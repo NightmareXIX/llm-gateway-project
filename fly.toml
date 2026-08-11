@@ -1,0 +1,74 @@
+# Fly.io deployment. See docs/deploy.md for the runbook this file is half of.
+#
+# Checked in and authoritative: `fly launch` offers to generate its own version,
+# and it should be told not to (`--no-deploy` then `fly deploy`). A generated
+# manifest will not carry the release command, which is the one part of this file
+# that is load-bearing.
+
+app = "llm-gateway"
+
+# Fly places machines, not databases. `iad` is chosen to sit near Supabase's
+# default US-East region — every request makes at least two round trips to
+# Postgres, and putting the app on another continent from its database is the
+# cheapest way to make a fast service feel slow.
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  # Migrations run here, not at app start. Fly runs this in a one-off machine
+  # that has the app's secrets, waits for it, and aborts the rollout on a
+  # non-zero exit — so a broken migration never reaches a machine that serves
+  # traffic, and two machines starting at once cannot race each other to apply
+  # the same revision.
+  #
+  # Consequence worth knowing before the first deploy: `alembic/env.py` resolves
+  # DATABASE_URL through `app/config.py`, so this command fails on a *missing*
+  # variable exactly as loudly as the app would. Every secret must be set before
+  # the first `fly deploy`, not after it. docs/deploy.md sets them in one call.
+  release_command = "alembic upgrade head"
+
+[env]
+  # Not a secret, and it belongs in version control: it is what switches off the
+  # /docs route in app/main.py. Everything else lives in `fly secrets`.
+  ENV = "prod"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+
+  # Free-tier economics: machines suspend when idle and wake on the next request.
+  # The cost is a cold start on the first request after a quiet spell, which the
+  # risk register (development-plan.md §5) already names and accepts — ping the
+  # health check before a demo. `suspend` rather than `stop` because resuming a
+  # suspended machine skips the Python interpreter's startup entirely.
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    # Two uvicorn workers, each an event loop, on a request profile dominated by
+    # waiting on a provider. The limits are about protecting the Postgres pool
+    # (pool_size 5 + max_overflow 5 per worker), not about CPU.
+    type = "requests"
+    soft_limit = 40
+    hard_limit = 60
+
+# Readiness, not liveness, because Fly uses this to gate a rollout and to decide
+# whether a machine takes traffic — and a machine that is up but cannot reach
+# Postgres should do neither. /healthz stays the "is the process alive" answer
+# and deliberately never touches the database; see ADR-009.
+[[http_service.checks]]
+  path = "/readyz"
+  method = "GET"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # 512, not the 256 default: two uvicorn workers plus SQLAlchemy's connection
+  # pool and httpx's do not fit comfortably in 256MB, and the failure mode is an
+  # OOM kill mid-request rather than anything that says "out of memory" usefully.
+  memory = "512mb"

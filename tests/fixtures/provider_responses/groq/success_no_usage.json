@@ -1,0 +1,24 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 200 with no `usage` block. Free tiers omit it more often than the docs suggest; this is what forces `extract_usage` to flag `estimated=True` rather than report zeros.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "id": "chatcmpl-1c9d7e40-55aa-4e0b-8b31-77e5c9a2b104",
+      "object": "chat.completion",
+      "created": 1786622401,
+      "model": "llama-3.3-70b-versatile",
+      "choices": [
+        {
+          "index": 0,
+          "message": {"role": "assistant", "content": "Yes — failover is transparent to the client."},
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  }
+}

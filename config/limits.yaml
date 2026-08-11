@@ -1,0 +1,42 @@
+# Free-tier rate limits per provider+model, with reset semantics.
+#
+# Nothing reads these for enforcement in Phase 1 — the quota tracker arrives in Phase 3.
+# They are declared now because the reset semantics differ per provider and that
+# difference is the whole reason `quota/windows.py` exists:
+#
+#   rolling_60s        — sliding window, the limit frees up continuously (Groq RPM/TPM)
+#   fixed_daily_utc    — hard counter, resets at 00:00 UTC (Groq RPD/TPD)
+#   fixed_daily_pt     — resets at midnight US/Pacific (Gemini's day boundary)
+#
+# `null` means the provider does not publish that window; the tracker must skip it
+# rather than assume unlimited.
+
+version: 1
+
+limits:
+  groq:
+    llama-3.3-70b-versatile:
+      rpm: 30
+      rpd: 1000
+      tpm: 12000
+      tpd: 100000
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_utc
+        tpm: rolling_60s
+        tpd: fixed_daily_utc
+
+    llama-3.1-8b-instant:
+      rpm: 30
+      rpd: 14400
+      tpm: 6000
+      tpd: 500000
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_utc
+        tpm: rolling_60s
+        tpd: fixed_daily_utc
+
+  # Populated in Phase 3, when failover and quota enforcement land together.
+  gemini: {}
+  openrouter: {}

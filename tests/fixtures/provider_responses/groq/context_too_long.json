@@ -1,0 +1,17 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "The one error class with a retry path: re-run the D4 fitting step against `limit_tokens` and try the same provider once more. The limit is stated in prose, which is why `parse_error` carries a regex for it.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 400,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "error": {
+        "message": "Please reduce the length of the messages or completion. This model's maximum context length is 131072 tokens, however you requested 138204 tokens.",
+        "type": "invalid_request_error",
+        "code": "context_length_exceeded"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+.env
+.env.local
+
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+node_modules/
+.next/
+
+.DS_Store
+
+# Next.js/TS build artifact
+tsconfig.tsbuildinfo

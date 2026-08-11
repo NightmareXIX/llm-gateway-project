@@ -1,0 +1,46 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Placeholder. Run `make record-fixtures` to replace with a real capture.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "x-ratelimit-limit-requests": "1000",
+      "x-ratelimit-limit-tokens": "12000",
+      "x-ratelimit-remaining-requests": "997",
+      "x-ratelimit-remaining-tokens": "11873",
+      "x-ratelimit-reset-requests": "2m59.56s",
+      "x-ratelimit-reset-tokens": "7.66s"
+    },
+    "body": {
+      "id": "chatcmpl-8a1f0c2e-3d44-4b1a-9f77-0c2a5b6e1d90",
+      "object": "chat.completion",
+      "created": 1786622400,
+      "model": "llama-3.3-70b-versatile",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "A gateway sits between a client and several providers, presenting one API while it decides which upstream actually serves each request."
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "queue_time": 0.019,
+        "prompt_tokens": 48,
+        "prompt_time": 0.004,
+        "completion_tokens": 27,
+        "completion_time": 0.098,
+        "total_tokens": 75,
+        "total_time": 0.102
+      },
+      "system_fingerprint": "fp_2f30b0b571",
+      "x_groq": {"id": "req_01k2p9wz8qf7ta3n6m0v4d5x7c"}
+    }
+  }
+}

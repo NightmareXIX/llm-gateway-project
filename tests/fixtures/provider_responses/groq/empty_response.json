@@ -1,0 +1,25 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "HTTP 200, zero usable content. §2.1.5 case 5. Not provokable on demand — it happens under load on free tiers — so this stays synthetic even after a recording run.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "id": "chatcmpl-6b0e2a11-0f3c-4a58-9d22-1e7b4c8f6a03",
+      "object": "chat.completion",
+      "created": 1786622402,
+      "model": "llama-3.3-70b-versatile",
+      "choices": [
+        {
+          "index": 0,
+          "message": {"role": "assistant", "content": ""},
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {"prompt_tokens": 48, "completion_tokens": 0, "total_tokens": 48}
+    }
+  }
+}

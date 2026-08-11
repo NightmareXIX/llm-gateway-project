@@ -1,0 +1,25 @@
+# Normalize line endings in the repository to LF.
+#
+# Development happens on Windows; everything that consumes this repo — the
+# Docker image, the Fly release command, GitHub Actions — is Linux. Without
+# this, a file committed with CRLF reaches a container and fails in ways that
+# read as anything but a line-ending problem: a shell script whose shebang has
+# a trailing \r reports "no such file or directory" naming a binary that plainly
+# exists, and a .env-style file yields values with an invisible \r appended.
+#
+# `text=auto` lets git decide what is text and store it as LF, while checking it
+# out with the platform's convention. Nothing about the working copy changes.
+* text=auto
+
+# Binary, never touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+
+# Recorded provider responses. Byte-for-byte fixtures: an SSE stream is framed
+# by \n\n, and a checkout that rewrote those to \r\n\r\n would change what the
+# parser is being tested against.
+tests/fixtures/** -text

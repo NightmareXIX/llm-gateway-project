@@ -1,0 +1,17 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Placeholder. `make record-fixtures` provokes this by sending a deliberately invalid key.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 401,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "error": {
+        "message": "Invalid API Key",
+        "type": "invalid_request_error",
+        "code": "invalid_api_key"
+      }
+    }
+  }
+}

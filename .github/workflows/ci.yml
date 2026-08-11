@@ -1,0 +1,159 @@
+## lint -> typecheck -> test -> deploy, per Step 11.
+##
+## `lint` and `test` are separate jobs rather than sequential steps in one: a
+## formatting nit should report in well under a minute instead of queueing behind
+## a database container, and the two are genuinely independent.
+##
+## Nothing here ever calls a live provider. Every upstream HTTP call in the suite
+## goes through `httpx.MockTransport`, GROQ_API_KEY below is a fake, and
+## `scripts/record_fixtures.py` — the only thing in the repo that talks to Groq —
+## is never invoked.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push to a PR should cancel the first run rather than race it. Not on
+# main: those runs deploy, and cancelling a deploy halfway is worse than waiting.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: lint + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - run: pip install -e ".[dev]"
+
+      - name: ruff (lint)
+        run: ruff check app tests scripts
+
+      - name: ruff (format)
+        run: ruff format --check app tests scripts
+
+      # `files` in pyproject covers app, tests and scripts, so the test suite is
+      # type-checked under strict mode too — which is the point of having it.
+      - name: mypy
+        run: mypy
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+
+    # The suite needs a real Postgres. The schema uses JSONB, a partial unique
+    # index, gen_random_uuid() and timestamptz, and the bugs worth catching are
+    # exactly the ones a SQLite stand-in could not catch. conftest creates and
+    # drops `gateway_test` itself, from the `postgres` maintenance database.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # Only DATABASE_URL is strictly required — tests/conftest.py `setdefault`s
+      # the rest. They are all set explicitly anyway: a CI run that depends on a
+      # default living in a test file is a CI run that breaks when someone edits
+      # that file for an unrelated reason.
+      DATABASE_URL: postgresql+asyncpg://gateway:gateway@127.0.0.1:5432/gateway
+      REDIS_URL: redis://localhost:6379/0
+      ENV: test
+      SUPABASE_URL: https://test-project.supabase.co
+      SUPABASE_JWT_AUDIENCE: authenticated
+      REQUIRE_VERIFIED_EMAIL: "true"
+      GROQ_API_KEY: gsk_test_key_not_real
+      ENCRYPTION_KEY: dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - run: pip install -e ".[dev]"
+
+      - name: pytest
+        run: pytest
+
+      # Reported, never gated. `make coverage` locally and this line in the log
+      # answer "what is untested?"; a --cov-fail-under threshold would instead
+      # fail unrelated work whenever a branch moves.
+      - name: coverage report
+        run: pytest --cov --cov-report=term-missing -q
+
+  frontend:
+    name: frontend checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+
+      # Deliberately no `npm run build`. It needs real NEXT_PUBLIC_SUPABASE_*
+      # values, and Vercel already builds on every push — running it here buys a
+      # second way to fail, not a second signal.
+
+  deploy:
+    name: deploy to fly
+    needs: [lint, test, frontend]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # One deploy at a time, and never cancelled mid-flight.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # --remote-only: the image builds on Fly's builder, so this runner needs no
+      # Docker daemon and the layer cache lives with the thing doing the deploying.
+      # Migrations run inside this command, via fly.toml's release_command.
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+    # The frontend is not deployed from here. Vercel's Git integration builds and
+    # ships it on push, which is one fewer long-lived token for this repo to hold.

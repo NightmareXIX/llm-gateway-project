@@ -1,0 +1,11 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A proxy in front of Groq answering instead of Groq. The body is HTML, not JSON — the case that makes `parse_error` defensive rather than trusting. It must classify as Unavailable, not raise a JSONDecodeError into the catch-all handler.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 502,
+    "headers": {"content-type": "text/html"},
+    "text": "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center></body></html>"
+  }
+}

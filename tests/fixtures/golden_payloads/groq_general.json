@@ -1,0 +1,36 @@
+{
+  "max_tokens": 512,
+  "messages": [
+    {
+      "content": "You are a terse assistant. Answer in one sentence.",
+      "role": "system"
+    },
+    {
+      "content": "[4 earlier messages omitted]\n\nRecap: what did we decide about mid-stream failover?",
+      "role": "user"
+    },
+    {
+      "content": "Restart the stream on a new provider and discard the partial.",
+      "role": "assistant"
+    },
+    {
+      "content": "And if the third attempt also fails?",
+      "role": "user"
+    },
+    {
+      "content": "The stream ends with status \"failed\" and the longest partial.",
+      "role": "assistant"
+    },
+    {
+      "content": "Good. Now summarise that for the README.",
+      "role": "user"
+    }
+  ],
+  "model": "llama-3.3-70b-versatile",
+  "stop": [
+    "</done>"
+  ],
+  "stream": false,
+  "temperature": 0.2,
+  "top_p": 0.9
+}

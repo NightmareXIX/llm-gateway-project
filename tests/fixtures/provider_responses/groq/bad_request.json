@@ -1,0 +1,17 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Placeholder. `make record-fixtures` provokes this with a malformed body (a message missing `role`).",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 400,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "error": {
+        "message": "'messages.0' : property 'role' is required",
+        "type": "invalid_request_error",
+        "code": "invalid_request_error"
+      }
+    }
+  }
+}

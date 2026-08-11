@@ -1,0 +1,23 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Synthetic and expected to stay that way: provoking a real 429 means deliberately exhausting a shared free-tier budget. Note the reset headers are Go durations, not seconds.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 429,
+    "headers": {
+      "content-type": "application/json",
+      "retry-after": "12",
+      "x-ratelimit-limit-requests": "1000",
+      "x-ratelimit-remaining-requests": "0",
+      "x-ratelimit-reset-requests": "11.94s"
+    },
+    "body": {
+      "error": {
+        "message": "Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01h` on requests per day (RPD): Limit 1000, Used 1000, Requested 1. Please try again in 11.94s.",
+        "type": "requests",
+        "code": "rate_limit_exceeded"
+      }
+    }
+  }
+}

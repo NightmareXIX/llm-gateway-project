@@ -1,0 +1,57 @@
+# Slot table: logical slot -> ordered candidate list (provider + model + capabilities).
+#
+# The router walks a slot's candidates in order and fails over down the list (D1/D2).
+# Phase 1 only ever resolves `general` and only ever reaches its first candidate.
+# Gemini and OpenRouter are declared but disabled — the shape is here so that turning
+# them on in Phase 3 is a config edit, not a code change.
+
+version: 1
+
+providers:
+  groq:
+    enabled: true
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+
+  gemini:
+    enabled: false
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key_env: GEMINI_API_KEY
+
+  openrouter:
+    enabled: false
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+
+# Each candidate carries every per-model fact `ModelSpec` needs. `priority` is not
+# a field — it is the candidate's index in the list below, so failover order and
+# priority order cannot disagree. `supports_system_field` is not a field either:
+# it is a property of the provider's wire format, and lives in registry.py.
+slots:
+  general:
+    description: Default answering slot — balanced quality and free-tier headroom.
+    candidates:
+      - provider: groq
+        model: llama-3.3-70b-versatile
+        context_tokens: 131072
+        max_output_tokens: 32768
+        capabilities: [text]
+        supports_streaming: true
+        max_file_bytes: null
+        reserved_fraction: 0.0
+
+  fast:
+    description: Latency-first slot for short turns.
+    candidates:
+      - provider: groq
+        model: llama-3.1-8b-instant
+        context_tokens: 131072
+        max_output_tokens: 8192
+        capabilities: [text]
+        supports_streaming: true
+        max_file_bytes: null
+        reserved_fraction: 0.0
+
+  # Perception lane (D8) and long-context slots land here in Phase 4/5.
+  # Left undeclared rather than guessed — an empty candidate list is rejected at
+  # load time, so no slot can exist without somewhere to actually route.

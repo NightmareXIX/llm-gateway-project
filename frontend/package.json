@@ -1,0 +1,51 @@
+{
+  "name": "llm-gateway-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "comment:overrides": [
+    "Both advisories are transitive through next, not direct dependencies:",
+    "postcss <=8.5.22 (sourceMappingURL path traversal + stringify XSS) and",
+    "sharp <0.35.0 (inherited libvips CVEs). `npm audit fix --force` resolves",
+    "them by installing next@16, a major version bump we have no other reason",
+    "to take. Pinning the two patched transitive versions gets the same result",
+    "without changing the framework under the app."
+  ],
+  "overrides": {
+    "postcss": "^8.5.23",
+    "sharp": "^0.35.0"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.47.10",
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "swr": "^2.3.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.2.0",
+    "@tailwindcss/postcss": "^4.0.0",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/node": "^22.10.7",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.18.0",
+    "eslint-config-next": "^15.1.6",
+    "jsdom": "^26.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.2"
+  }
+}

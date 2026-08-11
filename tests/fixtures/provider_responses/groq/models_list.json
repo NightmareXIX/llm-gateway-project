@@ -1,0 +1,31 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Placeholder. `GET /models` is Groq's cheapest liveness check and costs no completion quota — it is what `validate_key` calls.",
+  "request": {"method": "GET", "path": "/models"},
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "object": "list",
+      "data": [
+        {
+          "id": "llama-3.3-70b-versatile",
+          "object": "model",
+          "created": 1733447754,
+          "owned_by": "Meta",
+          "active": true,
+          "context_window": 131072
+        },
+        {
+          "id": "llama-3.1-8b-instant",
+          "object": "model",
+          "created": 1693721698,
+          "owned_by": "Meta",
+          "active": true,
+          "context_window": 131072
+        }
+      ]
+    }
+  }
+}

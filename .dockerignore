@@ -1,0 +1,50 @@
+# What never reaches the Docker daemon.
+#
+# Two jobs. The first is speed: without this the build context is the whole
+# working tree — .venv/ and frontend/node_modules/ alone are hundreds of
+# megabytes, uploaded on every single build.
+#
+# The second is the one that actually matters. Nothing in the Dockerfile copies
+# `.env` today, but a build context that *contains* a live credential is one
+# careless `COPY . .` away from an image that ships it, and images get pushed to
+# registries. Excluding it here means the secret cannot reach the daemon at all,
+# so no future edit to the Dockerfile can leak it by accident.
+
+# --- secrets: the reason this file is not optional ------------------------- #
+.env
+.env.*
+!.env.example
+frontend/.env.local
+
+# --- version control ------------------------------------------------------- #
+.git
+.gitignore
+.github
+
+# --- Python build and tool state ------------------------------------------- #
+.venv
+venv
+**/__pycache__
+*.py[cod]
+*.egg-info
+dist
+build
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# --- not part of the runtime image ----------------------------------------- #
+# The tests are excluded on purpose: the runtime image should not carry the
+# fixtures, and `make test` runs against the working tree, not the image.
+tests
+frontend
+docs
+doc
+Makefile
+docker-compose.yml
+Dockerfile
+fly.toml
+README.md
+CLAUDE.md

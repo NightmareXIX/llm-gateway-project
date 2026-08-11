@@ -1,0 +1,21 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "The quirk the adapter exists to absorb: Groq answers a tokens-per-minute overage with HTTP 413. Classifying on the status alone yields ContextTooLong — failover-ineligible — and strands the request on an exhausted model while three others sit idle. The body's `code` is what makes it a RateLimited.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 413,
+    "headers": {
+      "content-type": "application/json",
+      "x-ratelimit-remaining-tokens": "0",
+      "x-ratelimit-reset-tokens": "1m4.2s"
+    },
+    "body": {
+      "error": {
+        "message": "Request too large for model `llama-3.3-70b-versatile` in organization `org_01h` on tokens per minute (TPM): Limit 12000, Requested 13850. Please try again in 1m4.2s.",
+        "type": "tokens",
+        "code": "rate_limit_exceeded"
+      }
+    }
+  }
+}

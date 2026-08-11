@@ -1,0 +1,25 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 200 whose finish_reason is the refusal. Deliberately not recorded live — provoking it means sending a prompt designed to be refused.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {"content-type": "application/json"},
+    "body": {
+      "id": "chatcmpl-2d5c8b73-91ae-4d60-b0f1-3a9e7c2d5f18",
+      "object": "chat.completion",
+      "created": 1786622403,
+      "model": "llama-3.3-70b-versatile",
+      "choices": [
+        {
+          "index": 0,
+          "message": {"role": "assistant", "content": "I can't help with that."},
+          "logprobs": null,
+          "finish_reason": "content_filter"
+        }
+      ],
+      "usage": {"prompt_tokens": 61, "completion_tokens": 8, "total_tokens": 69}
+    }
+  }
+}

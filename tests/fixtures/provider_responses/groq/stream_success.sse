@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-5f2b91ac","object":"chat.completion.chunk","created":1786622410,"model":"llama-3.3-70b-versatile","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f2b91ac","object":"chat.completion.chunk","created":1786622410,"model":"llama-3.3-70b-versatile","choices":[{"index":0,"delta":{"content":"A gateway"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f2b91ac","object":"chat.completion.chunk","created":1786622410,"model":"llama-3.3-70b-versatile","choices":[{"index":0,"delta":{"content":" sits between"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f2b91ac","object":"chat.completion.chunk","created":1786622410,"model":"llama-3.3-70b-versatile","choices":[{"index":0,"delta":{"content":" a client and several providers."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5f2b91ac","object":"chat.completion.chunk","created":1786622410,"model":"llama-3.3-70b-versatile","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"x_groq":{"id":"req_01k2p9wz8q","usage":{"prompt_tokens":48,"completion_tokens":11,"total_tokens":59}}}
+
+data: [DONE]
+
