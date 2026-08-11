@@ -263,15 +263,35 @@ readable by anyone with project access.
 
 ## 5. Supabase redirect URLs
 
-**Auth → URL Configuration.** Set the site URL to the Vercel origin and add both to redirect URLs:
+**Authentication → URL Configuration.**
+
+**Site URL:** `https://<your-app>.vercel.app`
+
+**Redirect URLs:**
 
 ```
-https://<your-app>.vercel.app
-https://<your-app>.vercel.app/auth/callback
+https://<your-app>.vercel.app/**
+http://localhost:3000/**
 ```
 
-Skip this and confirmation emails link to `localhost:3000`, which looks like broken email delivery
-and is not.
+Keep the localhost entry so `make frontend-dev` signups keep working. Use the `/**` wildcard rather
+than a bare `/auth/callback`: [`LoginForm.tsx`](../frontend/components/LoginForm.tsx) appends
+`?next=…` to the redirect, and an exact-path entry rejects the querystring. If Vercel Preview
+deployments are enabled, add `https://<project>-*-<username>.vercel.app/**` too — preview hostnames
+are generated per branch and the auth flow builds its redirect from the request origin.
+
+**The symptom when this is missed** is a confirmation link landing on
+`http://localhost:3000/?code=…`. Two things to read off that URL: the host is Supabase's default
+Site URL, and the path is `/` rather than `/auth/callback` — Supabase does not merely swap the host
+on a non-allowlisted redirect, it discards the requested target entirely and substitutes the Site
+URL. A wrong *host* with the right path would mean something else.
+
+It looks like broken email delivery and is not; the mail arrived correctly, carrying the wrong
+destination.
+
+**Recovering an account stuck this way** needs no re-registration. In the same browser that signed
+up, open `https://<your-app>.vercel.app/auth/callback?code=<the code from the bad link>` — the PKCE
+verifier is in a cookie on that origin, so the exchange completes normally.
 
 ---
 
