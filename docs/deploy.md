@@ -60,6 +60,11 @@ postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.co
    Python. Leave the username as `postgres.<ref>` — the dotted form is how Supavisor identifies the
    tenant, and "tidying" it to plain `postgres` gives `Tenant or user not found`.
 
+   **Settle on the password before building the URL.** Rotating it afterwards invalidates the
+   secret you already set, and the deploy that reveals this is three minutes long. Read it with
+   `Read-Host -AsSecureString` rather than pasting into a double-quoted string: PowerShell expands
+   `$` inside `"..."`, so a password containing `$&` becomes a different password, silently.
+
 3. **`?ssl=require`, and delete any `?sslmode=require` Supabase gave you.** SQLAlchemy passes
    unknown query parameters straight through to the driver, and asyncpg has no `sslmode` keyword —
    it has `ssl`. Verified against SQLAlchemy 2.0.51:
@@ -110,9 +115,13 @@ Remove-Item Env:\PROBE_URL
 | Failure | Cause |
 |---|---|
 | `TypeError: ... unexpected keyword argument 'sslmode'` | `?sslmode=require` left on |
-| `password authentication failed` | wrong password, or `@`/`:` not percent-encoded |
+| `InvalidPasswordError: password authentication failed for user "postgres"` | wrong password — including a password rotated after the URL was built. Not a username problem: the tenant resolved, and Supavisor strips the `.<ref>` suffix before passing the request upstream, which is why the message names plain `postgres` |
+| `Tenant or user not found` | username *is* plain `postgres` — the request never reached Postgres at all |
 | `getaddrinfo failed` | wrong region, or an unencoded `@` truncated the host |
-| `Tenant or user not found` | username is plain `postgres` instead of `postgres.<ref>` |
+
+Run this probe again after **any** change to the password or the URL. It costs two seconds; the
+deploy that would otherwise tell you the same thing costs three minutes and leaves a failed release
+in the app's history.
 
 ---
 
