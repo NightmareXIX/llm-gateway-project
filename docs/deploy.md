@@ -297,15 +297,71 @@ verifier is in a cookie on that origin, so the exchange completes normally.
 
 ## 6. GitHub Actions
 
+Everything up to here was deployed by hand. This is what makes the next deploy automatic.
+
+### 6.1 Push the repository
+
+Nothing in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) can run until GitHub has the
+code:
+
 ```bash
-fly tokens create deploy -x 999999h
+git push -u origin main
 ```
 
-Add the output as the `FLY_API_TOKEN` repository secret (Settings → Secrets and variables →
-Actions). `.github/workflows/ci.yml` then runs lint, tests and frontend checks on every push and
-PR, and deploys on `main`.
+The first run will show `deploy` failing — the token does not exist yet. `lint`, `test` and
+`frontend` should be green.
 
-Vercel deploys itself through its own Git integration — there is no Vercel token in this repo.
+### 6.2 Mint a deploy token
+
+Run this from the repo root so it picks the app up from `fly.toml`:
+
+```bash
+fly tokens create deploy -x 8760h
+```
+
+It prints one line starting `FlyV1 ...`. **Copy the whole thing, including the `FlyV1 ` prefix and
+the trailing space-separated parts** — it is one value, and truncating it produces an
+authentication error at deploy time rather than a parse error now.
+
+`-x` is the expiry. A year is a reasonable default for a portfolio project; the token is scoped to
+this one app and can only deploy, so a leak cannot read secrets or touch other apps. It is shown
+exactly once.
+
+### 6.3 Store it as a repository secret
+
+GitHub → the repo → **Settings → Secrets and variables → Actions → New repository secret**.
+
+| Field | Value |
+|---|---|
+| Name | `FLY_API_TOKEN` |
+| Secret | the whole `FlyV1 …` string |
+
+The name must match exactly — [`ci.yml`](../.github/workflows/ci.yml) reads
+`${{ secrets.FLY_API_TOKEN }}`, and a missing secret becomes an empty string rather than an error,
+so a typo surfaces as `Error: No access token available` in the deploy job.
+
+Use a **repository** secret, not an environment or organization one, unless you have a reason —
+environment secrets need a matching `environment:` key in the job, which this workflow does not set.
+
+### 6.4 What now happens on every push
+
+| Job | Runs on | Does |
+|---|---|---|
+| `lint` | push + PR | `ruff check`, `ruff format --check`, `mypy` |
+| `test` | push + PR | `pytest --cov` against a `postgres:16` service container |
+| `frontend` | push + PR | `npm ci`, lint, typecheck, `vitest` |
+| `deploy` | **push to `main` only** | `flyctl deploy --remote-only` |
+
+`deploy` has `needs: [lint, test, frontend]`, so a red test suite stops the deploy rather than
+shipping past it. `--remote-only` builds the image on Fly's builder, so the runner needs no Docker
+daemon. Migrations run inside that deploy, through `fly.toml`'s `release_command` — the same path
+step 3 used, with the same abort-on-failure behaviour.
+
+Verify by pushing anything to `main` and watching the **Actions** tab. A green `deploy` job means
+`fly releases` has a new entry.
+
+Vercel is not deployed from here — its own Git integration builds the frontend on push, which is one
+fewer long-lived token for this repository to hold.
 
 ---
 

@@ -100,14 +100,15 @@ jobs:
 
       - run: pip install -e ".[dev]"
 
-      - name: pytest
-        run: pytest
-
-      # Reported, never gated. `make coverage` locally and this line in the log
-      # answer "what is untested?"; a --cov-fail-under threshold would instead
-      # fail unrelated work whenever a branch moves.
-      - name: coverage report
-        run: pytest --cov --cov-report=term-missing -q
+      # One run, with coverage attached. Locally `make test` and `make coverage`
+      # are separate so the common case stays fast; in CI the suite is going to
+      # run anyway, so measuring costs nothing extra and running it twice costs
+      # a full second pass.
+      #
+      # Coverage is reported, never gated. A --cov-fail-under threshold would
+      # fail unrelated work whenever a branch moved.
+      - name: pytest + coverage
+        run: pytest --cov --cov-report=term-missing
 
   frontend:
     name: frontend checks
