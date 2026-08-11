@@ -7,11 +7,13 @@
 
 app = "llm-gateway"
 
-# Fly places machines, not databases. `iad` is chosen to sit near Supabase's
-# default US-East region — every request makes at least two round trips to
-# Postgres, and putting the app on another continent from its database is the
-# cheapest way to make a fast service feel slow.
-primary_region = "iad"
+# Fly places machines, not databases. This must track wherever the Supabase
+# project actually lives — every request makes several round trips to Postgres,
+# and putting the app on another continent from its database is the cheapest
+# way to make a fast service feel slow. `nrt` (Tokyo) pairs with a Supabase
+# project in `ap-northeast-1`; read the region out of the pooler hostname
+# (`aws-0-<region>.pooler.supabase.com`) and change both together or neither.
+primary_region = "nrt"
 
 [build]
   dockerfile = "Dockerfile"

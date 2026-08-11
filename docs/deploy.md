@@ -44,11 +44,34 @@ environment.
 handful of messages an hour and you will hit it during ordinary testing, not in production.
 
 **Project Settings → Database → Connection string → URI.** Take the **session pooler** string
-(port `5432`) and rewrite the scheme for asyncpg:
+(port `5432`) — not the direct connection, which is IPv6-only without the paid IPv4 add-on — and
+make three edits:
 
 ```
-postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?ssl=require
+^^^^^^^^^^^^^^^^^^^^                ^^^^^^^^^^                                                  ^^^^^^^^^^^
+1. scheme                           2. percent-encoded                                          3. ssl, NOT sslmode
 ```
+
+1. **Scheme:** `postgresql://` → `postgresql+asyncpg://`.
+
+2. **Password:** percent-encode it. A raw `@` truncates the host and you get a DNS failure naming a
+   host you never typed. `[uri]::EscapeDataString($pw)` in PowerShell, `urllib.parse.quote` in
+   Python. Leave the username as `postgres.<ref>` — the dotted form is how Supavisor identifies the
+   tenant, and "tidying" it to plain `postgres` gives `Tenant or user not found`.
+
+3. **`?ssl=require`, and delete any `?sslmode=require` Supabase gave you.** SQLAlchemy passes
+   unknown query parameters straight through to the driver, and asyncpg has no `sslmode` keyword —
+   it has `ssl`. Verified against SQLAlchemy 2.0.51:
+
+   | Query string | Reaches asyncpg as | Result |
+   |---|---|---|
+   | `?sslmode=require` | `sslmode=` | `TypeError: connect() got an unexpected keyword argument 'sslmode'` |
+   | `?ssl=require` | `ssl=` | correct — TLS required |
+   | *(omitted)* | — | connects, but asyncpg defaults to `prefer`: silent plaintext fallback |
+
+   This does **not** fail when the engine is built. It fails on the first connection — which means it
+   fails inside the release command, during the deploy.
 
 > **If you use the transaction pooler (port 6543) instead**, you must also set
 > `DB_DISABLE_PREPARED_STATEMENTS=true`. That pooler hands each transaction a different upstream
@@ -56,8 +79,40 @@ postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.co
 > `DuplicatePreparedStatementError` on every concurrent request, not a graceful degradation. See
 > [`app/config.py`](../app/config.py).
 
-> **Percent-encode the password** if it contains `@`, `:`, `/` or `#`. A raw `@` silently truncates
-> the host and you get a DNS failure that names the wrong host.
+**Note the region in the pooler hostname** (`aws-0-<region>.pooler.supabase.com`). Step 3 has to put
+the Fly app next to it.
+
+### Test the string before it becomes a secret
+
+Exercises the real path — `create_db_engine`, the dialect, TLS, the pooler — so a failure here is one
+you would otherwise meet as a dead release command:
+
+```powershell
+$env:PROBE_URL = $dbUrl
+.venv\Scripts\python.exe -c @"
+import asyncio, os
+from sqlalchemy import text
+from app.config import Settings
+from app.db.session import create_db_engine
+s = Settings(DATABASE_URL=os.environ['PROBE_URL'], REDIS_URL='redis://x',
+             SUPABASE_URL='https://x.supabase.co', SUPABASE_JWT_AUDIENCE='authenticated',
+             GROQ_API_KEY='x', ENCRYPTION_KEY='x')
+async def main():
+    e = create_db_engine(s)
+    async with e.connect() as c:
+        print('connected:', (await c.execute(text('select version()'))).scalar_one()[:40])
+    await e.dispose()
+asyncio.run(main())
+"@
+Remove-Item Env:\PROBE_URL
+```
+
+| Failure | Cause |
+|---|---|
+| `TypeError: ... unexpected keyword argument 'sslmode'` | `?sslmode=require` left on |
+| `password authentication failed` | wrong password, or `@`/`:` not percent-encoded |
+| `getaddrinfo failed` | wrong region, or an unencoded `@` truncated the host |
+| `Tenant or user not found` | username is plain `postgres` instead of `postgres.<ref>` |
 
 ---
 
@@ -74,12 +129,25 @@ does not check it.
 
 ## 3. Fly.io — the gateway
 
-`fly.toml` is committed and authoritative, so create the app **without** letting `fly launch`
-generate its own:
+**Set `primary_region` in `fly.toml` to match the Supabase region** you noted in step 1, before
+anything else. `ap-northeast-1` → `nrt`, `us-east-1` → `iad`, `eu-central-1` → `fra`
+(`fly platform regions` lists them all). Every request makes several round trips to Postgres; an app
+a continent away from its database is slow in a way no amount of tuning fixes.
+
+`fly.toml` is committed and authoritative, so create the app with `apps create` rather than
+`fly launch` — `launch` rewrites `fly.toml` from its own template and drops the comments explaining
+why each setting is what it is:
 
 ```bash
-fly launch --no-deploy --copy-config --name llm-gateway --region iad
+fly apps create llm-gateway
 ```
+
+App names are a **global** namespace on Fly, so `llm-gateway` may be taken. If it is, pick another
+and change `app = ` in `fly.toml` to match — the two must agree or `fly deploy` targets the wrong
+app.
+
+Everything below assumes the app exists. `fly secrets set` against a name Fly does not know fails
+with `Could not find App "<name>"`, which is what you get for running step 3 out of order.
 
 ### Set every secret before the first deploy
 
