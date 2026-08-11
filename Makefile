@@ -1,3 +1,19 @@
+# Task runner. `make <target>`; see docs/deploy.md for the deployment ones.
+#
+# Windows: `make` is not installed by default and PowerShell will report it as
+# an unrecognized cmdlet. One of:
+#
+#     winget install ezwinports.make      # 4.4.1, standalone, no MSYS runtime
+#     choco install make
+#
+# then open a new shell — the installer edits PATH and the running session does
+# not see it. The recipes below are plain commands, so they run the same under
+# cmd.exe as under sh; nothing here needs a POSIX shell.
+#
+# Targets that touch the database (`test`, `coverage`, `migrate`) need Postgres
+# up: `docker compose up -d postgres`. Without it the unit suite still passes
+# and every integration test errors on a refused connection.
+
 .PHONY: install dev test coverage lint typecheck migrate revision record-fixtures \
         docker-build docker-run deploy \
         frontend-install frontend-dev frontend-build frontend-lint frontend-test

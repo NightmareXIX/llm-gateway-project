@@ -10,6 +10,10 @@ of those has a note saying so.
 
 ## 0. Before you start
 
+Postgres must be up for the integration suite (`docker compose up -d postgres`), and on Windows
+`make` needs installing first — `winget install ezwinports.make`, then open a new shell so the PATH
+change takes effect.
+
 ```bash
 make lint && make typecheck && make test    # must be green before anything ships
 make docker-build                           # the image the deploy will build, built locally first
