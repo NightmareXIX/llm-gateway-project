@@ -161,10 +161,17 @@ wholesale points production at your laptop:
 
 | Secret | Value |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `REQUIRE_VERIFIED_EMAIL`, `GROQ_API_KEY` | same as `.env` |
+| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY` | same as `.env` |
 | `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
 | `REDIS_URL` | Upstash, from step 2 — `.env` holds `localhost:6379` |
 | `ENCRYPTION_KEY` | **generate a fresh one.** Nothing is encrypted with it until Phase 6, so a new key is free now; sharing dev's means a leaked dev `.env` also decrypts production, and rotating later is a migration |
+| `REQUIRE_VERIFIED_EMAIL` | type `true` **literally**. It has a default in `Settings`, so it is frequently absent from `.env` — scripting it out of that file yields an empty string, and an empty string is not a boolean |
+
+> That last row is a real failure, not a hypothetical. A shell that interpolates a missing key as
+> `""` produces `fly secrets set REQUIRE_VERIFIED_EMAIL=""`, and the release command dies with
+> `Input should be a valid boolean, unable to interpret input`. Anything with a default in
+> `app/config.py` is a candidate for this; only the three in the first row are safe to read out of
+> `.env` programmatically, because only those are always present.
 
 `ENV` is deliberately absent — it lives in `fly.toml`'s `[env]` block as `prod`, and a secret of the
 same name would override it.
@@ -185,6 +192,10 @@ Then confirm all seven names landed — Fly never shows values back:
 ```bash
 fly secrets list
 ```
+
+Names and digests only, so `fly secrets list` cannot tell you a value is *wrong* — only that it is
+present. An empty string looks identical to a correct one here. The release command is what catches
+it, which is the argument for having migrations run there rather than at app start.
 
 `ENV=prod` is not here — it is in `fly.toml`'s `[env]` block, because it is not a secret and it
 belongs in version control. It is what disables the `/docs` route.
