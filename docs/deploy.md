@@ -367,6 +367,26 @@ fewer long-lived token for this repository to hold.
 
 ## 7. Smoke test
 
+PowerShell — use `Invoke-RestMethod`/`Invoke-WebRequest` rather than `curl`, which is an alias for
+`Invoke-WebRequest` in Windows PowerShell 5.1 and the real `curl.exe` in PowerShell 7. The
+`-SkipHttpErrorCheck` flag is what stops a deliberate 401 or 404 from throwing:
+
+```powershell
+$API = 'https://llm-gateway-sed.fly.dev'
+
+Invoke-RestMethod "$API/healthz"            # status : ok
+Invoke-RestMethod "$API/readyz"             # status : ok, database : ok
+
+$r = Invoke-WebRequest "$API/v1/me" -SkipHttpErrorCheck
+$r.StatusCode                               # 401
+$r.Headers['x-request-id']                  # present
+$r.Content                                  # the error envelope
+
+(Invoke-WebRequest "$API/docs" -SkipHttpErrorCheck).StatusCode   # 404 — ENV=prod hides it
+```
+
+bash:
+
 ```bash
 API=https://llm-gateway-sed.fly.dev
 
@@ -375,6 +395,12 @@ curl -s  $API/readyz                        # {"status":"ok","database":"ok"}
 curl -si $API/v1/me | head -20              # 401, error envelope, X-Request-ID header
 curl -s  $API/docs -o /dev/null -w '%{http_code}\n'   # 404 — ENV=prod hides it
 ```
+
+Four things are being checked, and the third is the interesting one. `/healthz` proves the process
+is up; `/readyz` proves it reached Supabase through the pooler, which is the only part local testing
+cannot demonstrate; `/docs` returning 404 proves `ENV=prod` took effect. The `/v1/me` call proves the
+error envelope survived deployment — and the `x-request-id` header must equal the `request_id`
+inside the body, which is the promise that makes a user's bug report traceable to a log line.
 
 Then in the browser, against the Vercel URL — this is the Phase 1 definition of done:
 
