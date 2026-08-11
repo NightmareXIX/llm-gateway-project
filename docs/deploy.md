@@ -239,6 +239,17 @@ Environment variables:
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the anon key | Browser. Public by design. |
 | `GATEWAY_URL` | `https://llm-gateway-sed.fly.dev` | **Server only.** |
 
+**Set these in the Vercel dashboard, not in `frontend/.env.local`.** That file is gitignored and
+never leaves your machine — it configures `make frontend-dev` and nothing else. Filling it in does
+not configure the deployment.
+
+> **Get `GATEWAY_URL` exactly right.** Fly's app namespace is global, so a near-miss hostname is
+> usually a *live app belonging to somebody else* rather than a DNS error you would notice.
+> [`lib/api.ts`](../frontend/lib/api.ts) attaches the user's Supabase JWT to every request that goes
+> through the rewrite, so a wrong host here sends valid session tokens for your project to a
+> stranger's server, silently, on every authenticated request. Verify before pasting:
+> `curl https://<app>.fly.dev/healthz` must return `{"status":"ok"}` — a 404 means it is not yours.
+
 `GATEWAY_URL` is read server-side by [`next.config.ts`](../frontend/next.config.ts)'s rewrite. The
 browser only ever calls `/api/gw/*` on the Vercel origin, which keeps every request same-origin —
 no preflight, no `Access-Control-Allow-*` to get wrong, and no CORS middleware in
