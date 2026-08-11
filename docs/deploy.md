@@ -139,12 +139,12 @@ a continent away from its database is slow in a way no amount of tuning fixes.
 why each setting is what it is:
 
 ```bash
-fly apps create llm-gateway
+fly apps create llm-gateway-sed
 ```
 
-App names are a **global** namespace on Fly, so `llm-gateway` may be taken. If it is, pick another
-and change `app = ` in `fly.toml` to match — the two must agree or `fly deploy` targets the wrong
-app.
+App names are a **global** namespace on Fly — plain `llm-gateway` is taken, which is why this one
+carries a suffix. Whatever you pick must match `app = ` in `fly.toml`, or `fly deploy` targets the
+wrong app (or none).
 
 Everything below assumes the app exists. `fly secrets set` against a name Fly does not know fails
 with `Could not find App "<name>"`, which is what you get for running step 3 out of order.
@@ -156,15 +156,34 @@ and [`alembic/env.py`](../alembic/env.py) resolves `DATABASE_URL` through `app/c
 validates the *whole* settings object. A missing `GROQ_API_KEY` fails the migration exactly as
 loudly as it would fail the app, before any machine starts.
 
+Seven secrets, and **only four of them are the values from your local `.env`**. Copying that file
+wholesale points production at your laptop:
+
+| Secret | Value |
+|---|---|
+| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `REQUIRE_VERIFIED_EMAIL`, `GROQ_API_KEY` | same as `.env` |
+| `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
+| `REDIS_URL` | Upstash, from step 2 — `.env` holds `localhost:6379` |
+| `ENCRYPTION_KEY` | **generate a fresh one.** Nothing is encrypted with it until Phase 6, so a new key is free now; sharing dev's means a leaked dev `.env` also decrypts production, and rotating later is a migration |
+
+`ENV` is deliberately absent — it lives in `fly.toml`'s `[env]` block as `prod`, and a secret of the
+same name would override it.
+
 ```bash
 fly secrets set \
-  DATABASE_URL='postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres' \
+  DATABASE_URL='postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?ssl=require' \
   REDIS_URL='rediss://default:<password>@<host>.upstash.io:6379' \
   SUPABASE_URL='https://<ref>.supabase.co' \
   SUPABASE_JWT_AUDIENCE='authenticated' \
   REQUIRE_VERIFIED_EMAIL='true' \
   GROQ_API_KEY='gsk_...' \
   ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+```
+
+Then confirm all seven names landed — Fly never shows values back:
+
+```bash
+fly secrets list
 ```
 
 `ENV=prod` is not here — it is in `fly.toml`'s `[env]` block, because it is not a secret and it
@@ -198,7 +217,7 @@ Environment variables:
 |---|---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://<ref>.supabase.co` | Browser. Public by design. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the anon key | Browser. Public by design. |
-| `GATEWAY_URL` | `https://llm-gateway.fly.dev` | **Server only.** |
+| `GATEWAY_URL` | `https://llm-gateway-sed.fly.dev` | **Server only.** |
 
 `GATEWAY_URL` is read server-side by [`next.config.ts`](../frontend/next.config.ts)'s rewrite. The
 browser only ever calls `/api/gw/*` on the Vercel origin, which keeps every request same-origin —
@@ -242,7 +261,7 @@ Vercel deploys itself through its own Git integration — there is no Vercel tok
 ## 7. Smoke test
 
 ```bash
-API=https://llm-gateway.fly.dev
+API=https://llm-gateway-sed.fly.dev
 
 curl -s  $API/healthz                       # {"status":"ok"}
 curl -s  $API/readyz                        # {"status":"ok","database":"ok"}
@@ -271,7 +290,7 @@ from requests order by created_at desc limit 5;
 **Cold starts.** `min_machines_running = 0` lets machines suspend when idle, so the first request
 after a quiet spell pays a wake-up. Accepted deliberately — it is in the risk register
 ([development-plan.md](../doc/reference/development-plan.md) §5). Before a demo:
-`curl https://llm-gateway.fly.dev/healthz`.
+`curl https://llm-gateway-sed.fly.dev/healthz`.
 
 **Rolling back.** `fly releases` then `fly deploy --image <previous>`. Note that this does **not**
 roll back a migration; Alembic downgrades are separate and deliberate.

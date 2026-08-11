@@ -1,11 +1,15 @@
 # Fly.io deployment. See docs/deploy.md for the runbook this file is half of.
 #
-# Checked in and authoritative: `fly launch` offers to generate its own version,
-# and it should be told not to (`--no-deploy` then `fly deploy`). A generated
-# manifest will not carry the release command, which is the one part of this file
-# that is load-bearing.
+# Checked in and authoritative. Create the app with `fly apps create <name>`, not
+# with `fly launch` — launch regenerates this file from its own template, which
+# drops both the release command below (the one load-bearing setting here) and
+# every comment explaining why the rest is what it is.
+#
+# `app` is a global namespace on Fly, so this name is claimed rather than
+# descriptive. It must match the app `fly deploy` targets; changing one without
+# the other deploys into the wrong place, or nowhere.
 
-app = "llm-gateway"
+app = "llm-gateway-sed"
 
 # Fly places machines, not databases. This must track wherever the Supabase
 # project actually lives — every request makes several round trips to Postgres,
