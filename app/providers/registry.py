@@ -19,6 +19,7 @@ system credentials. Only the second half needs a running application.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import NamedTuple, Protocol
 
 import httpx
@@ -54,11 +55,22 @@ class AdapterFactory(Protocol):
     Typed as a callable rather than ``type[HttpProviderAdapter]`` because the
     base class deliberately does *not* satisfy :class:`ProviderAdapter` — it
     supplies plumbing, not ``build_payload`` or ``complete``. What the registry
-    requires is "something that, given a client and a base URL, hands back a
-    conforming adapter", which is exactly this.
+    requires is "something that, given a client, a base URL and that provider's
+    options, hands back a conforming adapter", which is exactly this.
+
+    ``options`` is **not** a Contract A change. This protocol is registry-internal
+    and ``__init__`` was never part of the frozen :class:`ProviderAdapter`
+    protocol — the alternative, a per-provider construction branch in
+    :func:`build_registry`, is the thing the registry exists to avoid.
     """
 
-    def __call__(self, *, client: httpx.AsyncClient, base_url: str) -> ProviderAdapter: ...
+    def __call__(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        base_url: str,
+        options: Mapping[str, str],
+    ) -> ProviderAdapter: ...
 
 
 class ProviderTraits(NamedTuple):
@@ -75,9 +87,15 @@ class ProviderTraits(NamedTuple):
 
 _PROVIDER_TRAITS: dict[str, ProviderTraits] = {
     "groq": ProviderTraits(adapter_class=GroqAdapter, supports_system_field=False),
-    # Phase 2 adds:
+    # Phase 2 Step 6 adds, alongside the adapters themselves:
     #   "gemini":     system_instruction is a top-level field  -> True
     #   "openrouter": OpenAI-shaped, system stays in the array -> False
+    #
+    # Both are already declared in providers.yaml — with their models, limits and
+    # options — and both are `enabled: false` until they land here. That is not a
+    # placeholder: `_traits` below refuses to build a registry for an enabled
+    # provider it has no adapter for, so the flag and this table cannot drift
+    # apart quietly. Step 6 flips two booleans in YAML and adds two lines here.
 }
 
 
@@ -223,7 +241,9 @@ def build_registry(
             continue
 
         traits = _traits(name)
-        adapters[name] = traits.adapter_class(client=client, base_url=entry.base_url)
+        adapters[name] = traits.adapter_class(
+            client=client, base_url=entry.base_url, options=entry.options
+        )
         keys[name] = _resolve_system_key(name, entry.api_key_env, settings)
 
     specs = build_model_specs(config)

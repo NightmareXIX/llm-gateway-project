@@ -37,6 +37,68 @@ limits:
         tpm: rolling_60s
         tpd: fixed_daily_utc
 
-  # Populated in Phase 3, when failover and quota enforcement land together.
-  gemini: {}
-  openrouter: {}
+  # Gemini. Two things here are not like the others.
+  #
+  # `fixed_daily_pt` is the reason that enum exists: Google's RPD quota resets at
+  # midnight *Pacific*, so for most of a UTC day the "resets at" a rolling-window
+  # tracker would report is wrong by up to eight hours.
+  #
+  # And the budget is enforced per Google Cloud *project*, not per API key — a second
+  # key in the same project adds nothing, and two of this gateway's environments
+  # sharing a project share these numbers. Phase 3's `scope` is about *our* users,
+  # not about that.
+  #
+  # Google no longer publishes a universal free-tier table; live quotas are visible
+  # only in AI Studio's rate-limit page, per project. These are a documented snapshot
+  # (Aug 2026), which §5's risk register already anticipates — one YAML file to edit,
+  # never a hardcoded number.
+  gemini:
+    gemini-3.6-flash:
+      rpm: 10
+      rpd: 250
+      tpm: 250000
+      tpd: null
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_pt
+        tpm: rolling_60s
+
+    gemini-3.5-flash-lite:
+      rpm: 15
+      rpd: 1000
+      tpm: 250000
+      tpd: null
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_pt
+        tpm: rolling_60s
+
+  # OpenRouter publishes one limit for *all* `:free` models together — it is an
+  # account-level allowance, not a per-model one, so these two blocks are the same
+  # numbers describing a single shared budget. Phase 3's tracker will over-count here
+  # by keying on (provider, model) like everywhere else; that errs toward failing over
+  # early, which is the safe direction, and the alternative is a per-provider special
+  # case in the one module that must stay provider-agnostic.
+  #
+  # 50 RPD is the no-credit tier. It becomes 1000 permanently once an account has ever
+  # purchased $10 of credit — a one-time unlock, so if that ever happens, this is the
+  # line to change. No published TPM: `null` means "no such window", which the tracker
+  # must skip rather than read as unlimited.
+  openrouter:
+    nvidia/nemotron-3-super-120b-a12b:free:
+      rpm: 20
+      rpd: 50
+      tpm: null
+      tpd: null
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_utc
+
+    openai/gpt-oss-20b:free:
+      rpm: 20
+      rpd: 50
+      tpm: null
+      tpd: null
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_utc

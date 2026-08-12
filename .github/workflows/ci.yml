@@ -5,7 +5,7 @@
 ## a database container, and the two are genuinely independent.
 ##
 ## Nothing here ever calls a live provider. Every upstream HTTP call in the suite
-## goes through `httpx.MockTransport`, GROQ_API_KEY below is a fake, and
+## goes through `httpx.MockTransport`, every provider key below is a fake, and
 ## `scripts/record_fixtures.py` — the only thing in the repo that talks to Groq —
 ## is never invoked.
 
@@ -87,6 +87,8 @@ jobs:
       SUPABASE_JWT_AUDIENCE: authenticated
       REQUIRE_VERIFIED_EMAIL: "true"
       GROQ_API_KEY: gsk_test_key_not_real
+      GEMINI_API_KEY: gemini_test_key_not_real
+      OPENROUTER_API_KEY: sk-or-v1-test-key-not-real
       ENCRYPTION_KEY: dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=
 
     steps:

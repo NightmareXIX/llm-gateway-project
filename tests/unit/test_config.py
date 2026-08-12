@@ -42,6 +42,8 @@ from app.config import (
     ProvidersConfig,
     Settings,
     _load_yaml_model,
+    get_limits_config,
+    get_providers_config,
     get_settings,
     validate_startup_config,
 )
@@ -56,10 +58,15 @@ REQUIRED_VARS = (
     "SUPABASE_URL",
     "SUPABASE_JWT_AUDIENCE",
     "GROQ_API_KEY",
+    # Required from Phase 2 Step 1, while both providers are still `enabled: false`.
+    # The point of listing them here is that the parameterized test below then
+    # asserts the same "names itself at boot" promise for them as for the rest.
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
     "ENCRYPTION_KEY",
 )
 
-OPTIONAL_VARS = ("ENV", "REQUIRE_VERIFIED_EMAIL")
+OPTIONAL_VARS = ("ENV", "REQUIRE_VERIFIED_EMAIL", "ROUTING_LATENCY_RANKING")
 
 BASELINE = {
     "ENV": "test",
@@ -68,6 +75,8 @@ BASELINE = {
     "SUPABASE_URL": "https://test-project.supabase.co",
     "SUPABASE_JWT_AUDIENCE": "authenticated",
     "GROQ_API_KEY": "gsk_not_a_real_key",
+    "GEMINI_API_KEY": "not_a_real_gemini_key",
+    "OPENROUTER_API_KEY": "sk-or-v1-not-a-real-key",
     "ENCRYPTION_KEY": "dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=",
 }
 
@@ -170,14 +179,21 @@ def test_secrets_do_not_survive_being_printed() -> None:
     these fields to ``str`` is a provider key in the startup log — silent, and
     only noticed by whoever finds it there.
     """
-    settings = _settings(GROQ_API_KEY="gsk_the_real_thing", ENCRYPTION_KEY="fernet_the_real_thing")
+    secrets = {
+        "GROQ_API_KEY": "gsk_the_real_thing",
+        "GEMINI_API_KEY": "gemini_the_real_thing",
+        "OPENROUTER_API_KEY": "openrouter_the_real_thing",
+        "ENCRYPTION_KEY": "fernet_the_real_thing",
+    }
+    settings = _settings(**secrets)
 
-    assert "gsk_the_real_thing" not in repr(settings)
-    assert "gsk_the_real_thing" not in str(settings)
-    assert "fernet_the_real_thing" not in repr(settings)
-    assert "fernet_the_real_thing" not in str(settings)
+    for value in secrets.values():
+        assert value not in repr(settings)
+        assert value not in str(settings)
     # Still reachable when actually needed.
     assert settings.GROQ_API_KEY.get_secret_value() == "gsk_the_real_thing"
+    assert settings.GEMINI_API_KEY.get_secret_value() == "gemini_the_real_thing"
+    assert settings.OPENROUTER_API_KEY.get_secret_value() == "openrouter_the_real_thing"
 
 
 def test_settings_are_frozen() -> None:
@@ -191,6 +207,14 @@ def test_settings_are_frozen() -> None:
 def test_verified_email_defaults_closed() -> None:
     """The switch exists for a Supabase schema change, not as a convenience."""
     assert _settings().REQUIRE_VERIFIED_EMAIL is True
+
+
+def test_latency_ranking_defaults_on() -> None:
+    """D11 is the behaviour, not the opt-in. The flag exists so a misbehaving
+    ranking can be switched off in one deploy — off is the fallback position, and
+    it reproduces the config order a cold process already serves."""
+    assert _settings().ROUTING_LATENCY_RANKING is True
+    assert _settings(ROUTING_LATENCY_RANKING=False).ROUTING_LATENCY_RANKING is False
 
 
 # --------------------------------------------------------------------------- #
@@ -285,6 +309,25 @@ def test_a_well_formed_provider_table_loads(tmp_path: Path) -> None:
     assert candidate.supports_streaming is True
     assert candidate.max_file_bytes is None
     assert candidate.reserved_fraction == 0.0
+
+
+def test_a_provider_that_declares_no_options_gets_an_empty_mapping(tmp_path: Path) -> None:
+    """Not ``None``. Every adapter is handed this at construction, and an
+    adapter with nothing to configure should not have to check."""
+    config = _load_yaml_model(ProvidersConfig, _write(tmp_path, _providers_document()))
+
+    assert config.providers["groq"].options == {}
+
+
+def test_options_are_carried_through_verbatim(tmp_path: Path) -> None:
+    """Header names are case- and hyphen-sensitive on the wire, so this is a
+    passthrough rather than anything that normalizes keys."""
+    document = _providers_document()
+    document["providers"]["groq"]["options"] = {"HTTP-Referer": "https://example.test"}
+
+    config = _load_yaml_model(ProvidersConfig, _write(tmp_path, document))
+
+    assert config.providers["groq"].options == {"HTTP-Referer": "https://example.test"}
 
 
 def test_a_misspelled_capability_is_a_boot_failure_not_a_silent_downgrade(tmp_path: Path) -> None:
@@ -488,10 +531,89 @@ def test_yaml_that_is_not_a_mapping_is_refused_by_shape(tmp_path: Path, content:
 # The checked-in configuration
 # --------------------------------------------------------------------------- #
 def test_the_committed_configuration_actually_loads() -> None:
-    """The one test here that reads ``config/*.yaml``.
+    """The first of the tests here that read ``config/*.yaml``.
 
     Every validator above is only worth having if the files in the repo satisfy
     them, and this is the check that would have caught a bad edit to either file
     before the deploy did.
     """
     validate_startup_config()
+
+
+def test_every_openrouter_model_keeps_its_free_suffix() -> None:
+    """Phase 2 trap 9. The ``:free`` suffix is part of the model *name*, not a
+    flag — dropping it does not fail, it silently routes to the paid variant of
+    the same model and bills a card. Asserted here rather than trusted to the
+    YAML, because the failure is invisible until an invoice arrives."""
+    config = get_providers_config()
+
+    routed = [
+        candidate.model
+        for slot in config.slots.values()
+        for candidate in slot.candidates
+        if candidate.provider == "openrouter"
+    ]
+
+    assert routed, "expected the committed table to route to openrouter somewhere"
+    for model in routed:
+        assert model.endswith(":free"), model
+
+    for provider, models in get_limits_config().limits.items():
+        if provider == "openrouter":
+            for model in models:
+                assert model.endswith(":free"), model
+
+
+def test_the_committed_table_declares_three_providers_with_one_enabled() -> None:
+    """The shape Phase 2 Step 1 leaves behind, and the thing Step 6 changes.
+
+    Gemini and OpenRouter are fully declared — models, capabilities, limits,
+    options — and switched off, because ``registry._traits`` refuses to build a
+    registry for an enabled provider it has no adapter for. Step 6 writes those
+    adapters and flips these two booleans; if this test fails with them already
+    true, check that ``_PROVIDER_TRAITS`` grew the matching entries.
+    """
+    config = get_providers_config()
+
+    assert set(config.providers) == {"groq", "gemini", "openrouter"}
+    assert config.providers["groq"].enabled is True
+    assert config.providers["gemini"].enabled is False
+    assert config.providers["openrouter"].enabled is False
+
+    # Declared but unroutable: the slot table still resolves to Groq alone.
+    assert set(config.enabled_slots()) == {"general", "fast"}
+
+
+def test_openrouter_carries_its_attribution_headers() -> None:
+    """OpenRouter reads these to attribute traffic to an app. They are not
+    secrets and they change per deployment, which is exactly why they are config
+    rather than constants inside the adapter."""
+    options = get_providers_config().providers["openrouter"].options
+
+    assert set(options) == {"HTTP-Referer", "X-Title"}
+    assert options["HTTP-Referer"].startswith("https://")
+
+
+def test_every_routable_candidate_has_a_limits_entry() -> None:
+    """Phase 3's tracker looks these up by ``(provider, model)``. A candidate
+    with no entry is not "unlimited" — it is a model the tracker cannot budget
+    for, and the mismatch is a typo in one of two files that nothing else would
+    catch until a quota check silently did nothing."""
+    providers = get_providers_config()
+    limits = get_limits_config()
+
+    for slot in providers.slots.values():
+        for candidate in slot.candidates:
+            assert limits.for_model(candidate.provider, candidate.model) is not None, (
+                f"{candidate.provider}/{candidate.model} is routable but has no limits entry"
+            )
+
+
+def test_geminis_daily_window_resets_on_pacific_time() -> None:
+    """The reason ``fixed_daily_pt`` exists at all. Google's RPD resets at
+    midnight Pacific; modelling it as a rolling 24h window makes the ``resets_at``
+    that Phase 3's ``/v1/models`` reports wrong by up to eight hours."""
+    limits = get_limits_config().for_model("gemini", "gemini-3.6-flash")
+
+    assert limits is not None
+    assert limits.reset.rpd == "fixed_daily_pt"

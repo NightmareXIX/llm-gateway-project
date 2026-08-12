@@ -27,6 +27,12 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
+    # Phase 2 Step 3's circuit breaker. `redis>=5.2` is already a runtime dep and
+    # goes unused until Step 2; this is what lets the breaker's state machine be
+    # tested without a running server. Deliberately no `tenacity`: Step 4's
+    # same-provider retries are hand-rolled, because a decorator fights the
+    # async-generator streaming path in Step 9.
+    "fakeredis>=2.26",
     "ruff>=0.8",
     "mypy>=1.13",
     "types-PyYAML>=6.0",

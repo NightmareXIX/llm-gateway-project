@@ -27,7 +27,7 @@ with no change here.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import httpx
@@ -195,13 +195,30 @@ class HttpProviderAdapter:
 
     name: ClassVar[str]
 
-    def __init__(self, *, client: httpx.AsyncClient, base_url: str) -> None:
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        base_url: str,
+        options: Mapping[str, str] | None = None,
+    ) -> None:
         self._client = client
         self._base_url = base_url.rstrip("/")
+        self._options = dict(options or {})
 
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def options(self) -> Mapping[str, str]:
+        """Non-secret per-deployment settings from ``providers.yaml``.
+
+        Empty for every provider that declares none, which is why the parameter
+        is defaulted: an adapter with nothing to configure should not have to
+        know this exists. OpenRouter's attribution headers are the first user.
+        """
+        return self._options
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}/{path.lstrip('/')}"

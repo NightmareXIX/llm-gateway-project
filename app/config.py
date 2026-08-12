@@ -89,6 +89,31 @@ class Settings(BaseSettings):
     the startup log."""
 
     GROQ_API_KEY: SecretStr
+    GEMINI_API_KEY: SecretStr
+    OPENROUTER_API_KEY: SecretStr
+    """The three provider credentials, all required, all read by
+    ``registry._resolve_system_key`` through the ``api_key_env`` name each
+    provider declares in ``providers.yaml``.
+
+    Required even while Gemini and OpenRouter are ``enabled: false`` — the same
+    reasoning that made ``REDIS_URL`` required through the whole of Phase 1. A
+    config surface that grows a variable the day a feature is switched on is a
+    config surface that breaks the deploy that switches it on; this way the
+    variable is already set, and turning the provider on is a YAML edit that
+    cannot fail on a missing secret."""
+
+    ROUTING_LATENCY_RANKING: bool = True
+    """D11: reorder ``auto``'s candidate list by observed latency.
+
+    On by default. Off restores pure ``providers.yaml`` declaration order, which
+    is also what a cold process does anyway — the ranking only applies to
+    candidates with enough successful samples to have earned a position.
+
+    It exists as a switch because the standing caveat of ranking by speed with no
+    quota filter (Phase 3) is that it leans toward whichever provider is closest
+    to its rate limit: Groq is the fastest thing in the pool *and* has the
+    tightest TPM ceiling. A flag is cheaper than a revert when the thing being
+    debugged is the router itself."""
 
     ENCRYPTION_KEY: SecretStr
     """Fernet key for BYOK provider-credential encryption (``app/core/crypto.py``)."""
@@ -151,6 +176,18 @@ class ProviderEntry(BaseModel):
     enabled: bool
     base_url: str
     api_key_env: str
+
+    options: dict[str, str] = Field(default_factory=dict)
+    """Non-secret, per-deployment settings handed to the adapter at construction.
+
+    OpenRouter's ``HTTP-Referer`` and ``X-Title`` attribution headers are the
+    reason this exists: they are not credentials, they differ per deployment, and
+    they belong to exactly one provider. Carrying them here keeps the registry
+    free of per-provider construction branches — every adapter takes ``options``
+    and the ones with nothing to configure ignore it.
+
+    Secrets never go in here. This file is checked in; ``api_key_env`` above is
+    the only path a credential takes."""
 
 
 KNOWN_CAPABILITIES = frozenset({"text", "vision", "pdf"})

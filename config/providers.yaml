@@ -1,9 +1,17 @@
 # Slot table: logical slot -> ordered candidate list (provider + model + capabilities).
 #
 # The router walks a slot's candidates in order and fails over down the list (D1/D2).
-# Phase 1 only ever resolves `general` and only ever reaches its first candidate.
-# Gemini and OpenRouter are declared but disabled — the shape is here so that turning
-# them on in Phase 3 is a config edit, not a code change.
+#
+# Phase 2 Step 1 declares all three providers in full — models, capabilities, limits
+# (config/limits.yaml) and options — while leaving Gemini and OpenRouter `enabled: false`.
+# That is deliberate, not half-finished work: `registry._traits` refuses to build a
+# registry for an enabled provider it has no adapter for, and the adapters land in
+# Step 6. Declaring first means Step 6 is the config edit this design promised — flip
+# two booleans, add two lines to `_PROVIDER_TRAITS` — rather than a research task about
+# which models still exist on a free tier.
+#
+# Candidates on a disabled provider are dropped by `build_model_specs`, so everything
+# below routes exactly as it did in Phase 1 until those flags change.
 
 version: 1
 
@@ -14,19 +22,36 @@ providers:
     api_key_env: GROQ_API_KEY
 
   gemini:
-    enabled: false
+    enabled: false # Step 6: adapter + flip
     base_url: https://generativelanguage.googleapis.com/v1beta
     api_key_env: GEMINI_API_KEY
 
   openrouter:
-    enabled: false
+    enabled: false # Step 6: adapter + flip
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
+    # Attribution headers OpenRouter reads to credit traffic to an app. Not secrets,
+    # and genuinely per-deployment, which is why they are config rather than constants
+    # in the adapter. A fork pointing at its own deployment edits these two lines.
+    options:
+      HTTP-Referer: https://llm-gateway-sed.fly.dev
+      X-Title: LLM Gateway
 
 # Each candidate carries every per-model fact `ModelSpec` needs. `priority` is not
 # a field — it is the candidate's index in the list below, so failover order and
 # priority order cannot disagree. `supports_system_field` is not a field either:
 # it is a property of the provider's wire format, and lives in registry.py.
+#
+# Order is the failover chain *and* D11's seed: `auto` flattens these lists in
+# declaration order, then reorders by measured latency only where it has enough
+# successful samples to justify it. A cold process serves exactly this order.
+#
+# Model IDs verified against each provider's live catalogue in August 2026. The free
+# tiers rotate — OpenRouter's DeepSeek/Llama/Qwen free variants were all delisted
+# between the project brief and this edit — so treat a 404 from one of these as news
+# about the provider, not a bug in the router. The `:free` suffix on every OpenRouter
+# model is load-bearing and asserted by a test: dropping it routes to the paid variant
+# silently.
 slots:
   general:
     description: Default answering slot — balanced quality and free-tier headroom.
@@ -40,6 +65,28 @@ slots:
         max_file_bytes: null
         reserved_fraction: 0.0
 
+      - provider: gemini
+        model: gemini-3.6-flash
+        context_tokens: 1048576
+        max_output_tokens: 65536
+        # The only candidate in the table that can see a file without the perception
+        # lane extracting it first. Phase 4 is what reads these two flags.
+        capabilities: [text, vision, pdf]
+        supports_streaming: true
+        max_file_bytes: 20000000
+        # D8's 50/50 answer/perception split becomes 0.5 in Phase 3, when
+        # quota/lanes.py is the thing that reads it. Zero until something does.
+        reserved_fraction: 0.0
+
+      - provider: openrouter
+        model: nvidia/nemotron-3-super-120b-a12b:free
+        context_tokens: 262144
+        max_output_tokens: 262144
+        capabilities: [text]
+        supports_streaming: true
+        max_file_bytes: null
+        reserved_fraction: 0.0
+
   fast:
     description: Latency-first slot for short turns.
     candidates:
@@ -47,6 +94,24 @@ slots:
         model: llama-3.1-8b-instant
         context_tokens: 131072
         max_output_tokens: 8192
+        capabilities: [text]
+        supports_streaming: true
+        max_file_bytes: null
+        reserved_fraction: 0.0
+
+      - provider: gemini
+        model: gemini-3.5-flash-lite
+        context_tokens: 1048576
+        max_output_tokens: 65536
+        capabilities: [text, vision, pdf]
+        supports_streaming: true
+        max_file_bytes: 20000000
+        reserved_fraction: 0.0
+
+      - provider: openrouter
+        model: openai/gpt-oss-20b:free
+        context_tokens: 131072
+        max_output_tokens: 32768
         capabilities: [text]
         supports_streaming: true
         max_file_bytes: null

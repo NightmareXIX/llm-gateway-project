@@ -206,6 +206,69 @@ def test_adapters_share_the_injected_client(client: httpx.AsyncClient) -> None:
     assert adapter._client is client
 
 
+def test_a_providers_options_reach_its_adapter(client: httpx.AsyncClient) -> None:
+    """OpenRouter's attribution headers arrive this way. The registry passes them
+    through without knowing what they mean, which is what keeps it free of
+    per-provider construction branches."""
+    config = _config(
+        providers={
+            "groq": ProviderEntry(
+                enabled=True,
+                base_url="https://api.groq.com/openai/v1",
+                api_key_env="GROQ_API_KEY",
+                options={"X-Title": "LLM Gateway"},
+            ),
+        },
+        slots={
+            "general": Slot(
+                description="one routable candidate",
+                candidates=(
+                    SlotCandidate(
+                        provider="groq",
+                        model="llama-3.3-70b-versatile",
+                        context_tokens=131072,
+                        max_output_tokens=32768,
+                    ),
+                ),
+            )
+        },
+    )
+    registry = build_registry(client=client, config=config, settings=get_settings())
+    adapter = registry.adapter_for("groq")
+
+    assert isinstance(adapter, GroqAdapter)
+    assert adapter.options == {"X-Title": "LLM Gateway"}
+
+
+def test_an_adapter_for_a_provider_with_no_options_gets_an_empty_mapping(
+    client: httpx.AsyncClient,
+) -> None:
+    registry = build_registry(client=client, config=_config(), settings=get_settings())
+    adapter = registry.adapter_for("groq")
+
+    assert isinstance(adapter, GroqAdapter)
+    assert adapter.options == {}
+
+
+def test_the_checked_in_config_still_builds_a_groq_only_registry(
+    client: httpx.AsyncClient,
+) -> None:
+    """The guard on Phase 2 Step 1's central decision.
+
+    Gemini and OpenRouter are declared in full and disabled, because an enabled
+    provider with no entry in ``_PROVIDER_TRAITS`` is a `ConfigError` at boot —
+    which is what makes Step 6 (write the adapters, add two traits, flip two
+    booleans) a change that cannot be half-applied.
+    """
+    registry = build_registry(client=client, settings=get_settings())
+
+    assert registry.slots() == ("general", "fast")
+    assert registry.primary("general").provider == "groq"
+    for provider in ("gemini", "openrouter"):
+        with pytest.raises(UnknownSlot):
+            registry.adapter_for(provider)
+
+
 def test_an_enabled_provider_with_an_empty_key_kills_startup(
     client: httpx.AsyncClient, settings: Settings
 ) -> None:

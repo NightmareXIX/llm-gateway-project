@@ -101,7 +101,8 @@ from app.config import Settings
 from app.db.session import create_db_engine
 s = Settings(DATABASE_URL=os.environ['PROBE_URL'], REDIS_URL='redis://x',
              SUPABASE_URL='https://x.supabase.co', SUPABASE_JWT_AUDIENCE='authenticated',
-             GROQ_API_KEY='x', ENCRYPTION_KEY='x')
+             GROQ_API_KEY='x', GEMINI_API_KEY='x', OPENROUTER_API_KEY='x',
+             ENCRYPTION_KEY='x')
 async def main():
     e = create_db_engine(s)
     async with e.connect() as c:
@@ -165,12 +166,18 @@ and [`alembic/env.py`](../alembic/env.py) resolves `DATABASE_URL` through `app/c
 validates the *whole* settings object. A missing `GROQ_API_KEY` fails the migration exactly as
 loudly as it would fail the app, before any machine starts.
 
-Seven secrets, and **only four of them are the values from your local `.env`**. Copying that file
+> **Phase 2 added two.** `GEMINI_API_KEY` and `OPENROUTER_API_KEY` are required `Settings` fields
+> as of Phase 2 Step 1, even though both providers are `enabled: false` in `config/providers.yaml`
+> until Step 6. On an app that already exists, set them **before** the deploy that carries this
+> change — otherwise the release command fails config validation and the rollout aborts, which looks
+> like a broken migration and is not one.
+
+Nine secrets, and **only six of them are the values from your local `.env`**. Copying that file
 wholesale points production at your laptop:
 
 | Secret | Value |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY` | same as `.env` |
+| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | same as `.env` |
 | `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
 | `REDIS_URL` | Upstash, from step 2 — `.env` holds `localhost:6379` |
 | `ENCRYPTION_KEY` | **generate a fresh one.** Nothing is encrypted with it until Phase 6, so a new key is free now; sharing dev's means a leaked dev `.env` also decrypts production, and rotating later is a migration |
@@ -179,7 +186,7 @@ wholesale points production at your laptop:
 > That last row is a real failure, not a hypothetical. A shell that interpolates a missing key as
 > `""` produces `fly secrets set REQUIRE_VERIFIED_EMAIL=""`, and the release command dies with
 > `Input should be a valid boolean, unable to interpret input`. Anything with a default in
-> `app/config.py` is a candidate for this; only the three in the first row are safe to read out of
+> `app/config.py` is a candidate for this; only the five in the first row are safe to read out of
 > `.env` programmatically, because only those are always present.
 
 `ENV` is deliberately absent — it lives in `fly.toml`'s `[env]` block as `prod`, and a secret of the
@@ -193,10 +200,12 @@ fly secrets set \
   SUPABASE_JWT_AUDIENCE='authenticated' \
   REQUIRE_VERIFIED_EMAIL='true' \
   GROQ_API_KEY='gsk_...' \
+  GEMINI_API_KEY='...' \
+  OPENROUTER_API_KEY='sk-or-v1-...' \
   ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
 
-Then confirm all seven names landed — Fly never shows values back:
+Then confirm all nine names landed — Fly never shows values back:
 
 ```bash
 fly secrets list
@@ -431,8 +440,10 @@ roll back a migration; Alembic downgrades are separate and deliberate.
 **Reading logs.** Everything is JSON with `request_id` and `user_id` bound. To trace one user report:
 `fly logs | grep <request-id>` — the id in the error envelope they quote is the same one.
 
-**Rotating the Groq key.** `fly secrets set GROQ_API_KEY=...` restarts the machines. A revoked key
-surfaces as a clean 502 with a `requests` row at `status='error'`, never a traceback.
+**Rotating a provider key.** `fly secrets set GROQ_API_KEY=...` (or `GEMINI_API_KEY` /
+`OPENROUTER_API_KEY`) restarts the machines. A revoked key surfaces as a clean 502 with a `requests`
+row at `status='error'`, never a traceback — and from Phase 2 Step 5 onward, as a failover to
+whichever provider is still live rather than as an error at all.
 
 **Database migrations on a live deploy.** They run before the new version takes traffic, which means
 a migration must be compatible with the *old* code for the length of the rollout. Additive changes
