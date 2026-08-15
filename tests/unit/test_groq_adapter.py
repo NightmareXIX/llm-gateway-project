@@ -7,6 +7,7 @@ the hard rule from ``CLAUDE.md`` made structural rather than aspirational.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 
 import httpx
@@ -292,13 +293,69 @@ def test_go_style_durations_parse(raw: str, expected: float | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The Phase 2 seam
+# stream() — Step 7
 # --------------------------------------------------------------------------- #
-def test_streaming_raises_on_call_not_on_first_chunk() -> None:
-    """The distinction that matters. An `async def` with a `yield` would return a
-    well-formed generator and only fail on the first `__anext__` — deep inside an
-    SSE response, after the headers were already sent."""
-    adapter = GroqAdapter(client=httpx.AsyncClient(), base_url=BASE_URL)
+async def test_stream_yields_one_chunk_per_frame_and_the_last_carries_usage() -> None:
+    async with fx.client_streaming(
+        [fx.read_sse("groq", "stream_success").encode("utf-8")]
+    ) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
 
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        chunks = [
+            chunk
+            async for chunk in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        ]
+
+    assert len(chunks) == 5
+    full_text = "A gateway sits between a client and several providers."
+    assert "".join(chunk.delta for chunk in chunks) == full_text
+    assert chunks[0].finish_reason is None
+    assert chunks[0].usage is None
+
+    last = chunks[-1]
+    assert last.delta == ""
+    assert last.finish_reason == "stop"
+    assert last.usage is not None
+    assert last.usage.tokens_in == 48
+    assert last.usage.tokens_out == 11
+    assert last.usage.estimated is False
+
+
+async def test_stream_request_carries_a_bearer_token_and_the_payload_verbatim() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=fx.read_sse("groq", "stream_success"))
+
+    async with fx.client_from(handler) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+        async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+            pass
+
+    assert requests[0].url.path.endswith("/chat/completions")
+    assert requests[0].headers["authorization"] == f"Bearer {KEY}"
+    assert json.loads(requests[0].content) == _payload()
+
+
+async def test_a_malformed_frame_raises_unavailable_not_a_decode_error() -> None:
+    """`_stream_events` hands `stream()` a frame that arrived, whole or not —
+    JSON parsing is this adapter's own job, and a half-written frame must not
+    escape as a `json.JSONDecodeError`."""
+    async with fx.client_streaming([b"data: {not valid json\n\n"]) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass
+
+
+async def test_a_truncated_stream_raises_unavailable() -> None:
+    async with fx.client_streaming(
+        [fx.read_sse("groq", "stream_truncated").encode("utf-8")]
+    ) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass

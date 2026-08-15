@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any, ClassVar, TypeGuard
 
@@ -52,6 +53,7 @@ from app.providers.types import (
     ModelSpec,
     QuotaHint,
     ResolvedAttachment,
+    StreamChunk,
     Usage,
 )
 
@@ -239,6 +241,48 @@ class GroqAdapter(HttpProviderAdapter):
 
         finish_reason = _FINISH_REASONS.get(raw_finish, "stop") if raw_finish else "stop"
         return content, finish_reason
+
+    async def stream(
+        self,
+        payload: dict[str, Any],
+        key: str,
+        timeout: float,
+        idle_timeout: float,
+    ) -> AsyncIterator[StreamChunk]:
+        """Groq's OpenAI-shaped SSE stream, one delta per chunk.
+
+        ``base.py``'s ``_stream_events`` owns framing, the idle timeout and every
+        transport-level fault; everything here is specific to Groq's JSON
+        shape — where the delta text lives, and that usage rides on the final
+        chunk under ``x_groq`` rather than the ``usage`` key ``extract_usage``
+        reads from a non-streaming body.
+        """
+        model = str(payload.get("model", "unknown"))
+
+        async for frame in self._stream_events(
+            "POST",
+            CHAT_COMPLETIONS_PATH,
+            headers=self._auth_headers(key),
+            json=payload,
+            timeout_s=timeout,
+            idle_timeout_s=idle_timeout,
+            model=model,
+        ):
+            try:
+                event = json.loads(frame)
+            except json.JSONDecodeError as exc:
+                # An event that arrived is not the same as an event that arrived
+                # whole — a connection cut mid-write leaves valid SSE framing
+                # wrapped around invalid JSON, and that must not escape as a
+                # decoding traceback deep inside a streaming response.
+                raise Unavailable(
+                    "groq sent a malformed stream frame",
+                    provider=self.name,
+                    model=model,
+                ) from exc
+
+            if isinstance(event, dict):
+                yield _stream_chunk_from_event(event)
 
     # ----------------------------------------------------------------- #
     # Normalization
@@ -484,6 +528,43 @@ def _render_attachment(attachment: ResolvedAttachment) -> str:
         )
 
     return document_envelope(attachment)
+
+
+def _stream_chunk_from_event(event: dict[str, Any]) -> StreamChunk:
+    """One decoded ``chat.completion.chunk`` -> one :class:`StreamChunk`.
+
+    Tolerant of whichever fields a given chunk carries: the first chunk is a
+    bare role announcement with no content, most chunks carry only a delta, and
+    only the last carries a ``finish_reason`` and Groq's ``x_groq.usage`` block.
+    """
+    delta_text = ""
+    finish_reason: str | None = None
+
+    choices = event.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str):
+                    delta_text = content
+
+            raw_finish = choice.get("finish_reason")
+            if isinstance(raw_finish, str):
+                finish_reason = _FINISH_REASONS.get(raw_finish, raw_finish)
+
+    usage: Usage | None = None
+    x_groq = event.get("x_groq")
+    if isinstance(x_groq, dict):
+        raw_usage = x_groq.get("usage")
+        if isinstance(raw_usage, dict):
+            tokens_in = raw_usage.get("prompt_tokens")
+            tokens_out = raw_usage.get("completion_tokens")
+            if _is_int(tokens_in) and _is_int(tokens_out):
+                usage = Usage(tokens_in=tokens_in, tokens_out=tokens_out, estimated=False)
+
+    return StreamChunk(delta=delta_text, finish_reason=finish_reason, usage=usage)
 
 
 def _json_object(response: httpx.Response) -> dict[str, Any] | None:

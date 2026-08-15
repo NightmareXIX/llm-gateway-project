@@ -27,6 +27,7 @@ with no change here.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
@@ -298,7 +299,103 @@ class HttpProviderAdapter:
         it raises immediately. An async generator would return a perfectly
         well-formed object and only fail on the first ``__anext__`` — deep inside
         an SSE response, after the headers were already sent.
+
+        Adapters that implement streaming build on :meth:`_stream_events` rather
+        than reimplementing this raise.
         """
         raise NotImplementedError(
             f"{self.name}: streaming lands in Phase 2 with the D1 restart state machine"
         )
+
+    # ---- shared streaming plumbing (Step 7) -------------------------------- #
+    async def _stream_events(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+        timeout_s: float,
+        idle_timeout_s: float,
+        model: str,
+    ) -> AsyncIterator[str]:
+        """Open a streaming request and yield each SSE event's ``data:`` payload.
+
+        Shared by every adapter's ``stream()`` so idle-timeout enforcement and
+        mid-stream fault normalization exist in exactly one place — the reason
+        the contract puts these obligations on ``stream`` at all is so a third
+        adapter cannot forget them, and that only holds if there is one place to
+        get them right. Per-adapter frame→:class:`StreamChunk` mapping is the
+        adapter's own job; this method never looks inside the JSON.
+
+        Assembles multi-line ``data:`` fields per the SSE spec, skips comment
+        lines (keepalive pings — proof the connection is alive, not that the
+        model is still generating, so they never reset the idle clock below),
+        and stops — without yielding — at a ``[DONE]`` sentinel.
+
+        **Idle timeout** applies to the gap between raw lines arriving on the
+        wire, measured with ``asyncio.wait_for`` around each ``__anext__``. A
+        provider that accepts the connection and then goes quiet trips this
+        as :class:`~app.providers.errors.Unavailable` rather than hanging the
+        request open for the full read timeout.
+
+        **Mid-stream faults** — a reset connection, a truncated body — surface
+        from ``httpx`` as ``httpx.HTTPError`` subclasses partway through
+        iteration; they are normalized through the adapter's own
+        :meth:`parse_error`, exactly like the non-streaming path, so a truncated
+        response never escapes as a bare decoding traceback.
+        """
+        try:
+            async with self._client.stream(
+                method,
+                self._url(path),
+                headers=headers,
+                json=json,
+                timeout=self._timeout(timeout_s),
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    error = self.parse_error(response, model=model)
+                    logger.warning("provider.request_failed", **error.log_fields())
+                    raise error
+
+                lines: AsyncIterator[str] = response.aiter_lines()
+                data_lines: list[str] = []
+                while True:
+                    try:
+                        raw_line = await asyncio.wait_for(lines.__anext__(), idle_timeout_s)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise Unavailable(
+                            "idle stall: no data from provider within the timeout",
+                            provider=self.name,
+                            model=model,
+                        ) from exc
+
+                    line = raw_line.rstrip("\r\n")
+                    if line == "":
+                        if data_lines:
+                            payload = "\n".join(data_lines)
+                            data_lines = []
+                            if payload == "[DONE]":
+                                return
+                            yield payload
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[len("data:") :].lstrip())
+
+                # A stream that ends without a trailing blank line still has a
+                # pending event worth surfacing — often the truncated one that
+                # proves the connection died mid-write, which the adapter's own
+                # JSON parsing is what turns into a normalized error.
+                if data_lines:
+                    payload = "\n".join(data_lines)
+                    if payload != "[DONE]":
+                        yield payload
+        except httpx.HTTPError as exc:
+            error = self.parse_error(exc, model=model)
+            logger.warning("provider.transport_error", **error.log_fields(), path=path)
+            raise error from exc

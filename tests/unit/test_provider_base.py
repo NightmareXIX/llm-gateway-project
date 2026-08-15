@@ -131,3 +131,88 @@ def test_the_groq_adapter_satisfies_the_protocol_at_runtime_too() -> None:
     adapter = GroqAdapter(client=httpx.AsyncClient(), base_url=BASE_URL)
 
     assert isinstance(adapter, ProviderAdapter)
+
+
+# --------------------------------------------------------------------------- #
+# _stream_events — Step 7's shared SSE plumbing
+# --------------------------------------------------------------------------- #
+async def _collect_frames(
+    adapter: HttpProviderAdapter, *, idle_timeout_s: float = 5.0
+) -> list[str]:
+    return [
+        frame
+        async for frame in adapter._stream_events(
+            "POST",
+            "/x",
+            headers={},
+            json={},
+            timeout_s=5.0,
+            idle_timeout_s=idle_timeout_s,
+            model="m",
+        )
+    ]
+
+
+async def test_stream_events_assembles_multiline_data_and_skips_comment_lines() -> None:
+    """A comment (keepalive) line carries no data and must not surface as an
+    empty event — only a real `data:` field is a frame."""
+    async with fx.client_streaming(
+        [b": keepalive\n\n", b"data: line one\ndata: line two\n\n", b"data: [DONE]\n\n"]
+    ) as client:
+        frames = await _collect_frames(_BareAdapter(client=client, base_url=BASE_URL))
+
+    assert frames == ["line one\nline two"]
+
+
+async def test_stream_events_stops_without_yielding_the_done_sentinel() -> None:
+    async with fx.client_streaming([b"data: hello\n\n", b"data: [DONE]\n\n"]) as client:
+        frames = await _collect_frames(_BareAdapter(client=client, base_url=BASE_URL))
+
+    assert frames == ["hello"]
+
+
+async def test_stream_events_yields_a_dangling_frame_with_no_trailing_blank_line() -> None:
+    """A connection that dies mid-event still has one buffered frame worth
+    handing to the adapter — which is what turns it into a decode error instead
+    of the delta silently vanishing."""
+    async with fx.client_streaming([b"data: unterminated"]) as client:
+        frames = await _collect_frames(_BareAdapter(client=client, base_url=BASE_URL))
+
+    assert frames == ["unterminated"]
+
+
+async def test_stream_events_raises_unavailable_on_an_idle_stall() -> None:
+    """A provider that accepts the connection and then goes quiet trips the
+    idle timeout rather than hanging the request open."""
+    async with fx.client_streaming([b"data: hi\n\n", 10.0, b"data: [DONE]\n\n"]) as client:
+        adapter = _BareAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable, match="idle stall"):
+            await _collect_frames(adapter, idle_timeout_s=0.05)
+
+
+async def test_stream_events_normalizes_a_mid_stream_protocol_error() -> None:
+    """A truncated body raises `httpx.RemoteProtocolError` partway through
+    iteration; it must come out normalized, not as a bare transport exception."""
+    async with fx.client_streaming(
+        [b"data: hi\n\n", httpx.RemoteProtocolError("truncated")]
+    ) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable):
+            await _collect_frames(adapter)
+
+
+async def test_stream_events_raises_the_normalized_error_for_a_non_2xx_status() -> None:
+    """Deciding what the status means is still `parse_error`'s job — the
+    streaming path checks the status and delegates exactly like the
+    non-streaming one, rather than deciding for itself."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "slow down"})
+
+    async with fx.client_from(handler) as client:
+        adapter = _BareAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable):
+            await _collect_frames(adapter)

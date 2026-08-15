@@ -11,7 +11,9 @@ force every caller into the dependency-injection style whether it helps or not.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -43,6 +45,13 @@ class RecordedResponse:
     headers: dict[str, str]
     body: dict[str, Any] | None
     text: str | None
+    request_body: dict[str, Any] | None = None
+    """The payload that produced this response, when the fixture recorded one.
+
+    What makes the conformance suite's estimate check mean anything: without it,
+    ``estimate_tokens`` gets measured against usage reported for a completely
+    different prompt.
+    """
 
     @property
     def is_live(self) -> bool:
@@ -73,6 +82,7 @@ def load(provider: str, name: str) -> RecordedResponse:
         headers=response.get("headers", {}),
         body=response.get("body"),
         text=response.get("text"),
+        request_body=raw.get("request", {}).get("body"),
     )
 
 
@@ -85,6 +95,39 @@ def load_all(provider: str) -> dict[str, RecordedResponse]:
 def read_sse(provider: str, name: str) -> str:
     """Raw SSE text for the Phase 2 streaming cases."""
     return (FIXTURE_ROOT / provider / f"{name}.sse").read_text(encoding="utf-8")
+
+
+class ScriptedByteStream(httpx.AsyncByteStream):
+    """A response body that trickles out on a script, for streaming tests.
+
+    A bare async generator does not satisfy ``httpx.Response(stream=...)`` —
+    it checks ``isinstance(..., AsyncByteStream)`` rather than duck-typing —
+    so genuinely delayed or mid-stream-failing bodies need a real subclass.
+    Each scripted item is either a chunk of bytes to yield, a delay in seconds
+    to await first (what makes an idle-timeout test deterministic instead of
+    `sleep`-based guessing), or an exception to raise in place of a chunk
+    (what makes a mid-stream transport fault reproducible).
+    """
+
+    def __init__(self, script: Sequence[bytes | float | BaseException]) -> None:
+        self._script = script
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for item in self._script:
+            if isinstance(item, float):
+                await asyncio.sleep(item)
+            elif isinstance(item, BaseException):
+                raise item
+            else:
+                yield item
+
+    async def aclose(self) -> None:
+        return None
+
+
+def client_streaming(script: Sequence[bytes | float | BaseException]) -> httpx.AsyncClient:
+    """A client whose response body plays out exactly as scripted."""
+    return client_from(lambda _request: httpx.Response(200, stream=ScriptedByteStream(script)))
 
 
 def client_returning(recorded: RecordedResponse) -> httpx.AsyncClient:
@@ -136,6 +179,78 @@ class RecordingHandler:
 
     def client(self) -> httpx.AsyncClient:
         return client_from(self)
+
+
+class ScriptedHandler:
+    """Serves a *sequence* of fixtures — one per request, in order.
+
+    What :class:`RecordingHandler` is for asserting on the payload we sent, this
+    is for asserting on what the router does when the second answer differs from
+    the first: a 429 then a 200 is a failover, a 503 then a 200 is a retry, and
+    the difference between those two is the whole of Step 4.
+
+    Faking at the transport layer rather than behind a fake ``ProviderAdapter``
+    keeps every test in the repo mocking at one seam, and means the router is
+    exercised through the real adapter's ``parse_error`` — which is where the
+    normalized error it branches on actually comes from.
+
+    An unscripted request is an assertion failure, not a repeat of the last
+    response. "The loop tried a fourth time" is exactly the bug the attempt cap
+    exists to prevent, and silently answering it would hide that.
+    """
+
+    def __init__(self, *script: RecordedResponse) -> None:
+        self.script = list(script)
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        index = len(self.requests) - 1
+        if index >= len(self.script):
+            raise AssertionError(
+                f"unscripted request #{index + 1} to {request.url}; "
+                f"the script holds {len(self.script)}"
+            )
+        return self.script[index].to_response()
+
+    @property
+    def calls(self) -> int:
+        """How many requests actually left the process."""
+        return len(self.requests)
+
+    def models(self) -> list[str]:
+        """The model each request targeted, in order.
+
+        The candidate chain, as observed from the wire — which is a stronger
+        assertion than the router's own report of what it did.
+
+        Reads the body first, then falls back to the URL: Gemini names the model in
+        the path (``/models/{model}:generateContent``) and rejects it in the body,
+        so a body-only reading returns ``""`` for every Gemini attempt and a
+        cross-provider chain assertion goes quiet exactly where it matters most.
+        """
+        return [_target_model(request) for request in self.requests]
+
+    def client(self) -> httpx.AsyncClient:
+        return client_from(self)
+
+
+def _target_model(request: httpx.Request) -> str:
+    """The model a recorded request was aimed at, whichever half of it carries one."""
+    try:
+        body = json.loads(request.content)
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        model = body.get("model")
+        if isinstance(model, str) and model:
+            return model
+
+    # `/v1beta/models/gemini-3.6-flash:generateContent` -> `gemini-3.6-flash`.
+    segment = request.url.path.rsplit("/", 1)[-1]
+    if ":" in segment:
+        return segment.split(":", 1)[0]
+    return ""
 
 
 def canonical_history() -> list[CanonicalMessage]:
