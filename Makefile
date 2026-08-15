@@ -50,9 +50,11 @@ migrate:
 revision:
 	alembic revision --autogenerate -m "$(MSG)"
 
-# The ONLY thing in this repo that calls a live provider. Run it once with a
-# working GROQ_API_KEY; the committed fixtures serve every test forever after.
+# The ONLY thing in this repo that calls a live provider. Run it once with working
+# keys; the committed fixtures serve every test forever after. A provider whose key
+# is still the .env.example placeholder is skipped rather than failing the run.
 # make record-fixtures ARGS="--force"
+# make record-fixtures ARGS="--provider gemini --only success"
 record-fixtures:
 	$(PYTHON) -m scripts.record_fixtures $(ARGS)
 

@@ -12,7 +12,7 @@ response mid-test and inspect the payload that was sent.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -22,14 +22,38 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Message, Request
+from app.config import ProvidersConfig, get_providers_config
+from app.db.models import Conversation, Message, Request
 from app.providers.registry import build_registry
 from tests import provider_fixtures
 from tests.conftest import TokenFactory
+from tests.provider_fixtures import ScriptedHandler
 
 pytestmark = pytest.mark.integration
 
 COMPLETIONS = "/v1/chat/completions"
+
+
+def _groq_only() -> ProvidersConfig:
+    """The committed slot table with the other two providers switched off.
+
+    Most of the tests below assert on a *two-candidate* fleet — the exact chain
+    that was attempted, the exact length of the trail, which provider ended up on
+    the ``requests`` row. Those are statements about the router, not about which
+    providers Phase 2 Step 6 happened to enable, and pinning the fleet is what
+    keeps them from having to be rewritten every time the YAML grows a candidate.
+    Cross-provider failover has its own test, against the real config.
+
+    ``model_copy`` rather than mutation: both models are frozen, and
+    ``get_providers_config`` is ``lru_cache``d, so editing in place would leak into
+    every other test in the session.
+    """
+    config = get_providers_config()
+    providers = {
+        name: entry if name == "groq" else entry.model_copy(update={"enabled": False})
+        for name, entry in config.providers.items()
+    }
+    return config.model_copy(update={"providers": providers})
 
 
 @pytest.fixture
@@ -42,11 +66,66 @@ async def groq(app: FastAPI) -> AsyncIterator[provider_fixtures.RecordingHandler
     """
     handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
     client = handler.client()
-    app.state.provider_registry = build_registry(client=client)
+    app.state.provider_registry = build_registry(client=client, config=_groq_only())
     try:
         yield handler
     finally:
         await client.aclose()
+
+
+@pytest.fixture
+async def groq_script(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHandler]]:
+    """Install a handler that answers a *sequence* of fixtures, one per call.
+
+    The failover fixture. ``groq`` above repeats one response forever, which
+    cannot express "the first candidate 429s and the second one answers" — the
+    single behaviour Step 5 exists to deliver.
+
+    Pinned to a Groq-only fleet of two models: ``general``'s
+    ``llama-3.3-70b-versatile`` and ``fast``'s ``llama-3.1-8b-instant``. D10's
+    spill means either slot's chain reaches both, so these tests exercise the
+    failover loop against a chain short enough to script exactly.
+    """
+    installed: list[httpx.AsyncClient] = []
+
+    def install(*names: str) -> ScriptedHandler:
+        handler = ScriptedHandler(*(provider_fixtures.load("groq", name) for name in names))
+        client = handler.client()
+        installed.append(client)
+        app.state.provider_registry = build_registry(client=client, config=_groq_only())
+        return handler
+
+    try:
+        yield install
+    finally:
+        for client in installed:
+            await client.aclose()
+
+
+@pytest.fixture
+async def fleet_script(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHandler]]:
+    """``groq_script``'s cross-provider sibling, against the *committed* config.
+
+    Fixtures are named ``"provider/case"``, because the point of this fixture is
+    that consecutive attempts land on different providers. Nothing else in this
+    module uses the real three-provider fleet, which is deliberate: one test
+    proving Milestone A beats six tests that all have to be re-scripted whenever a
+    candidate is added.
+    """
+    installed: list[httpx.AsyncClient] = []
+
+    def install(*specs: str) -> ScriptedHandler:
+        handler = ScriptedHandler(*(provider_fixtures.load(*spec.split("/", 1)) for spec in specs))
+        client = handler.client()
+        installed.append(client)
+        app.state.provider_registry = build_registry(client=client)
+        return handler
+
+    try:
+        yield install
+    finally:
+        for client in installed:
+            await client.aclose()
 
 
 def _headers(make_jwt: TokenFactory, **kwargs: Any) -> dict[str, str]:
@@ -425,6 +504,269 @@ async def test_an_empty_generation_is_not_stored(
     (row,) = await _requests(db_session)
     stored = await _messages(db_session, str(row.conversation_id))
     assert [m.role for m in stored] == ["user"]
+
+
+# --------------------------------------------------------------------------- #
+# Failover — Phase 2 Step 5, and the first time any of this is true
+# --------------------------------------------------------------------------- #
+async def test_a_rate_limited_slot_is_substituted_and_says_so(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """D2 end to end: the named slot fails, another answers, and the response
+    discloses it. Before D10's spill this assertion was unwritable — inside one
+    slot the requested and served slots cannot differ (ADR-011)."""
+    handler = groq_script("rate_limited", "success")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"model": "fast", "messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["requested_slot"] == "fast"
+    assert body["served_by"]["slot"] == "general"
+    assert body["served_by"]["model"] == "llama-3.3-70b-versatile"
+    assert body["substituted"] is True
+    assert body["attempts"] == 2
+    # The chain as the wire saw it: the named slot first, then the spill.
+    assert handler.models() == ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
+
+    stored = await _messages(db_session, body["conversation_id"])
+    assert stored[1].meta["substituted"] is True
+    assert stored[1].meta["attempts"] == 2
+    assert stored[1].meta["model_used"] == "llama-3.3-70b-versatile"
+
+
+async def test_auto_failing_over_is_not_a_substitution(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+) -> None:
+    """Nothing was overridden — the client asked the gateway to choose. Reporting
+    `substituted` here would cry wolf on every ordinary failover and train people
+    to ignore the field that matters."""
+    handler = groq_script("rate_limited", "success")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    body = response.json()
+    assert body["substituted"] is False
+    assert body["attempts"] == 2
+    assert body["served_by"]["slot"] == "fast"
+    assert handler.calls == 2
+
+
+async def test_exactly_one_assistant_message_however_many_attempts(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """One logical message, one row. The discarded attempt leaves no trace in
+    ``messages`` — which is exactly why the trail in ``requests`` has to exist."""
+    groq_script("rate_limited", "success")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    stored = await _messages(db_session, response.json()["conversation_id"])
+    assert [(m.seq, m.role) for m in stored] == [(0, "user"), (1, "assistant")]
+
+
+async def test_the_attempt_trail_reaches_the_requests_row(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """``requests.attempts`` is the only place a discarded attempt survives, and
+    Phase 7's dashboard reads this shape."""
+    groq_script("rate_limited", "success")
+
+    await client.post(
+        COMPLETIONS,
+        json={"model": "fast", "messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    (row,) = await _requests(db_session)
+    assert row.status == "ok"
+    assert row.substituted is True
+    assert row.served_slot == "general"
+    assert row.model == "llama-3.3-70b-versatile"
+
+    first, second = row.attempts
+    assert first["n"] == 1
+    assert first["outcome"] == "error"
+    assert first["error_code"] == "rate_limited"
+    assert first["model"] == "llama-3.1-8b-instant"
+    assert second["outcome"] == "ok"
+    assert second["model"] == "llama-3.3-70b-versatile"
+    assert row.wasted_tokens_out == 0
+
+
+async def test_a_failed_request_still_records_what_it_tried(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """The row that answers "why did this take eight seconds before failing?".
+    Two candidates, both spent, and the trail is the only record of the first."""
+    handler = groq_script("rate_limited", "rate_limited")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "rate_limited"
+    assert handler.calls == 2
+
+    (row,) = await _requests(db_session)
+    assert row.status == "error"
+    assert [attempt["outcome"] for attempt in row.attempts] == ["error", "error"]
+    assert [attempt["model"] for attempt in row.attempts] == [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+    ]
+    # The last candidate attempted, so "which slot was it on?" stays answerable.
+    assert row.served_slot == "fast"
+
+
+# --------------------------------------------------------------------------- #
+# Milestone A — failover across genuinely different providers
+# --------------------------------------------------------------------------- #
+async def test_failover_crosses_providers(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    fleet_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """The one test in this module that runs against the real three-provider fleet.
+
+    Everything above proves the failover *loop* works, but only across two Groq
+    models — which cannot distinguish "the router recovers from a failure" from
+    "the router recovers from a failure it understands the shape of". Here the
+    second attempt is a different provider, with a different request shape, a
+    different auth header, the model in the URL instead of the body, and a
+    completely different response schema. Nothing in ``router.py`` knows any of
+    that; the whole difference lives behind Contract A.
+
+    This is Milestone A's exit criterion, and the only place it is asserted.
+    """
+    handler = fleet_script("groq/rate_limited", "gemini/success")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"model": "general", "messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["served_by"]["provider"] == "gemini"
+    assert body["served_by"]["model"] == "gemini-3.6-flash"
+    assert body["served_by"]["slot"] == "general"
+    # Still the requested slot, so this is a failover rather than a substitution.
+    assert body["substituted"] is False
+    assert body["attempts"] == 2
+
+    # The chain as the wire saw it. The second entry comes out of the URL, because
+    # Gemini has no `model` field in its body at all.
+    assert handler.models() == ["llama-3.3-70b-versatile", "gemini-3.6-flash"]
+
+    (row,) = await _requests(db_session)
+    assert row.provider == "gemini"
+    assert [attempt["provider"] for attempt in row.attempts] == ["groq", "gemini"]
+
+    # Gemini's own `usageMetadata`, read through its own `extract_usage` and landing
+    # in the same columns Groq's `usage` block does — which is the accounting half of
+    # the abstraction. Derived from the fixture rather than pasted from it, because
+    # that fixture is a live capture whose token counts change on every re-record.
+    served = provider_fixtures.load("gemini", "success")
+    assert served.body is not None
+    metadata = served.body["usageMetadata"]
+    assert row.tokens_in == metadata["promptTokenCount"]
+    assert row.tokens_out == metadata["candidatesTokenCount"] + metadata["thoughtsTokenCount"]
+
+    stored = await _messages(db_session, body["conversation_id"])
+    assert stored[1].meta["provider_used"] == "gemini"
+    assert stored[1].meta["attempts"] == 2
+
+
+async def test_a_bad_request_aborts_on_the_first_candidate(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """Asserted through the endpoint, not just the router: a malformed payload is
+    equally unparseable on the next model, and walking it down the chain would
+    turn one fast failure into two slow ones."""
+    handler = groq_script("bad_request")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_headers(make_jwt),
+    )
+
+    assert response.status_code == 502
+    assert handler.calls == 1
+    (row,) = await _requests(db_session)
+    assert len(row.attempts) == 1
+
+
+async def test_a_pinned_conversation_ignores_the_requested_slot(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """D3's read side. Nothing writes ``pinned_model`` until tool calls land, so
+    the test sets it the way that code eventually will — and the router honours it
+    over ``auto``, which would otherwise have picked ``general``."""
+    handler = groq_script("success", "success")
+    headers = _headers(make_jwt)
+
+    first = await client.post(
+        COMPLETIONS, json={"messages": [{"role": "user", "content": "hi"}]}, headers=headers
+    )
+    conversation_id = UUID(first.json()["conversation_id"])
+    assert first.json()["served_by"]["model"] == "llama-3.3-70b-versatile"
+
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    conversation.pinned_model = "groq/llama-3.1-8b-instant"
+    await db_session.flush()
+
+    second = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "auto",
+            "conversation_id": str(conversation_id),
+            "messages": [{"role": "user", "content": "and again"}],
+        },
+        headers=headers,
+    )
+
+    assert second.json()["served_by"]["model"] == "llama-3.1-8b-instant"
+    assert handler.models()[-1] == "llama-3.1-8b-instant"
 
 
 # --------------------------------------------------------------------------- #

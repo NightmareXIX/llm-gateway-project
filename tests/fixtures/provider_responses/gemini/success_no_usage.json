@@ -1,0 +1,30 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 200 with no usageMetadata at all. Rare from Gemini but the contract requires `extract_usage` to fall back to an estimate with `estimated=True` rather than reporting a zero that is indistinguishable from a real measurement.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "candidates": [
+        {
+          "content": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "The router keeps trying candidates until one answers or the attempt budget runs out."
+              }
+            ]
+          },
+          "finishReason": "STOP",
+          "index": 0
+        }
+      ],
+      "modelVersion": "gemini-3.6-flash",
+      "responseId": "9f77c2a5-b6e1-4d90-8a1f-0c2e3d444b1a"
+    }
+  }
+}

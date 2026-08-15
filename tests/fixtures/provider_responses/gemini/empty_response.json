@@ -1,0 +1,21 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "HTTP 200 with an empty candidates list and NO promptFeedback — nothing was refused, the model simply returned nothing usable. Common on free tiers, not provokable on demand, so this stays synthetic even after a recording run. The absent promptFeedback is what makes this EmptyResponse rather than ContentFiltered; `blocked_prompt.json` is the other half of that pair.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "candidates": [],
+      "usageMetadata": {
+        "promptTokenCount": 64,
+        "totalTokenCount": 64
+      },
+      "modelVersion": "gemini-3.6-flash",
+      "responseId": "5b6e1d90-8a1f-4c2e-9f77-0c2a3d444b1a"
+    }
+  }
+}

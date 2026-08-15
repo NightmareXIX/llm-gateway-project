@@ -12,9 +12,12 @@ from typing import Annotated
 
 import httpx
 from fastapi import Depends, Request
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.providers.registry import ProviderRegistry
+from app.routing.circuit_breaker import CircuitBreaker
+from app.usage.metrics import LatencyTable
 
 
 def get_engine(request: Request) -> AsyncEngine:
@@ -57,6 +60,47 @@ def get_registry(request: Request) -> ProviderRegistry:
     return registry
 
 
+def get_redis(request: Request) -> Redis:
+    """The process-wide Redis client, opened once in the lifespan.
+
+    Handed out rather than depended on: nothing may assume a command will
+    succeed. Redis is fail-open here (ADR-010) — the breaker that reads it treats
+    an unreachable server as "every candidate allowed", which is a slower correct
+    gateway rather than a broken one. Quota, in Phase 3, will fail closed on the
+    same client for the opposite reason.
+    """
+    client: Redis = request.app.state.redis
+    return client
+
+
+def get_breaker(request: Request) -> CircuitBreaker:
+    """A circuit breaker over the process-wide Redis client.
+
+    Constructed per request rather than held in the lifespan, and that is not
+    laziness: the breaker keeps no state of its own — the ``cb:{provider}:{model}``
+    hash *is* the state, shared by every worker and every instance. A singleton
+    would suggest there is something to share in-process, which is exactly the
+    misunderstanding the Redis-backed design exists to prevent. Constructing one
+    is three attribute assignments.
+    """
+    return CircuitBreaker(get_redis(request))
+
+
+def get_latency(request: Request) -> LatencyTable:
+    """The in-process EWMA latency table `auto` ranks with (ADR-014).
+
+    The mirror image of the breaker: one per *process*, created in the lifespan,
+    because its entire value is that it accumulates across requests. It is
+    deliberately not in Redis — Contract C is frozen, and a cross-instance latency
+    key is a change that needs sign-off rather than a side effect.
+    """
+    table: LatencyTable = request.app.state.latency
+    return table
+
+
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
+RedisDep = Annotated[Redis, Depends(get_redis)]
+BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]
+LatencyDep = Annotated[LatencyTable, Depends(get_latency)]

@@ -564,23 +564,22 @@ def test_every_openrouter_model_keeps_its_free_suffix() -> None:
                 assert model.endswith(":free"), model
 
 
-def test_the_committed_table_declares_three_providers_with_one_enabled() -> None:
-    """The shape Phase 2 Step 1 leaves behind, and the thing Step 6 changes.
+def test_the_committed_table_declares_three_providers_all_enabled() -> None:
+    """Phase 2 Step 6's config half, and the guard on it.
 
-    Gemini and OpenRouter are fully declared — models, capabilities, limits,
-    options — and switched off, because ``registry._traits`` refuses to build a
-    registry for an enabled provider it has no adapter for. Step 6 writes those
-    adapters and flips these two booleans; if this test fails with them already
-    true, check that ``_PROVIDER_TRAITS`` grew the matching entries.
+    Step 1 declared all three in full — models, capabilities, limits, options — and
+    left these two switched off until their adapters existed. Enabling them is only
+    safe because ``registry._traits`` refuses to build a registry for an enabled
+    provider it has no adapter for, so the flag and ``_PROVIDER_TRAITS`` cannot
+    drift apart: a mistake here is a boot failure rather than a 502 mid-demo.
     """
     config = get_providers_config()
 
     assert set(config.providers) == {"groq", "gemini", "openrouter"}
     assert config.providers["groq"].enabled is True
-    assert config.providers["gemini"].enabled is False
-    assert config.providers["openrouter"].enabled is False
+    assert config.providers["gemini"].enabled is True
+    assert config.providers["openrouter"].enabled is True
 
-    # Declared but unroutable: the slot table still resolves to Groq alone.
     assert set(config.enabled_slots()) == {"general", "fast"}
 
 

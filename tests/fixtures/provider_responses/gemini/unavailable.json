@@ -1,0 +1,19 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "The overloaded-model 503 that free tiers serve most often. Unavailable: retryable against the same provider, failover-eligible, and breaker-eligible.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "error": {
+        "code": 503,
+        "message": "The model is overloaded. Please try again later.",
+        "status": "UNAVAILABLE"
+      }
+    }
+  }
+}

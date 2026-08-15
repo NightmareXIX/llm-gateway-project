@@ -1,0 +1,27 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "HTTP 200, a well-formed envelope, and nothing in it. Ordinary rather than exceptional on OpenRouter, since it proxies upstreams it does not control. Not provokable on demand, so this stays synthetic even after a recording run. EmptyResponse is retryable and failover-eligible but deliberately NOT breaker-eligible — a free tier returning 200-with-nothing is annoying, not broken.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "gen-1786622402-Zm4r1yb0sh9vc5p8o2x6",
+      "object": "chat.completion",
+      "created": 1786622402,
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "provider": "Nvidia",
+      "choices": [
+        {
+          "index": 0,
+          "message": {"role": "assistant", "content": ""},
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {"prompt_tokens": 48, "completion_tokens": 0, "total_tokens": 48}
+    }
+  }
+}

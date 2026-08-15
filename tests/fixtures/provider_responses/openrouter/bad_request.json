@@ -1,0 +1,18 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A malformed body — our bug. BadRequest is neither retryable nor failover-eligible: walking it down three providers turns one fast failure into three slow ones and burns quota doing it.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "messages: Field required",
+        "code": 400
+      }
+    }
+  }
+}

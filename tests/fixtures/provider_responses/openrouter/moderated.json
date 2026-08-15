@@ -1,0 +1,24 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 403 that is moderation, not a credential problem. `error.metadata.reasons` is the only thing distinguishing the two, and the check runs before 403 -> AuthFailed: reading this as auth would page someone AND launder the refusal onto the next provider. Same argument as the 402.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 403,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "Your input was flagged for moderation by the upstream provider.",
+        "code": 403,
+        "metadata": {
+          "reasons": ["harassment"],
+          "flagged_input": "…the offending fragment, truncated by OpenRouter…",
+          "provider_name": "Nvidia",
+          "model_slug": "nvidia/nemotron-3-super-120b-a12b:free"
+        }
+      }
+    }
+  }
+}

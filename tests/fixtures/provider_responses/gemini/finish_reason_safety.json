@@ -1,0 +1,30 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "The other shape a refusal takes: the prompt passed, generation started, and the model stopped itself. There is a candidate but no content, and finishReason names why. Also ContentFiltered — failing over would only launder the refusal.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "candidates": [
+        {
+          "finishReason": "SAFETY",
+          "index": 0,
+          "safetyRatings": [
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "MEDIUM", "blocked": true}
+          ]
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 64,
+        "candidatesTokenCount": 0,
+        "totalTokenCount": 64
+      },
+      "modelVersion": "gemini-3.6-flash",
+      "responseId": "8a1f0c2e-3d44-4b1a-9f77-5b6e1d90c2a5"
+    }
+  }
+}

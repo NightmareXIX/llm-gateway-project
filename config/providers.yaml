@@ -2,16 +2,17 @@
 #
 # The router walks a slot's candidates in order and fails over down the list (D1/D2).
 #
-# Phase 2 Step 1 declares all three providers in full — models, capabilities, limits
-# (config/limits.yaml) and options — while leaving Gemini and OpenRouter `enabled: false`.
-# That is deliberate, not half-finished work: `registry._traits` refuses to build a
-# registry for an enabled provider it has no adapter for, and the adapters land in
-# Step 6. Declaring first means Step 6 is the config edit this design promised — flip
-# two booleans, add two lines to `_PROVIDER_TRAITS` — rather than a research task about
-# which models still exist on a free tier.
+# All three providers are live as of Phase 2 Step 6. Step 1 declared them in full —
+# models, capabilities, limits (config/limits.yaml) and options — and left Gemini and
+# OpenRouter `enabled: false` until their adapters existed, which is why Step 6 really
+# was the config edit the design promised: two booleans here, two lines in
+# `_PROVIDER_TRAITS`. The flag and that table cannot drift apart, because
+# `registry._traits` refuses to build a registry for an enabled provider it has no
+# adapter for — a mistake here is a boot failure, not a 502 mid-demo.
 #
-# Candidates on a disabled provider are dropped by `build_model_specs`, so everything
-# below routes exactly as it did in Phase 1 until those flags change.
+# Every slot below now has three candidates rather than one, so `auto` and every named
+# slot fail over across genuinely different providers. Candidate order is the failover
+# order, subject to the breaker and to D11's latency ranking.
 
 version: 1
 
@@ -22,12 +23,12 @@ providers:
     api_key_env: GROQ_API_KEY
 
   gemini:
-    enabled: false # Step 6: adapter + flip
+    enabled: true
     base_url: https://generativelanguage.googleapis.com/v1beta
     api_key_env: GEMINI_API_KEY
 
   openrouter:
-    enabled: false # Step 6: adapter + flip
+    enabled: true
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
     # Attribution headers OpenRouter reads to credit traffic to an app. Not secrets,

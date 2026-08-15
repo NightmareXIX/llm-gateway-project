@@ -1,0 +1,13 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Google's edge failing in front of the API, so the body is HTML rather than the usual error envelope. This is the fixture that proves `_json_object` tolerates a non-JSON body instead of letting a decode error escape `parse_error`, which is not allowed to raise.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 502,
+    "headers": {
+      "content-type": "text/html; charset=UTF-8"
+    },
+    "text": "<!DOCTYPE html>\n<html lang=en>\n<title>Error 502 (Bad Gateway)!!1</title>\n<p><b>502.</b> <ins>That's an error.</ins>\n<p>The server encountered a temporary error and could not complete your request. <ins>That's all we know.</ins>\n</html>\n"
+  }
+}

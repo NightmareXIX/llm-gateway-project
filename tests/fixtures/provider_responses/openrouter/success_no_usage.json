@@ -1,0 +1,29 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 200 with no usage block. More likely on OpenRouter than on a first-party API, because usage depends on what the upstream chose to report. `extract_usage` must fall back to an estimate with `estimated=True` rather than reporting a zero that is indistinguishable from a real measurement.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "gen-1786622401-Yl3q0xa9rg8ub4o7n1w5",
+      "object": "chat.completion",
+      "created": 1786622401,
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "provider": "Nvidia",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "The router keeps trying candidates until one answers or the attempt budget runs out."
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  }
+}

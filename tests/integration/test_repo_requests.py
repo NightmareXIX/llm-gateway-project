@@ -78,8 +78,8 @@ async def test_the_row_knows_its_own_id_before_the_caller_gets_it(
 async def test_the_phase_two_columns_carry_their_defaults(
     db_session: AsyncSession, user_factory: Callable[..., Any]
 ) -> None:
-    """Unused in Phase 1, present in the schema, and not NULL. D1's attempt trail
-    starts as an empty array so Phase 2 appends rather than initializes."""
+    """Parameters since Step 5, but still defaulted — a caller with nothing to say
+    about failover writes the same row Phase 1 wrote."""
     user = await user_factory()
 
     row = await repo.create(db_session, user_id=user.id, status=repo.STATUS_OK)
@@ -88,6 +88,38 @@ async def test_the_phase_two_columns_carry_their_defaults(
     assert row.attempts == []
     assert row.wasted_tokens_out == 0
     assert row.cache_hit is False
+
+
+async def test_the_attempt_trail_survives_the_round_trip(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    """JSONB, so the list has to come back as a list of dicts rather than a string.
+
+    The trail is deliberately longer than the three-attempt cap: a candidate
+    skipped on an open breaker is an event without a round trip (ADR-015), so this
+    column and ``messages.meta.attempts`` legitimately disagree.
+    """
+    user = await user_factory()
+    trail = [
+        {"n": 1, "provider": "groq", "model": "big", "outcome": "skipped_breaker"},
+        {"n": 2, "provider": "groq", "model": "small", "outcome": "error", "latency_ms": 412},
+        {"n": 3, "provider": "groq", "model": "other", "outcome": "ok", "latency_ms": 890},
+    ]
+
+    written = await repo.create(
+        db_session,
+        user_id=user.id,
+        status=repo.STATUS_OK,
+        substituted=True,
+        attempts=trail,
+        wasted_tokens_out=128,
+    )
+    await db_session.refresh(written)
+
+    assert written.substituted is True
+    assert written.wasted_tokens_out == 128
+    assert written.attempts == trail
+    assert written.attempts[1]["latency_ms"] == 412
 
 
 async def test_a_fully_populated_row_survives_the_round_trip(

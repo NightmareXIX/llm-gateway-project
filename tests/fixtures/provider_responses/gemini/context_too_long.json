@@ -1,0 +1,19 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Also a 400 INVALID_ARGUMENT, and the reason `_looks_like_context_overflow` is consulted before the status map: landing this as a plain BadRequest would lose the re-fit-and-retry path, which is the one recovery ContextTooLong has. The real limit is stated in the prose, so `_read_limit_tokens` can recover it and the fitting step can re-run against a real number.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "error": {
+        "code": 400,
+        "message": "The input token count (1348221) exceeds the maximum number of tokens allowed (1048576).",
+        "status": "INVALID_ARGUMENT"
+      }
+    }
+  }
+}

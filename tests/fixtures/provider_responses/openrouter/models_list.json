@@ -1,0 +1,30 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Placeholder. Run `make record-fixtures --provider openrouter` to replace with a real capture. Trimmed to the two models providers.yaml declares — the real catalogue is several hundred entries. Note both ids keep the `:free` suffix: dropping it silently routes to the paid variant.",
+  "request": {"method": "GET", "path": "/models"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "data": [
+        {
+          "id": "nvidia/nemotron-3-super-120b-a12b:free",
+          "name": "NVIDIA: Nemotron 3 Super 120B A12B (free)",
+          "context_length": 262144,
+          "pricing": {"prompt": "0", "completion": "0"},
+          "top_provider": {"context_length": 262144, "max_completion_tokens": 262144}
+        },
+        {
+          "id": "openai/gpt-oss-20b:free",
+          "name": "OpenAI: gpt-oss-20b (free)",
+          "context_length": 131072,
+          "pricing": {"prompt": "0", "completion": "0"},
+          "top_provider": {"context_length": 131072, "max_completion_tokens": 32768}
+        }
+      ]
+    }
+  }
+}

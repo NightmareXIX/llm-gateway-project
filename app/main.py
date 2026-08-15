@@ -21,6 +21,7 @@ from app.api import keys as keys_routes
 from app.api.v1 import chat as chat_routes
 from app.api.v1 import conversations as conversations_routes
 from app.auth.jwt import JwksCache
+from app.cache.client import LuaScriptRegistry, create_redis_client, probe, redacted_target
 from app.config import Settings, get_settings, validate_startup_config
 from app.core.errors import error_response, register_exception_handlers
 from app.core.logging import (
@@ -31,11 +32,21 @@ from app.core.logging import (
 from app.db.session import create_db_engine, create_session_factory
 from app.providers.registry import build_registry
 from app.schemas.errors import DEFAULT_ERROR_RESPONSES, ErrorResponse
+from app.usage.metrics import LatencyTable
 
 logger = get_logger("app.main")
 
 READYZ_TIMEOUT_S = 5.0
 """Upper bound on the readiness check's database round-trip."""
+
+READYZ_REDIS_TIMEOUT_S = 1.0
+"""Upper bound on the readiness check's Redis round-trip — separate, and shorter.
+
+Two reasons it is not folded into the block above. It cannot *fail* the probe
+(ADR-010), so spending the database's budget on it would let a fail-open
+dependency cause a 503 by starvation alone. And a `PING` is the cheapest command
+Redis has: one second is already generous, and anything slower is a server that
+is not answering rather than one that is busy."""
 
 HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 """Defaults for the shared outbound client.
@@ -77,19 +88,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     registry = build_registry(client=http_client, settings=settings)
     app.state.provider_registry = registry
 
-    # Still to come:
-    #   Phase 3 — redis.asyncio pool + Lua script loading (app/cache/client.py)
+    # Lazy like the engine: from_url opens no socket, so an Upstash blip cannot
+    # stop the process booting. Nothing reads it until Step 3's circuit breaker —
+    # it arrives a phase early (the plan says Phase 3) because breaker state has
+    # to be shared across instances, and a per-process breaker would let each
+    # one rediscover the same dead provider separately.
+    redis = create_redis_client(settings)
+    app.state.redis = redis
+
+    scripts = LuaScriptRegistry(redis)
+    scripts.load_dir()
+    await scripts.warm()  # never fatal; Redis is fail-open (ADR-010)
+    app.state.lua_scripts = scripts
+
+    # Per-process on purpose (ADR-014). It starts empty, so a freshly-booted
+    # instance routes in config order until each candidate has five successful
+    # samples — which is what makes the first request after a deploy predictable
+    # rather than arbitrary.
+    app.state.latency = LatencyTable()
 
     logger.info(
         "startup.complete",
         require_verified_email=settings.REQUIRE_VERIFIED_EMAIL,
         jwks_url=settings.supabase_jwks_url,
+        # Redacted deliberately: REDIS_URL carries a password in every
+        # deployment that is not a laptop, and this line goes to log storage.
+        redis=redacted_target(settings.REDIS_URL),
         slots=registry.describe(),
+        # D11's kill switch. Printed at boot because "the router reordered my
+        # candidates" and "the router did not" are the same log line otherwise.
+        latency_ranking=settings.ROUTING_LATENCY_RANKING,
     )
     try:
         yield
     finally:
         # Mirror-image teardown, in reverse order of acquisition.
+        await redis.aclose()
         await http_client.aclose()
         await engine.dispose()
         logger.info("shutdown.complete")
@@ -137,9 +171,16 @@ def create_app() -> FastAPI:
     async def readyz(request: Request) -> JSONResponse:
         """Readiness: can this instance actually serve a request?
 
-        Postgres only. Redis is running in compose but nothing reads it until
-        Phase 3, and a readiness probe that fails on an unused dependency takes
-        the app out of rotation for no reason.
+        **Postgres decides; Redis is only reported** (ADR-010). Postgres is on
+        the critical path of every authenticated request, so an instance that
+        cannot reach it genuinely cannot serve. Redis is fail-open — a dead one
+        costs the breaker's memory and nothing else — and taking a machine out of
+        rotation for a dependency it can serve without is a self-inflicted
+        outage. The general rule: a readiness probe fails only on dependencies
+        whose absence makes the instance unable to serve.
+
+        Reported anyway, because "every instance says redis: unavailable" is how
+        a broken cache is noticed at all when nothing it does is user-visible.
         """
         try:
             # Bounded: an unreachable database refuses fast, but a hung one would
@@ -158,7 +199,19 @@ def create_app() -> FastAPI:
                 message="Database is not reachable.",
             )
 
-        return JSONResponse(status_code=200, content={"status": "ok", "database": "ok"})
+        # Outside the block above, on its own shorter bound: this check cannot
+        # turn the probe red, so it must not be able to spend the budget of the
+        # one that can.
+        redis_ok = await probe(app.state.redis, timeout_s=READYZ_REDIS_TIMEOUT_S)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "database": "ok",
+                "redis": "ok" if redis_ok else "unavailable",
+            },
+        )
 
     return app
 

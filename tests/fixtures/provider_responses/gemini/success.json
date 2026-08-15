@@ -1,0 +1,75 @@
+{
+  "recorded_at": "2026-08-12T17:48:13Z",
+  "source": "live",
+  "note": "The happy path. Also the source of truth for the ±25% estimate check. Recorded with a 512-token output budget because this model thinks first and a smaller cap never reaches an answer.",
+  "request": {
+    "method": "POST",
+    "path": "/models/gemini-3.6-flash:generateContent",
+    "body": {
+      "system_instruction": {
+        "parts": [
+          {
+            "text": "You are terse."
+          }
+        ]
+      },
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {
+              "text": "In one sentence: what is an LLM gateway?"
+            }
+          ]
+        }
+      ],
+      "generationConfig": {
+        "temperature": 0.0,
+        "maxOutputTokens": 512
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "x-gemini-service-tier": "standard",
+      "content-type": "application/json; charset=UTF-8",
+      "x-xss-protection": "0",
+      "x-frame-options": "SAMEORIGIN",
+      "x-content-type-options": "nosniff",
+      "server-timing": "gfet4t7; dur=2692"
+    },
+    "body": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "An LLM gateway is a centralized proxy that routes, secures, and optimizes API requests between applications and multiple AI model providers.",
+                "thoughtSignature": "Eq8LCqwLARFNMg+Jz/S/sCfnh2Rx0c7RlP5dasbRmN8JMPEaxCIPh4gce58PYuvKtNcmlGK4XtyY/Ny74sMwF6Cj9zE4OAy8zxcpVWq+Teu/p3y96z4+Q2zWQJcmd/boHoxMuAvdZU+D+3GlNiXrQGHUrzGClAgMiX/qk/9SqkMkrVM8nCpG9rb9z7iPdRo9SwfoTPkLt2AFiwUFnoBH0FEA578p/grsAcXPXUX8xa+rCrFRAvmOXHc71xhRNiKut5RPQd97RBLyui+sBni5igiIYRtIOMqxUJbmYrIiNeEikk6DbWhL+94t6JXfg8+jEtTPpiqUQlwE9kD+BQzZBIx7BEKzmY7DUExhQIkjvwGEW/hMtMrVIQx7ofUfk5zNtshcUtMsYbK0/G87SlqtqtyJihsJkC+5D88tkUFJ/4KSd0of0E+APTZmNwYXbeWfjXbx7b9SP3IIj1iamJbEtbcWHyTEzy6kMUHnklUmsN11hvKtDjRj0ghWxxgTn4UGt8sjFkuUGQ60ub4rYsz6MlYmGBrFXHaBxuRtH7dX9UMBk+OPf5eudDw5a+/79zVLmRz4LL+OlTV7to6g5RNNSCgycwC05RMdZKHtRdLfUoyOJG9RQG0FMdS2TbPt6yPt0YtPKyQCdTVwlPIL15PCn3xy00owdF5w2tIPzvKOKoayLYDRDTpvrLbspn2IDS1lCgXmyoaa+F2XKc9D6ORQ08zWa7z/MPjCSqfZA9bQcRQqTEWW/+566UTWFdjAe2/34ikz6v0E69bZ4yg1W8k9IaiEcpllYFfX6g3ycqCBh8vtH4YznDu2iyBszH5Yd9e53CAOx5ggw4uEInRSQ3U0pnuW66HHXzr8HP9jMZXYoNYQSJ7nNZIYR0DPh/5d82uVTC5GTp+l2iwT1TJGqX6cNJGORiyRiAV4QOydGpLtemPqZXrntBdJhIuXubpnyLd790pNvigYjKx3mASGZUuFz34gcwNJDlEwgi5RwXBv/7o8nTjpnAUqYjTF6/n5j7AFsdcR0EOZyb7PmfKfCDT9Ot2ndyYxr/QWdzLsIaCfxGgkEzrMpP+Y8MyPciUoj2G3ipj3wLtaOhIVDkLrJPPCn4GI8CcUnTAFPhB3tq77NRDkWzcuDvqS3QVO80oo6vq7oBAEDrU37XgZYf68xP9Zr7XMMfrn/yWtZWCuPyuEt8qJW7M8dJeDu2hH7tWXZDS1ELnZPjEgs3dx2dPr6sU/bLMoJOY0eeFzYtfj703hnbP6jrbi2cloB5/DIMXseldesUh9CLNZ+/3X4obt9aWF8mKEMEo/omn/zNGbq2sAHXusHg7kwOjUFsO3gGmHpzrUtUxHpYOpfr7UNx7Eg5mrKhs4Gp2lgjoU5wcECtvzGx8hTXGWxCGDpir70w+fsgCobHeJlMZdFHwb1txtL9f1LuKYIUecXpbVO2GXluzALJ9tfa09no/zZTR2h4NkmhSeEdmcTYdfE21x4+zKJHJn7dE+6B9Wt9F2pJxx1PGs/gKAlOs8WZGOLl19qkPp5NDlcoPzN/oWeAg1/dNEUDq0HimcAdEpggtlWGffxavI7ejZTQKQOCrBq/viLsT2rPUKmmcyP9CGIiqEeuascKZPQzMW1CICqQv5dOkuzSNV4035J7u+OagJLr6jS2BsIsVcpVZUqbvq82+YdNcceIWHVxKxm3v9gOdRGr3lmz/dc779JF2p0S6xSD/ONZ6lADqOkYssxNZsHOwERHll6am4WE/zeZ2zuiLDu8wNnh9+OxljlMPWZMOjU4833LivV+z0zioE3iZlwHYUksf8nqorpK67O5GIjQ+Zv41Iv1iH2d8RmxLrAd7/nXgJg87rBTaQKTNSZDkVRo9Y1f19KfqahU8mSjn5clFTZu+0U5CdTB0zZnrk2D6c9e5r1S6+6PxMQmVUDY3/UyNHOVVpcpY4AkM5"
+              }
+            ],
+            "role": "model"
+          },
+          "finishReason": "STOP",
+          "index": 0
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 16,
+        "candidatesTokenCount": 25,
+        "totalTokenCount": 368,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 16
+          }
+        ],
+        "thoughtsTokenCount": 327,
+        "serviceTier": "standard"
+      },
+      "modelVersion": "gemini-3.6-flash",
+      "responseId": "2rF8avrCCoHEg8UP1bSyoQo"
+    }
+  }
+}

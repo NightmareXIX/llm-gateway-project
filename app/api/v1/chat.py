@@ -15,15 +15,14 @@ message should still be there: a thread that silently loses what someone typed i
 worse than one that shows an error next to it.
 
 **Every payload comes out of ``render()``.** Never ``adapter.build_payload``
-directly. Attachment resolution, budgeting and D4 fitting live in the pipeline's
-six steps, and a call site that skips it gets none of them — silently, and only
-for whichever conversation happened to be too long.
+directly — and since Phase 2 Step 5, never from here at all: the router owns the
+render-and-attempt pair, because it may do it more than once per turn.
 
-**``served_by`` is on every response from the first one.** Phase 1 cannot
-substitute anything, so it is constant here. It ships anyway, because D1 and D2
-both resolve to "substitute silently, then disclose", and a client that only
-learns to read the disclosure in Phase 2 spent Phase 1 training its users to
-believe one model answered everything.
+**``served_by`` is on every response from the first one.** Phase 1 could not
+substitute anything, so it was constant. It shipped anyway, because D1 and D2 both
+resolve to "substitute silently, then disclose", and a client that only learns to
+read the disclosure in Phase 2 spent Phase 1 training its users to believe one
+model answered everything. Step 5 is where it starts telling the truth.
 """
 
 from __future__ import annotations
@@ -36,18 +35,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependency import PrincipalDep
 from app.auth.principal import Principal
+from app.config import get_settings
 from app.core.clock import SYSTEM_CLOCK
 from app.core.errors import InvalidRequest, NotFound
 from app.core.logging import get_logger, get_request_id
+from app.db.models import Conversation
 from app.db.repo import conversations as conversations_repo
 from app.db.repo import messages as messages_repo
-from app.deps import RegistryDep, SessionDep
+from app.deps import BreakerDep, LatencyDep, RegistryDep, SessionDep
 from app.memory.canonical import CanonicalMessage, MessageMeta, text_block
-from app.memory.render import render
-from app.providers.base import DEFAULT_READ_TIMEOUT_S
-from app.providers.errors import ProviderError, to_app_error
+from app.providers.errors import to_app_error
 from app.providers.registry import ProviderRegistry, UnknownSlot
 from app.providers.types import GenParams, ModelSpec
+from app.routing import router as routing
 from app.routing import selection
 from app.schemas.chat import (
     AssistantMessage,
@@ -79,6 +79,8 @@ async def create_chat_completion(
     principal: PrincipalDep,
     session: SessionDep,
     registry: RegistryDep,
+    breaker: BreakerDep,
+    latency: LatencyDep,
 ) -> ChatCompletionResponse:
     """Answer one turn, persisting both halves of it."""
     if body.stream:
@@ -90,7 +92,14 @@ async def create_chat_completion(
             code="streaming_not_supported",
         )
 
-    conversation_id = await _resolve_conversation(session, principal=principal, body=body)
+    # Rejected here rather than inside the router, because only this layer knows
+    # the name came off a request body and is therefore a 400. Before the
+    # conversation is touched, so a typo'd slot does not open a thread it will
+    # never answer.
+    _validate_slot(registry, body.model)
+
+    conversation = await _resolve_conversation(session, principal=principal, body=body)
+    conversation_id = conversation.id
 
     # --- persist the inbound turn, then let go of the transaction ----------- #
     for message in body.messages:
@@ -106,12 +115,6 @@ async def create_chat_completion(
     )
     await session.commit()
 
-    spec = _resolve_spec(registry, body.model)
-    adapter = registry.adapter_for_spec(spec)
-    # Phase 6 replaces this line with `resolve_provider_key(user_id, provider)`,
-    # which checks the user's own key first and falls back to exactly this value.
-    key = registry.system_key(spec.provider)
-
     history = await messages_repo.list_for_conversation(
         session, conversation_id=conversation_id, user_id=principal.user_id
     )
@@ -125,9 +128,22 @@ async def create_chat_completion(
 
     started = time.perf_counter()
     try:
-        payload, report = await render(history, spec, params, adapter)
-        completion = await adapter.complete(payload, key, timeout=DEFAULT_READ_TIMEOUT_S)
-    except ProviderError as exc:
+        # One call, and everything that used to be here is behind it: the
+        # candidate chain, the breaker, the render, the attempt, the failover and
+        # the trail. The endpoint's job is now the two halves of persistence.
+        outcome = await routing.route(
+            registry=registry,
+            breaker=breaker,
+            history=history,
+            params=params,
+            requested=body.model,
+            # D3: a conversation that has made a tool call is locked to one
+            # model, and that outranks both `auto` and a named slot.
+            pinned=conversation.pinned_model,
+            metrics=latency,
+            rank_by_latency=get_settings().ROUTING_LATENCY_RANKING,
+        )
+    except routing.RoutingFailed as failure:
         # Includes `ContextTooLong` raised by the fitting step before a request
         # was ever sent — it is a provider-shaped failure with a provider and a
         # model attached, and recording it is how "this model's window is too
@@ -135,18 +151,24 @@ async def create_chat_completion(
         await usage_logger.record_failure(
             session,
             principal=principal,
-            error=exc,
+            error=failure.error,
             requested_slot=body.model,
-            spec=spec,
+            spec=failure.spec,
             latency_ms=_elapsed_ms(started),
             conversation_id=conversation_id,
+            attempts=failure.trail,
         )
         await session.commit()
         # Substitutes a message written for our caller; the provider's own prose
-        # stayed in the log line above, with the request_id.
-        raise to_app_error(exc) from exc
+        # stayed in the log line above, with the request_id. `to_app_error` sees
+        # the normalized error, not the wrapper — it needs to know nothing about
+        # routing.
+        raise to_app_error(failure.error) from failure
 
     latency_ms = _elapsed_ms(started)
+    spec = outcome.spec
+    completion = outcome.completion
+    substituted = _is_substitution(body.model, spec.slot)
 
     # Note what is *not* handled here: an empty generation. The adapter raises
     # `EmptyResponse` for a 200-with-nothing, so it leaves through the branch
@@ -160,15 +182,18 @@ async def create_chat_completion(
         role="assistant",
         content=[text_block(completion.text)],
         meta=MessageMeta(
+            # The *serving* candidate, not the requested one. On a failed-over
+            # turn these three fields are the only record of which model actually
+            # wrote the text sitting next to them.
             provider_used=spec.provider,
             model_used=spec.model,
             slot_used=spec.slot,
             requested_slot=body.model,
-            substituted=_is_substitution(body.model, spec.slot),
-            attempts=1,
+            substituted=substituted,
+            attempts=outcome.attempts,
             tokens_in=completion.usage.tokens_in,
             tokens_out=completion.usage.tokens_out,
-            degraded=report.degraded,
+            degraded=outcome.report.degraded,
         ),
     )
     await usage_logger.record_success(
@@ -179,6 +204,8 @@ async def create_chat_completion(
         usage=completion.usage,
         latency_ms=latency_ms,
         conversation_id=conversation_id,
+        attempts=outcome.trail,
+        substituted=substituted,
     )
     await session.commit()
 
@@ -190,7 +217,8 @@ async def create_chat_completion(
         tokens_in=completion.usage.tokens_in,
         tokens_out=completion.usage.tokens_out,
         estimated=completion.usage.estimated,
-        degraded=report.degraded,
+        degraded=outcome.report.degraded,
+        attempts=outcome.attempts,
         conversation_id=conversation_id,
         assistant=assistant,
     )
@@ -204,20 +232,23 @@ async def _resolve_conversation(
     *,
     principal: Principal,
     body: ChatCompletionRequest,
-) -> UUID:
+) -> Conversation:
     """Continue the caller's thread, or start one.
+
+    Returns the row rather than its id, because the handler needs
+    ``pinned_model`` off it (D3). Both branches already have the row in hand, so
+    this costs nothing a second query would not.
 
     A ``conversation_id`` that is not theirs is a 404, never a 403 — the
     repository scopes ownership inside the SELECT, so a miss and a non-existent
     id are the same answer, and a 403 would confirm the id names something real.
     """
     if body.conversation_id is None:
-        conversation = await conversations_repo.create(
+        return await conversations_repo.create(
             session,
             user_id=principal.user_id,
             preferred_slot=body.model,
         )
-        return conversation.id
 
     existing = await conversations_repo.get_owned(
         session, conversation_id=body.conversation_id, user_id=principal.user_id
@@ -234,19 +265,27 @@ async def _resolve_conversation(
             code="system_message_not_first",
         )
 
-    return existing.id
+    return existing
 
 
-def _resolve_spec(registry: ProviderRegistry, requested: str) -> ModelSpec:
-    """Slot name → the model that will answer.
+def _validate_slot(registry: ProviderRegistry, requested: str) -> None:
+    """Reject a slot name the table does not carry, before anything else happens.
 
     ``UnknownSlot`` is translated here rather than in ``selection.py`` because
     this is the layer that knows where the name came from: off a request body, so
     it is the client's mistake and a 400. The same lookup failing on a stored
-    ``preferred_slot`` would be ours, and a 500.
+    ``preferred_slot`` or a stale ``pinned_model`` would be ours, and a 500.
+
+    Checked up front rather than by catching ``UnknownSlot`` around the router:
+    the registry raises the same class for a provider with no adapter and for one
+    with no key, and both of those are our configuration being wrong, not the
+    caller's request. Wrapping the router would label them 400s and send someone
+    looking in the wrong place.
     """
+    if requested == selection.AUTO:
+        return
     try:
-        return selection.resolve_slot(registry, requested)
+        registry.candidates(requested)
     except UnknownSlot as exc:
         raise InvalidRequest(
             f"Unknown model slot {requested!r}.",
@@ -259,9 +298,10 @@ def _is_substitution(requested_slot: str, served_slot: str) -> bool:
     """Whether the client's explicit choice was overridden.
 
     Resolving ``auto`` is not substitution — nothing was overridden, the client
-    asked the gateway to choose. Phase 1 has no failover, so this is always
-    ``False``; it is computed rather than hardcoded so Phase 2 inherits the
-    right rule instead of a constant someone has to remember to change.
+    asked the gateway to choose. Phase 1 could only ever return ``False`` here;
+    it was computed rather than hardcoded so that Step 5 would inherit the right
+    rule instead of a constant someone had to remember to change, and D10's spill
+    (ADR-011) is what finally makes it reachable.
     """
     return requested_slot != selection.AUTO and requested_slot != served_slot
 
@@ -285,6 +325,7 @@ def _to_response(
     tokens_out: int,
     estimated: bool,
     degraded: bool,
+    attempts: int,
     conversation_id: UUID,
     assistant: CanonicalMessage,
 ) -> ChatCompletionResponse:
@@ -310,7 +351,7 @@ def _to_response(
         served_by=ServedBy(slot=spec.slot, provider=spec.provider, model=spec.model),
         requested_slot=body.model,
         substituted=_is_substitution(body.model, spec.slot),
-        attempts=1,
+        attempts=attempts,
         degraded=degraded,
         conversation_id=conversation_id,
         message_id=assistant.id,

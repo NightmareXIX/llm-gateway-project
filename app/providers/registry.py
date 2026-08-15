@@ -34,7 +34,9 @@ from app.config import (
 )
 from app.core.logging import get_logger
 from app.providers.base import ProviderAdapter
+from app.providers.gemini import GeminiAdapter
 from app.providers.groq import GroqAdapter
+from app.providers.openrouter import OpenRouterAdapter
 from app.providers.types import ModelSpec
 
 logger = get_logger("app.providers.registry")
@@ -87,15 +89,12 @@ class ProviderTraits(NamedTuple):
 
 _PROVIDER_TRAITS: dict[str, ProviderTraits] = {
     "groq": ProviderTraits(adapter_class=GroqAdapter, supports_system_field=False),
-    # Phase 2 Step 6 adds, alongside the adapters themselves:
-    #   "gemini":     system_instruction is a top-level field  -> True
-    #   "openrouter": OpenAI-shaped, system stays in the array -> False
-    #
-    # Both are already declared in providers.yaml — with their models, limits and
-    # options — and both are `enabled: false` until they land here. That is not a
-    # placeholder: `_traits` below refuses to build a registry for an enabled
-    # provider it has no adapter for, so the flag and this table cannot drift
-    # apart quietly. Step 6 flips two booleans in YAML and adds two lines here.
+    # `supports_system_field` describes the wire format; it is not a switch the
+    # adapter reads. Gemini hoists the system prompt unconditionally because it has
+    # nowhere else to put one, and Groq and OpenRouter leave it in the array for the
+    # same reason — so a `False` branch in either adapter would be dead code.
+    "gemini": ProviderTraits(adapter_class=GeminiAdapter, supports_system_field=True),
+    "openrouter": ProviderTraits(adapter_class=OpenRouterAdapter, supports_system_field=False),
 }
 
 
@@ -290,12 +289,20 @@ def _resolve_system_key(provider: str, env_name: str, settings: Settings) -> Sec
     return value
 
 
-def _conformance_check(client: httpx.AsyncClient) -> ProviderAdapter:
+def _conformance_check(client: httpx.AsyncClient) -> tuple[ProviderAdapter, ...]:
     """Never called. Its return type is the assertion.
 
-    If ``GroqAdapter`` drifts out of structural conformance with
+    If any adapter drifts out of structural conformance with
     :class:`ProviderAdapter` — a renamed method, a changed signature — this fails
     under mypy, so ``make typecheck`` catches it rather than the contract suite
-    catching it later. Every adapter added in Phase 2 gets a line here.
+    catching it later. Every adapter gets a line here.
+
+    Worth noting what this proves that the contract suite does not: conformance is
+    *structural*, so nothing at runtime would object to an adapter missing a method
+    the router never happens to call on it. This is the only place that objects.
     """
-    return GroqAdapter(client=client, base_url="https://example.invalid")
+    return (
+        GroqAdapter(client=client, base_url="https://example.invalid"),
+        GeminiAdapter(client=client, base_url="https://example.invalid"),
+        OpenRouterAdapter(client=client, base_url="https://example.invalid"),
+    )

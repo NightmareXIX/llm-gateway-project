@@ -1,0 +1,23 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "HTTP 200 whose body is an error object instead of choices — one of OpenRouter's teeth. Reading this as EmptyResponse records the wrong code in the attempt trail AND skips the breaker, because EmptyResponse is deliberately not breaker-eligible, so a provider returning these all day would never be taken out of rotation. There is no status to classify on, which is why `_classify` reads the body's own code first. Note the code is an INTEGER.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day.",
+        "code": 429,
+        "metadata": {
+          "headers": {"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0"},
+          "provider_name": null
+        }
+      },
+      "user_id": "user_2fVdemo"
+    }
+  }
+}

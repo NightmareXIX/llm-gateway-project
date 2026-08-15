@@ -1,0 +1,18 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "The 402, and one of the phase's named traps. Credit exhaustion is a QUOTA condition, so it normalizes to RateLimited: classifying it as AuthFailed would fire the `alert` flag and page someone about a free tier working exactly as designed. Not provokable without spending down a real account, so this stays synthetic.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 402,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "Insufficient credits. Add more using https://openrouter.ai/settings/credits",
+        "code": 402
+      }
+    }
+  }
+}

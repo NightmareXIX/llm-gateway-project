@@ -1,0 +1,36 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Synthetic and expected to stay that way: provoking a real 429 means deliberately exhausting a shared free-tier budget. Note there is NO Retry-After header — the retry hint lives in error.details[] as a RetryInfo with a protobuf duration, which is the quirk. An adapter that only reads headers finds nothing on every real Gemini 429.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 429,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "error": {
+        "code": 429,
+        "message": "You exceeded your current quota, please check your plan and billing details.",
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+          {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [
+              {
+                "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                "quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "quotaDimensions": {"model": "gemini-3.6-flash", "location": "global"},
+                "quotaValue": "250"
+              }
+            ]
+          },
+          {
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            "retryDelay": "23s"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 401 with no credentials. AuthFailed, which also raises the `alert` flag — an ops problem, not a capacity one. Note `code` is an INTEGER here where every other provider in the pool sends a string, which is why `_read_error_fields` coerces it.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "No auth credentials found",
+        "code": 401
+      }
+    }
+  }
+}

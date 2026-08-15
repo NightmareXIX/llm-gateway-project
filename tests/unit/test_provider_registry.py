@@ -21,7 +21,9 @@ from app.config import (
     get_providers_config,
     get_settings,
 )
+from app.providers.gemini import GeminiAdapter
 from app.providers.groq import GroqAdapter
+from app.providers.openrouter import OpenRouterAdapter
 from app.providers.registry import (
     ProviderRegistry,
     UnknownSlot,
@@ -250,23 +252,31 @@ def test_an_adapter_for_a_provider_with_no_options_gets_an_empty_mapping(
     assert adapter.options == {}
 
 
-def test_the_checked_in_config_still_builds_a_groq_only_registry(
+def test_the_checked_in_config_builds_a_registry_for_all_three_providers(
     client: httpx.AsyncClient,
 ) -> None:
-    """The guard on Phase 2 Step 1's central decision.
+    """Phase 2 Step 6, end to end through the registry.
 
-    Gemini and OpenRouter are declared in full and disabled, because an enabled
-    provider with no entry in ``_PROVIDER_TRAITS`` is a `ConfigError` at boot —
-    which is what makes Step 6 (write the adapters, add two traits, flip two
-    booleans) a change that cannot be half-applied.
+    Every slot now has three candidates, so failover spans genuinely different
+    providers rather than two Groq models. The candidate *order* is unchanged —
+    Groq still leads both slots — which is what keeps the enabling a routing
+    addition rather than a routing change.
     """
     registry = build_registry(client=client, settings=get_settings())
 
     assert registry.slots() == ("general", "fast")
     assert registry.primary("general").provider == "groq"
-    for provider in ("gemini", "openrouter"):
-        with pytest.raises(UnknownSlot):
-            registry.adapter_for(provider)
+
+    assert isinstance(registry.adapter_for("gemini"), GeminiAdapter)
+    assert isinstance(registry.adapter_for("openrouter"), OpenRouterAdapter)
+
+    providers = [spec.provider for spec in registry.candidates("general")]
+    assert providers == ["groq", "gemini", "openrouter"]
+
+    # The lookup still refuses a provider that is not in the table at all, so the
+    # branch that turns a config typo into a loud failure stays covered.
+    with pytest.raises(UnknownSlot):
+        registry.adapter_for("anthropic")
 
 
 def test_an_enabled_provider_with_an_empty_key_kills_startup(

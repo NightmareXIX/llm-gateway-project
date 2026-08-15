@@ -1,0 +1,18 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 400 whose prose is really an overflow, with no machine-readable code to say so — hence `_looks_like_context_overflow`. ContextTooLong rather than BadRequest because it has a recovery: re-fit the history against the stated limit and retry once against the same provider. It is deliberately NOT failover-eligible; the next candidate's window is usually smaller.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "error": {
+        "message": "This endpoint's maximum context length is 262144 tokens. However, you requested about 291204 tokens. Please reduce the length of either the messages or completion.",
+        "code": 400
+      }
+    }
+  }
+}

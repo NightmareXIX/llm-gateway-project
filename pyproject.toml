@@ -32,7 +32,11 @@ dev = [
     # tested without a running server. Deliberately no `tenacity`: Step 4's
     # same-provider retries are hand-rolled, because a decorator fights the
     # async-generator streaming path in Step 9.
-    "fakeredis>=2.26",
+    #
+    # The [lua] extra pulls in `lupa`, without which fakeredis raises on EVAL and
+    # the script-loading path in app/cache/client.py could only be tested against
+    # a real server — which CI deliberately does not run.
+    "fakeredis[lua]>=2.26",
     "ruff>=0.8",
     "mypy>=1.13",
     "types-PyYAML>=6.0",
@@ -86,6 +90,12 @@ ignore = [
 # that into one number and cancel a request that was streaming along fine.
 "app/providers/base.py" = ["ASYNC109"]
 "app/providers/groq.py" = ["ASYNC109"]
+"app/providers/gemini.py" = ["ASYNC109"]
+"app/providers/openrouter.py" = ["ASYNC109"]
+# `RoutingFailed` is the outcome, named as one — and deliberately not a
+# `ProviderError`, so an `Error` suffix would make it read as a sibling of the
+# frozen hierarchy above rather than the wrapper it is.
+"app/routing/router.py" = ["N818"]
 # `InvariantViolation` names the thing that happened — a Contract B invariant
 # (§2.2.3) was violated. `InvariantViolationError` reads as "an error about a
 # violation", one noun further from the fact. The contract's vocabulary wins.

@@ -41,8 +41,10 @@ services:
       timeout: 3s
       retries: 10
 
-  # Unused in Phase 1 — quota, caching, and breakers land in Phase 3. It runs now
-  # so the topology the app is developed against never changes underneath it.
+  # Load-bearing since Phase 2 Step 2: the circuit breaker keeps its state here so
+  # every instance sees the same dead provider. Quota and caching join it in
+  # Phase 3. The app degrades rather than fails without it (ADR-010) — but it is
+  # no longer running here just to keep the topology honest.
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]

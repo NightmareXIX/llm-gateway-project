@@ -2,7 +2,19 @@
   "recorded_at": "2026-08-10T12:00:00Z",
   "source": "synthetic",
   "note": "Placeholder. Run `make record-fixtures` to replace with a real capture.",
-  "request": {"method": "POST", "path": "/chat/completions"},
+  "request": {
+    "method": "POST",
+    "path": "/chat/completions",
+    "body": {
+      "model": "llama-3.3-70b-versatile",
+      "messages": [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "In one sentence: what is an LLM gateway?"}
+      ],
+      "temperature": 0.0,
+      "max_tokens": 64
+    }
+  },
   "response": {
     "status": 200,
     "headers": {

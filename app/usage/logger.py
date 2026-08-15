@@ -20,6 +20,7 @@ different times by different people, so both are emitted.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +31,7 @@ from app.db.models import Request
 from app.db.repo import requests as requests_repo
 from app.providers.errors import ProviderError
 from app.providers.types import ModelSpec, Usage
+from app.routing.router import AttemptRecord
 
 logger = get_logger("app.usage")
 
@@ -44,8 +46,17 @@ async def record_success(
     latency_ms: int,
     conversation_id: UUID | None = None,
     cache_hit: bool = False,
+    attempts: Sequence[AttemptRecord] = (),
+    substituted: bool = False,
 ) -> Request:
-    """Record a turn that produced an answer."""
+    """Record a turn that produced an answer.
+
+    ``attempts`` is the router's trail — every event, including the candidates it
+    skipped and the ones that failed before this one worked. A successful turn
+    with a three-entry trail is the most interesting row in the table, and it is
+    the only place that story survives: one ``messages`` row per logical message
+    means the discarded attempts leave no other trace.
+    """
     row = await requests_repo.create(
         session,
         user_id=principal.user_id,
@@ -60,6 +71,8 @@ async def record_success(
         latency_ms=latency_ms,
         status=requests_repo.STATUS_OK,
         cache_hit=cache_hit,
+        substituted=substituted,
+        attempts=[record.to_json() for record in attempts],
     )
 
     logger.info(
@@ -75,6 +88,10 @@ async def record_success(
         tokens_estimated=usage.estimated,
         latency_ms=latency_ms,
         cache_hit=cache_hit,
+        substituted=substituted,
+        # The count of events, which is what a log reader scanning for "did this
+        # one fail over?" wants. The trail itself is in the row.
+        attempts=len(attempts),
     )
     return row
 
@@ -88,6 +105,8 @@ async def record_failure(
     latency_ms: int,
     spec: ModelSpec | None = None,
     conversation_id: UUID | None = None,
+    attempts: Sequence[AttemptRecord] = (),
+    substituted: bool = False,
 ) -> Request:
     """Record a turn that ended in a normalized provider failure.
 
@@ -114,6 +133,11 @@ async def record_failure(
         latency_ms=latency_ms,
         status=requests_repo.STATUS_ERROR,
         error_code=error.code,
+        substituted=substituted,
+        # The trail matters more here than on the success path: this is the row
+        # that answers "why did this take eight seconds before failing?", and the
+        # error alone names one candidate out of however many were tried.
+        attempts=[record.to_json() for record in attempts],
     )
 
     # `log_fields()` carries the routing flags — retryable, failover-eligible,
@@ -126,6 +150,7 @@ async def record_failure(
         "requested_slot": requested_slot,
         "served_slot": spec.slot if spec is not None else None,
         "latency_ms": latency_ms,
+        "attempts": len(attempts),
         # The provider's own prose, kept out of the response body and put here
         # instead: it is written for whoever holds the upstream account.
         "detail": str(error),

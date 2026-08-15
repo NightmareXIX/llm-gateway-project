@@ -1,0 +1,52 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Placeholder. Run `make record-fixtures --provider openrouter` to replace with a real capture. Note `x-ratelimit-reset` is a unix timestamp in MILLISECONDS, not a duration and not a delta — hence the injected clock in the adapter.",
+  "request": {
+    "method": "POST",
+    "path": "/chat/completions",
+    "body": {
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "messages": [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "In one sentence: what is an LLM gateway?"}
+      ],
+      "temperature": 0.0,
+      "max_tokens": 64
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "20",
+      "x-ratelimit-remaining": "19",
+      "x-ratelimit-reset": "1786622460000"
+    },
+    "body": {
+      "id": "gen-1786622400-Xk2p9wz8qf7ta3n6m0v4",
+      "object": "chat.completion",
+      "created": 1786622400,
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "provider": "Nvidia",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "A gateway sits between a client and several providers, presenting one API while it decides which upstream actually serves each request.",
+            "refusal": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "native_finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 48,
+        "completion_tokens": 27,
+        "total_tokens": 75
+      }
+    }
+  }
+}

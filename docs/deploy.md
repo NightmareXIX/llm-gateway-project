@@ -130,10 +130,15 @@ in the app's history.
 
 Create a database at [upstash.com](https://upstash.com) and copy the `rediss://` URL.
 
-Nothing reads it in Phase 1 — quota, caching and circuit breakers land in Phase 3. It is set now so
-the configuration surface never shifts underneath a deploy, and so `/readyz` never has to change
-shape later. See [ADR-009](decisions/ADR-009-readiness-probe-scope.md) for why the readiness probe
-does not check it.
+Read since Phase 2 Step 2: the circuit breaker keeps its state here so every instance skips the same
+dead provider. Quota and caching join it in Phase 3.
+
+`/readyz` reports Redis but is never failed by it — an instance that cannot reach Redis serves every
+request correctly, just without the breaker's memory, and taking a healthy machine out of rotation
+(or blocking a rollout) over an Upstash blip would be a self-inflicted outage. See
+[ADR-010](decisions/ADR-010-redis-fail-open-and-readiness.md). The practical consequence for
+operating this: a green `/readyz` does not mean Redis is up. Check the body's `redis` field, or the
+`redis.unreachable` warning in the logs.
 
 ---
 

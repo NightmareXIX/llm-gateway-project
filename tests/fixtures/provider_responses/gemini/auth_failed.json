@@ -1,0 +1,26 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A 403 PERMISSION_DENIED — the project cannot use this API. AuthFailed, which also raises the `alert` flag: this is an ops problem, not a capacity one.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 403,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "error": {
+        "code": 403,
+        "message": "Permission denied on resource project llm-gateway-demo. Generative Language API has not been used in this project before or it is disabled.",
+        "status": "PERMISSION_DENIED",
+        "details": [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "SERVICE_DISABLED",
+            "domain": "googleapis.com"
+          }
+        ]
+      }
+    }
+  }
+}

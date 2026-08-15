@@ -1,0 +1,28 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "A refusal signalled through finish_reason on an otherwise-normal 200. ContentFiltered is neither retryable nor failover-eligible: failing over would just launder the refusal until some model in the pool agreed to answer.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "gen-1786622403-An5s2zc1ti0wd6q9p3y7",
+      "object": "chat.completion",
+      "created": 1786622403,
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "provider": "Nvidia",
+      "choices": [
+        {
+          "index": 0,
+          "message": {"role": "assistant", "content": null},
+          "finish_reason": "content_filter",
+          "native_finish_reason": "safety"
+        }
+      ],
+      "usage": {"prompt_tokens": 48, "completion_tokens": 0, "total_tokens": 48}
+    }
+  }
+}

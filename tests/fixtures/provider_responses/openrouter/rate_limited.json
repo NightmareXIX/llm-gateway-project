@@ -1,0 +1,21 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "Synthetic and expected to stay that way: provoking a real 429 means deliberately exhausting a shared free-tier budget. Note there is no Retry-After — the only hint is `x-ratelimit-reset`, a unix timestamp in MILLISECONDS, so an adapter that reads it as a delta parks the provider for fifty-six thousand years.",
+  "request": {"method": "POST", "path": "/chat/completions"},
+  "response": {
+    "status": 429,
+    "headers": {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "50",
+      "x-ratelimit-remaining": "0",
+      "x-ratelimit-reset": "1786622460000"
+    },
+    "body": {
+      "error": {
+        "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day.",
+        "code": 429
+      }
+    }
+  }
+}

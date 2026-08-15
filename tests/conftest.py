@@ -15,8 +15,9 @@ is bound to a connection in ``create_savepoint`` mode, so those commits release 
 savepoint rather than escaping the outer transaction.
 
 **No network, ever.** Supabase's JWKS is served by an ``httpx.MockTransport``
-whose call count is assertable, and tokens are signed with a keypair minted in
-the test process. Nothing here can reach the internet.
+whose call count is assertable, tokens are signed with a keypair minted in the
+test process, and Redis is ``fakeredis`` in-process. Nothing here can reach the
+internet, and CI runs no Redis container.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from cryptography.hazmat.primitives.serialization import (
     NoEncryption,
     PrivateFormat,
 )
+from fakeredis.aioredis import FakeRedis
 from fastapi import FastAPI
 from jose import jwt
 from sqlalchemy.ext.asyncio import (
@@ -64,12 +66,14 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.auth.jwt import JwksCache
+from app.cache.client import LuaScriptRegistry
 from app.config import REPO_ROOT, Settings, get_settings
 from app.core.clock import FixedClock
 from app.db.models import ApiKey, Conversation, User
 from app.deps import get_session
 from app.main import create_app
 from app.providers.registry import build_registry
+from app.usage.metrics import LatencyTable
 
 TEST_DATABASE_NAME = "gateway_test"
 TEST_KID = "test-signing-key-1"
@@ -359,11 +363,35 @@ async def jwks_cache(
 
 
 # --------------------------------------------------------------------------- #
+# Redis
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+async def redis_client() -> AsyncIterator[FakeRedis]:
+    """An in-process Redis, per test.
+
+    ``fakeredis`` rather than a container: CI runs no Redis service, and the
+    things worth testing here — a breaker's state machine, a Lua script's
+    atomicity — are behaviour of the *commands*, which fakeredis implements
+    faithfully. ``decode_responses=True`` mirrors ``create_redis_client``; without
+    it a test would compare ``b"open"`` against ``"open"`` and pass for the wrong
+    reason once and fail for the right one later.
+    """
+    client = FakeRedis(decode_responses=True)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
 # The application
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 async def app(
-    db_session: AsyncSession, jwks_server: JwksServer, frozen_clock: FixedClock
+    db_session: AsyncSession,
+    jwks_server: JwksServer,
+    frozen_clock: FixedClock,
+    redis_client: FakeRedis,
 ) -> AsyncIterator[FastAPI]:
     """The real app, with the lifespan's resources supplied by hand.
 
@@ -384,6 +412,20 @@ async def app(
     # Built over the same mock-transport client, so an adapter reached through
     # the app cannot escape to the network either.
     application.state.provider_registry = build_registry(client=client)
+
+    # The lifespan's Redis leg, supplied by hand like the rest. Every route that
+    # touches Redis reads it from here, so an integration test gets real Redis
+    # semantics without a server and without reaching the network.
+    application.state.redis = redis_client
+    scripts = LuaScriptRegistry(redis_client)
+    scripts.load_dir()
+    application.state.lua_scripts = scripts
+
+    # A fresh latency table per test. The lifespan's is per *process* on purpose
+    # (ADR-014), and sharing one across tests would let a warmed-up ranking in one
+    # reorder the candidate chain in another — an ordering bug that appears only
+    # when the suite runs in a particular order.
+    application.state.latency = LatencyTable()
 
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield db_session

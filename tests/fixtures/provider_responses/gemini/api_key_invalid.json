@@ -1,0 +1,53 @@
+{
+  "recorded_at": "2026-08-12T17:48:13Z",
+  "source": "live",
+  "note": "The 400-not-401 quirk. Provoked with a plausible but dead key — Google answers INVALID_ARGUMENT, which the naive status ladder would classify as a failover-ineligible BadRequest.",
+  "request": {
+    "method": "POST",
+    "path": "/models/gemini-3.6-flash:generateContent",
+    "body": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {
+              "text": "hi"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8",
+      "x-xss-protection": "0",
+      "x-frame-options": "SAMEORIGIN",
+      "x-content-type-options": "nosniff",
+      "server-timing": "gfet4t7; dur=50"
+    },
+    "body": {
+      "error": {
+        "code": 400,
+        "message": "API key not valid. Please pass a valid API key.",
+        "status": "INVALID_ARGUMENT",
+        "details": [
+          {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "API_KEY_INVALID",
+            "domain": "googleapis.com",
+            "metadata": {
+              "service": "generativelanguage.googleapis.com"
+            }
+          },
+          {
+            "@type": "type.googleapis.com/google.rpc.LocalizedMessage",
+            "locale": "en-US",
+            "message": "API key not valid. Please pass a valid API key."
+          }
+        ]
+      }
+    }
+  }
+}

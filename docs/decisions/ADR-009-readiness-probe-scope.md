@@ -1,7 +1,18 @@
 # ADR-009 — Readiness checks Postgres only, and what Redis being down means
 
-**Status:** accepted · Phase 1, Step 11 · 2026-08-11
+**Status:** superseded in part by [ADR-010](ADR-010-redis-fail-open-and-readiness.md) · Phase 1, Step 11 · 2026-08-11
 **Relates to:** §2.3 of `doc/reference/contracts-and-phase1.md` (Contract C, "Degradation")
+
+> **Superseded in part.** Redis arrived in Phase 2 Step 2, one phase early, because the circuit
+> breaker needs shared state. ADR-010 replaces the readiness half of this document: `/readyz` now
+> *reports* Redis without being decided by it, and the general rule is stated in terms of what a
+> dependency's absence costs rather than whether it is used yet. The consequence below that predicts
+> "one more awaited check inside the existing `asyncio.timeout` block" was wrong — a fail-open
+> dependency sharing that budget can fail the probe by starvation.
+>
+> **The fail-closed/fail-open split below stands unchanged** and is still the governing decision for
+> quota, caching and rate limiting. ADR-010 extends it to the breaker (open) and explains why that is
+> the opposite verdict from quota on the same connection.
 
 ## Context
 

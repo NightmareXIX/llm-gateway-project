@@ -1,0 +1,28 @@
+{
+  "recorded_at": "2026-08-10T12:00:00Z",
+  "source": "synthetic",
+  "note": "The fixture that pins the check order in `_read_candidate`. A blocked prompt carries promptFeedback.blockReason AND an empty candidates list, so an adapter that tests for emptiness first reports EmptyResponse — which is failover-eligible, meaning the refused prompt gets shopped to the next provider until one answers it. ContentFiltered is not failover-eligible, which is the whole point.",
+  "request": {"method": "POST", "path": "/models/gemini-3.6-flash:generateContent"},
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "candidates": [],
+      "promptFeedback": {
+        "blockReason": "SAFETY",
+        "safetyRatings": [
+          {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH", "blocked": true},
+          {"category": "HARM_CATEGORY_HARASSMENT", "probability": "NEGLIGIBLE"}
+        ]
+      },
+      "usageMetadata": {
+        "promptTokenCount": 64,
+        "totalTokenCount": 64
+      },
+      "modelVersion": "gemini-3.6-flash",
+      "responseId": "1d908a1f-0c2e-4b1a-9f77-3d445b6ec2a5"
+    }
+  }
+}

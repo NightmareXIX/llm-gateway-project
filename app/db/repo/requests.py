@@ -10,10 +10,13 @@ writing ``"unknown"`` into those columns would poison exactly the query the tabl
 exists to serve — "how often does Groq fail". ``NULL`` means "never got that far";
 a string means we know.
 
-The Phase 2/3 columns (``substituted``, ``attempts``, ``wasted_tokens_out``) are
-deliberately not parameters yet. They carry their server defaults, and adding them
-to this signature is what Phase 2 does when it has something to put in them —
-which is cheaper than carrying arguments every current caller passes as a constant.
+``substituted``, ``attempts`` and ``wasted_tokens_out`` were added to the schema in
+Phase 1 and left off this signature until there was something to put in them.
+Phase 2 Step 5 is that moment: the router's attempt trail lands in ``attempts``,
+and D2's disclosure lands in ``substituted``. ``wasted_tokens_out`` is still a
+parameter nobody passes a non-zero value to — the streaming collector (Step 10) is
+its first real writer, and it is here now so that step is a call-site change rather
+than a signature change.
 
 Takes a session, never commits. The caller owns the transaction boundary.
 """
@@ -21,6 +24,7 @@ Takes a session, never commits. The caller owns the transaction boundary.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -51,6 +55,9 @@ async def create(
     latency_ms: int | None = None,
     error_code: str | None = None,
     cache_hit: bool = False,
+    substituted: bool = False,
+    attempts: list[dict[str, Any]] | None = None,
+    wasted_tokens_out: int = 0,
 ) -> Request:
     """Record one inbound request.
 
@@ -58,6 +65,11 @@ async def create(
     and is ``None`` for a browser session. Quota keys on the first (§1.2) —
     a user with three API keys is one user with one budget — while the second is
     what answers "which of my integrations is burning the daily cap".
+
+    ``attempts`` is the router's trail, already serialized. It can be longer than
+    the three-attempt cap, because a candidate skipped on an open breaker is an
+    event without a round trip (ADR-015) — so this column and
+    ``messages.meta.attempts`` legitimately disagree, and neither is wrong.
     """
     row = Request(
         user_id=user_id,
@@ -73,6 +85,9 @@ async def create(
         status=status,
         error_code=error_code,
         cache_hit=cache_hit,
+        substituted=substituted,
+        attempts=attempts if attempts is not None else [],
+        wasted_tokens_out=wasted_tokens_out,
     )
     session.add(row)
     # Assigns id and created_at now, so the caller can log the row it just wrote
