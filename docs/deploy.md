@@ -234,10 +234,14 @@ Set them at **the service → Environment → Environment Variables**, one at a 
 python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 ```
 
-`ENV`, `PORT` and `WEB_CONCURRENCY` are **not** in that list and should not be added here. They live
-in [`render.yaml`](../render.yaml)'s `envVars` block, because none of them is a secret and all three
-belong in version control — `ENV=prod` is what disables the `/docs` route. A dashboard variable of
-the same name shadows the file's, silently.
+`ENV`, `WEB_CONCURRENCY` and `FORWARDED_ALLOW_IPS` are **not** in that list and should not be added
+here. They live in [`render.yaml`](../render.yaml)'s `envVars` block, because none of them is a
+secret and all three belong in version control — `ENV=prod` is what disables the `/docs` route. A
+dashboard variable of the same name shadows the file's, silently.
+
+`PORT` is set by neither. Render assigns it, its value wins over anything declared alongside it, and
+`dockerCommand` binds `$PORT` rather than a number — so there is nothing to set and nothing that can
+drift.
 
 Render shows variable values back, unlike Fly's names-and-digests. Useful for catching a truncated
 paste; also worth knowing before treating the dashboard as a place secrets are hidden.

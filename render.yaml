@@ -72,10 +72,24 @@ services:
     #
     # Single instance on the free plan, so nothing can race this. That stops
     # being true the moment this service scales past one.
+    #
+    # No `/bin/sh -c` wrapper and no quotes anywhere, both learned the hard way.
+    # Render runs this through a shell already — it expands $PORT — but it hands
+    # the string on with quote characters intact rather than consumed as syntax,
+    # so wrapping it ourselves produced an inner shell whose entire argument was
+    # one quoted word: `/bin/sh: 1: alembic upgrade head && exec uvicorn ...:
+    # not found`, exit 127. The `&&` still works because Render's own shell is
+    # what parses it.
+    #
+    # $PORT is Render's to choose (10000 by default, and its value wins over an
+    # envVar of the same name), so this binds whatever arrives rather than
+    # naming a number. --workers and --forwarded-allow-ips are gone from the
+    # line because uvicorn reads $WEB_CONCURRENCY and $FORWARDED_ALLOW_IPS
+    # itself when the flags are absent (uvicorn/main.py), which keeps the one
+    # value that needs quoting — the `*` — out of a shell entirely.
     dockerCommand: >-
-      /bin/sh -c "alembic upgrade head && exec uvicorn app.main:app
-      --host 0.0.0.0 --port $PORT --workers ${WEB_CONCURRENCY:-1}
-      --proxy-headers --forwarded-allow-ips '*'"
+      alembic upgrade head && exec uvicorn app.main:app
+      --host 0.0.0.0 --port $PORT --proxy-headers
 
     envVars:
       # Not secrets, and they belong in version control. Everything else — the
@@ -84,18 +98,29 @@ services:
         value: prod
         # What switches off the /docs route in app/main.py.
 
-      - key: PORT
-        value: "8000"
-        # Render defaults this to 10000 and expects the server to bind whatever
-        # it says. Pinned to 8000 so the image, docker-compose, the Dockerfile's
-        # EXPOSE and this host all name the same port; the command above still
-        # reads $PORT, so the two cannot drift.
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"
+        # uvicorn's --forwarded-allow-ips, moved off the command line because a
+        # bare `*` is a glob to any shell and a quoted one is what broke the
+        # first deploy. Safe *here specifically* because nothing but Render's
+        # edge can route to this container's port — it would be a header-
+        # spoofing hole on a host where the port is directly reachable. Without
+        # it, --proxy-headers trusts nobody: request.url.scheme is http on every
+        # request and every log line names the proxy instead of the caller.
 
       - key: WEB_CONCURRENCY
         value: "1"
-        # One uvicorn worker, not the image's default of two. The free instance
-        # is 0.1 CPU and 512MB: a second worker splits one tenth of a core and
-        # doubles the resident set, and it doubles the Postgres pool with it
-        # (pool_size 5 + max_overflow 5 per process, app/db/session.py). The app
-        # is async throughout, so one event loop still serves concurrent requests
-        # while they wait on a provider.
+        # Also uvicorn's, read from the environment for the same reason — one
+        # worker, not the image's default of two. The free instance is 0.1 CPU
+        # and 512MB: a second worker splits one tenth of a core and doubles the
+        # resident set, and it doubles the Postgres pool with it (pool_size 5 +
+        # max_overflow 5 per process, app/db/session.py). The app is async
+        # throughout, so one event loop still serves concurrent requests while
+        # they wait on a provider. Render happens to default a free instance to
+        # 1 as well; it is declared here so the value is a decision in version
+        # control rather than a platform default that could change.
+        #
+        # PORT is deliberately absent from this block: Render assigns it and its
+        # own value wins over an envVar of the same name (the first deploy bound
+        # 10000 while this file asked for 8000). The command reads $PORT, so
+        # there is nothing to pin.

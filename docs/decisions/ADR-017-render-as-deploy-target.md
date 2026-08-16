@@ -33,14 +33,20 @@ constraints touch decisions this repo had already made and written down:
 by CI through a deploy hook.**
 
 - `render.yaml` is checked in and authoritative, the way `fly.toml` was.
-- `dockerCommand` is `/bin/sh -c "alembic upgrade head && exec uvicorn …"` — Render's own documented
-  pattern for this.
+- `dockerCommand` is `alembic upgrade head && exec uvicorn …`, unwrapped and unquoted. Render runs it
+  through a shell itself, so the `&&` works; a `/bin/sh -c "…"` wrapper does not, because Render
+  passes quote characters through as literal text rather than consuming them as syntax. The first
+  deploy proved it: `/bin/sh: 1: alembic upgrade head && exec uvicorn …: not found`, exit 127.
 - `healthCheckPath: /readyz`, unchanged in intent from ADR-009.
 - `autoDeploy: false`. The `deploy` job in `.github/workflows/ci.yml` calls the service's deploy hook,
   so `needs: [lint, test, frontend]` stays in front of every deploy.
 - One uvicorn worker (`WEB_CONCURRENCY=1`), down from two.
-- `PORT` is read from the environment by both the image's default `CMD` and the Render command;
-  `render.yaml` pins it to 8000 so image, compose and host agree on one number.
+- `PORT` is read from the environment by both the image's default `CMD` and the Render command, and
+  is *not* declared in `render.yaml` — Render assigns it and its own value wins over an `envVar` of
+  the same name, so declaring one only creates a number that looks authoritative and is not.
+- `--workers` and `--forwarded-allow-ips` are set as `WEB_CONCURRENCY` and `FORWARDED_ALLOW_IPS`
+  environment variables rather than command-line flags. uvicorn reads both natively when the flags
+  are absent, which keeps the `*` — a glob unquoted, and a parse failure quoted — out of a shell.
 
 ## Why
 
