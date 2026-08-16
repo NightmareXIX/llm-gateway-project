@@ -15,7 +15,10 @@ from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.cache.client import LuaScriptRegistry
+from app.config import get_limits_config, get_settings
 from app.providers.registry import ProviderRegistry
+from app.quota.tracker import QuotaTracker
 from app.routing.circuit_breaker import CircuitBreaker
 from app.usage.metrics import LatencyTable
 
@@ -101,6 +104,35 @@ def get_breaker(request: Request) -> CircuitBreaker:
     return CircuitBreaker(get_redis(request))
 
 
+def get_quota(request: Request) -> QuotaTracker | None:
+    """A quota tracker over the process-wide Redis client, or ``None`` when
+    enforcement is off.
+
+    Constructed per request for the same reason the breaker is: the tracker holds
+    no state — the ``q:{scope}:{provider}:{model}:*`` counters are the state, and
+    they are shared by every worker and every instance. Constructing one is four
+    attribute assignments.
+
+    ``None`` rather than a no-op tracker, and that is the whole point of
+    ``QUOTA_ENFORCEMENT`` (D15). Quota fails *closed*, so a self-inflicted total
+    outage — Redis down, every candidate refused — needs an escape hatch that
+    does not merely make the tracker permissive but stops it being constructed at
+    all. The router takes ``quota: QuotaTracker | None`` and skips reservation
+    entirely on ``None``, which is Phase 2's behaviour exactly.
+    """
+    settings = get_settings()
+    if not settings.QUOTA_ENFORCEMENT:
+        return None
+
+    scripts: LuaScriptRegistry = request.app.state.lua_scripts
+    return QuotaTracker(
+        get_redis(request),
+        scripts,
+        get_limits_config(),
+        headroom=settings.QUOTA_HEADROOM_FRACTION,
+    )
+
+
 def get_latency(request: Request) -> LatencyTable:
     """The in-process EWMA latency table `auto` ranks with (ADR-014).
 
@@ -119,4 +151,5 @@ RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
 BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]
+QuotaDep = Annotated[QuotaTracker | None, Depends(get_quota)]
 LatencyDep = Annotated[LatencyTable, Depends(get_latency)]

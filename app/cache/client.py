@@ -31,7 +31,7 @@ from app.core.logging import get_logger
 logger = get_logger("app.cache.client")
 
 LUA_SCRIPT_DIR = Path(__file__).resolve().parent.parent / "quota" / "scripts"
-"""Where checked-in Lua lives. Empty today; Phase 3's ``reserve.lua`` is the first."""
+"""Where checked-in Lua lives: ``reserve``, ``commit`` and ``release`` (Phase 3)."""
 
 CONNECT_TIMEOUT_S = 5.0
 """Bound on opening a connection. Upstash is a network hop, not a local socket."""
@@ -122,10 +122,10 @@ class LuaScriptRegistry:
     at startup so the first real request does not pay for the round trip and a
     syntax error surfaces at boot rather than under load.
 
-    Empty today. Phase 3's ``reserve.lua`` — a single atomic check-and-increment,
-    because a check-then-increment across two round trips overshoots under
-    concurrency — is the first file to land in the directory, and needs no change
-    here to be picked up.
+    Phase 3's three scripts were the first to land in the directory, and needed
+    no change here to be picked up: ``reserve.lua`` — a single atomic
+    check-and-increment, because a check-then-increment across two round trips
+    overshoots under concurrency — plus ``commit.lua`` and ``release.lua``.
     """
 
     def __init__(self, client: Redis) -> None:

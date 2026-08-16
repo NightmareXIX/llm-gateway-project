@@ -43,7 +43,9 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Final, Literal
+from uuid import uuid4
 
+from app.cache import keys
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
 from app.memory.canonical import CanonicalMessage
@@ -53,9 +55,16 @@ from app.providers.base import (
     DEFAULT_IDLE_TIMEOUT_S,
     DEFAULT_READ_TIMEOUT_S,
 )
-from app.providers.errors import ContextTooLong, EmptyResponse, ProviderError, Unavailable
+from app.providers.errors import (
+    ContextTooLong,
+    EmptyResponse,
+    ProviderError,
+    RateLimited,
+    Unavailable,
+)
 from app.providers.registry import ProviderRegistry
 from app.providers.types import Completion, GenParams, ModelSpec, Usage
+from app.quota.tracker import QuotaTracker, Reservation
 from app.routing import selection
 from app.routing.circuit_breaker import BreakerState, CircuitBreaker
 from app.usage.metrics import COMPLETE, STREAM, LatencyTable
@@ -98,7 +107,7 @@ invisible until a key rate-limits earlier than predicted. Marked
 it after the fact.
 """
 
-type AttemptOutcome = Literal["ok", "error", "skipped_breaker"]
+type AttemptOutcome = Literal["ok", "error", "skipped_breaker", "skipped_quota"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +136,13 @@ class AttemptRecord:
 
     breaker: BreakerState = "closed"
     retry_after_s: float | None = None
-    """Only on a skip: how long the breaker says this candidate is still out."""
+    """On a skip of either kind: how long until this candidate is worth trying
+    again — the breaker's cooldown, or D17's blocked window's reset."""
+
+    blocked_window: str | None = None
+    """Only on ``skipped_quota``: which window (``rpm``/``rpd``/``tpm``/``tpd``)
+    said no. ``None`` on every other outcome, breaker skips included — a breaker
+    skip has no window, it has a cooldown."""
 
     def to_json(self) -> dict[str, Any]:
         """The JSONB shape. Stable — Phase 7's dashboard reads it."""
@@ -144,6 +159,8 @@ class AttemptRecord:
         }
         if self.retry_after_s is not None:
             record["retry_after_s"] = round(self.retry_after_s, 3)
+        if self.blocked_window is not None:
+            record["blocked_window"] = self.blocked_window
         return record
 
 
@@ -306,6 +323,8 @@ async def route(
     resolver: AttachmentResolver | None = None,
     timeout_s: float = DEFAULT_READ_TIMEOUT_S,
     max_attempts: int = MAX_ATTEMPTS,
+    quota: QuotaTracker | None = None,
+    scope: keys.Scope = keys.SYSTEM_SCOPE,
     clock: Clock = SYSTEM_CLOCK,
     rng: random.Random | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -325,6 +344,12 @@ async def route(
     ``Settings.ROUTING_LATENCY_RANKING`` lands, so this module never reads
     settings. ``rng`` and ``sleep`` are injected so retry jitter is deterministic
     and tests do not actually wait.
+
+    ``quota`` being ``None`` disables reservation entirely — the same shape as
+    ``metrics=None`` — which is Step 3's ``QUOTA_ENFORCEMENT`` kill switch (D15)
+    reaching this module without it having to read settings either. ``scope`` is
+    ``keys.SYSTEM_SCOPE`` at every call site until Phase 6's
+    ``resolve_provider_key`` replaces the constant.
     """
     snapshot = metrics.snapshot(COMPLETE) if metrics is not None and rank_by_latency else None
     chain = selection.candidates(registry, requested, pinned=pinned, latency=snapshot)
@@ -372,16 +397,64 @@ async def route(
         retries_used = 0
 
         while True:
-            attempts += 1
             attempt_started = clock.now()
             adapter = registry.adapter_for_spec(spec)
             key = registry.system_key(spec.provider)
+            reservation: Reservation | None = None
 
             try:
                 payload, report = await render(history, spec, params, adapter, resolver=resolver)
+
+                # D17: the reservation *is* the check, made after render because
+                # the only trustworthy token estimate is the one render just
+                # measured. A render failure above never reaches here, so it
+                # never reserves and never counts as an attempt (below) —
+                # exactly the "attempts: 0" behaviour D17 calls out by name.
+                if quota is not None:
+                    quota_decision = await quota.reserve(
+                        spec,
+                        scope=scope,
+                        estimated_tokens=report.estimated_tokens,
+                        request_id=str(uuid4()),
+                    )
+                    if not quota_decision.allowed:
+                        trail.append(
+                            AttemptRecord(
+                                n=len(trail) + 1,
+                                slot=spec.slot,
+                                provider=spec.provider,
+                                model=spec.model,
+                                outcome="skipped_quota",
+                                breaker=decision.state,
+                                retry_after_s=quota_decision.retry_after_s,
+                                blocked_window=quota_decision.blocked_window,
+                            )
+                        )
+                        logger.info(
+                            "router.candidate_skipped_quota",
+                            provider=spec.provider,
+                            model=spec.model,
+                            slot=spec.slot,
+                            blocked_window=quota_decision.blocked_window,
+                            retry_after_s=quota_decision.retry_after_s,
+                            degraded=quota_decision.degraded,
+                        )
+                        # No round trip, no attempt spent (D17, trap 8) — straight
+                        # to the next candidate. Retrying the same one is pointless:
+                        # the window it just failed is still the window it has.
+                        break
+                    reservation = quota_decision.reservation
+
+                attempts += 1
                 completion = await adapter.complete(payload, key, timeout=timeout_s)
             except ProviderError as exc:
                 latency_ms = _elapsed_ms(clock, attempt_started)
+                if quota is not None and reservation is not None:
+                    # The provider counted the request the moment it left the
+                    # process, and it stays counted no matter what happens next
+                    # (trap 6) — only the token estimate corrects, down to what
+                    # was really generated: nothing, on this path.
+                    await quota.commit(reservation, tokens_in=0, tokens_out=0)
                 last_error = exc
                 last_spec = spec
                 trail.append(
@@ -466,6 +539,13 @@ async def route(
                 ) from exc
             else:
                 latency_ms = _elapsed_ms(clock, attempt_started)
+                if quota is not None and reservation is not None:
+                    # Correct the estimate to the truth, in either direction.
+                    await quota.commit(
+                        reservation,
+                        tokens_in=completion.usage.tokens_in,
+                        tokens_out=completion.usage.tokens_out,
+                    )
                 await breaker.record_success(decision)
                 if metrics is not None:
                     # Successful attempts only — a provider that 429s in 80ms is
@@ -510,7 +590,7 @@ async def route(
         error_code=last_error.code if last_error is not None else None,
     )
     raise RoutingFailed(
-        last_error if last_error is not None else _all_skipped(chain),
+        last_error if last_error is not None else _all_skipped(chain, tuple(trail)),
         spec=last_spec,
         trail=tuple(trail),
         attempts=attempts,
@@ -533,6 +613,8 @@ async def route_stream(
     idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
     first_token_timeout_s: float = DEFAULT_FIRST_TOKEN_TIMEOUT_S,
     max_attempts: int = MAX_ATTEMPTS,
+    quota: QuotaTracker | None = None,
+    scope: keys.Scope = keys.SYSTEM_SCOPE,
     clock: Clock = SYSTEM_CLOCK,
     rng: random.Random | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -573,6 +655,11 @@ async def route_stream(
     reaches the client as a JSON envelope or as an in-band ``done`` is D13's
     question and the orchestrator's to answer — this loop does not know that a
     client exists.
+
+    **The reservation is per attempt, same as** :func:`route`. A restart makes a
+    fresh one; a mid-stream abort commits the tokens it really generated (D1 step
+    4) rather than losing them, which is Step 5's whole reason for existing on
+    this path.
     """
     snapshot = metrics.snapshot(STREAM) if metrics is not None and rank_by_latency else None
     chain = selection.candidates(registry, requested, pinned=pinned, latency=snapshot)
@@ -617,10 +704,10 @@ async def route_stream(
         retries_used = 0
 
         while True:
-            attempts += 1
             attempt_started = clock.now()
             adapter = registry.adapter_for_spec(spec)
             key = registry.system_key(spec.provider)
+            reservation: Reservation | None = None
 
             delivered_chars = 0
             ttft_ms: int | None = None
@@ -629,6 +716,43 @@ async def route_stream(
 
             try:
                 payload, report = await render(history, spec, params, adapter, resolver=resolver)
+
+                # Same ordering as `route` (D17): render first for the token
+                # estimate, reserve second, and only a granted reservation counts
+                # as an attempt. A render failure below never reaches this block.
+                if quota is not None:
+                    quota_decision = await quota.reserve(
+                        spec,
+                        scope=scope,
+                        estimated_tokens=report.estimated_tokens,
+                        request_id=str(uuid4()),
+                    )
+                    if not quota_decision.allowed:
+                        trail.append(
+                            AttemptRecord(
+                                n=len(trail) + 1,
+                                slot=spec.slot,
+                                provider=spec.provider,
+                                model=spec.model,
+                                outcome="skipped_quota",
+                                breaker=decision.state,
+                                retry_after_s=quota_decision.retry_after_s,
+                                blocked_window=quota_decision.blocked_window,
+                            )
+                        )
+                        logger.info(
+                            "router.candidate_skipped_quota",
+                            provider=spec.provider,
+                            model=spec.model,
+                            slot=spec.slot,
+                            blocked_window=quota_decision.blocked_window,
+                            retry_after_s=quota_decision.retry_after_s,
+                            degraded=quota_decision.degraded,
+                        )
+                        break
+                    reservation = quota_decision.reservation
+
+                attempts += 1
                 yield AttemptStarted(attempt=attempts, spec=spec)
 
                 chunks = adapter.stream(payload, key, timeout_s, idle_timeout_s).__aiter__()
@@ -688,6 +812,11 @@ async def route_stream(
                 latency_ms = _elapsed_ms(clock, attempt_started)
                 wasted = _estimate_discarded_tokens(delivered_chars)
                 wasted_total += wasted
+                if quota is not None and reservation is not None:
+                    # Those tokens were really generated and really charged
+                    # (§1.1 step 4, D17 trap 7) — zero here only when nothing was
+                    # delivered before the fault, same as the non-streaming path.
+                    await quota.commit(reservation, tokens_in=0, tokens_out=wasted)
                 last_error = exc
                 last_spec = spec
                 trail.append(
@@ -784,6 +913,21 @@ async def route_stream(
                 # at all raised EmptyResponse above — but mypy cannot see that and
                 # a silent 0 would be a wrong measurement rather than a missing one.
                 first_token_ms = ttft_ms if ttft_ms is not None else latency_ms
+                final_usage = (
+                    usage
+                    if usage is not None
+                    else Usage(
+                        tokens_in=report.estimated_tokens,
+                        tokens_out=_estimate_discarded_tokens(delivered_chars),
+                        estimated=True,
+                    )
+                )
+                if quota is not None and reservation is not None:
+                    await quota.commit(
+                        reservation,
+                        tokens_in=final_usage.tokens_in,
+                        tokens_out=final_usage.tokens_out,
+                    )
                 await breaker.record_success(decision)
                 if metrics is not None:
                     metrics.record(spec.provider, spec.model, STREAM, first_token_ms)
@@ -812,13 +956,7 @@ async def route_stream(
                 )
                 yield StreamCompleted(
                     spec=spec,
-                    usage=usage
-                    if usage is not None
-                    else Usage(
-                        tokens_in=report.estimated_tokens,
-                        tokens_out=_estimate_discarded_tokens(delivered_chars),
-                        estimated=True,
-                    ),
+                    usage=final_usage,
                     finish_reason=finish_reason,
                     report=report,
                     trail=tuple(trail),
@@ -838,7 +976,7 @@ async def route_stream(
         wasted_tokens_out=wasted_total,
     )
     raise RoutingFailed(
-        last_error if last_error is not None else _all_skipped(chain),
+        last_error if last_error is not None else _all_skipped(chain, tuple(trail)),
         spec=last_spec,
         trail=tuple(trail),
         attempts=attempts,
@@ -881,19 +1019,37 @@ def _elapsed_ms(clock: Clock, since: datetime) -> int:
     return int((clock.now() - since).total_seconds() * 1000)
 
 
-def _all_skipped(chain: tuple[ModelSpec, ...]) -> ProviderError:
-    """Every candidate's breaker was open, so nothing was ever attempted.
+def _all_skipped(chain: tuple[ModelSpec, ...], trail: tuple[AttemptRecord, ...]) -> ProviderError:
+    """Every candidate was skipped, so nothing was ever attempted — but not every
+    skip means the same thing, and the client's error has to say which.
 
-    A real outcome, not an impossible one: it is what a fleet-wide outage looks
-    like on the request *after* the one that opened everything. Normalized into
-    the hierarchy so the endpoint's ``to_app_error`` handles it like any other
-    upstream failure rather than needing a case of its own.
+    A breaker-only skip is what a fleet-wide outage looks like on the request
+    *after* the one that opened everything: ``Unavailable``, as before. But if
+    even one candidate was skipped on quota, the honest answer is ``RateLimited``
+    with a ``Retry-After`` the client can actually use — the gateway did not fail,
+    it declined to spend a budget it knows is gone, and conflating that with an
+    outage would send a client's retry loop at a key that is not coming back any
+    sooner for it.
     """
-    first = chain[0] if chain else None
+    quota_skips = [record for record in trail if record.outcome == "skipped_quota"]
+    if quota_skips:
+        first = quota_skips[0]
+        retry_after_s = min(
+            (record.retry_after_s for record in quota_skips if record.retry_after_s is not None),
+            default=None,
+        )
+        return RateLimited(
+            "every candidate is blocked on quota",
+            provider=first.provider,
+            model=first.model,
+            retry_after_s=retry_after_s,
+        )
+
+    first_candidate = chain[0] if chain else None
     return Unavailable(
         "every candidate is in circuit-breaker cooldown",
-        provider=first.provider if first is not None else "none",
-        model=first.model if first is not None else "none",
+        provider=first_candidate.provider if first_candidate is not None else "none",
+        model=first_candidate.model if first_candidate is not None else "none",
     )
 
 

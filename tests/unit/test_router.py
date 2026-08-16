@@ -36,6 +36,7 @@ a quarter-second per retry test.
 from __future__ import annotations
 
 import contextlib
+import json
 import random
 from collections.abc import Iterator
 from typing import Any
@@ -44,7 +45,9 @@ import httpx
 import pytest
 from fakeredis.aioredis import FakeRedis
 
-from app.config import ProviderEntry, ProvidersConfig, Slot, SlotCandidate
+from app.cache import keys
+from app.cache.client import LuaScriptRegistry
+from app.config import LimitsConfig, ProviderEntry, ProvidersConfig, Slot, SlotCandidate
 from app.core.clock import FixedClock
 from app.memory.canonical import CanonicalMessage
 from app.providers.errors import (
@@ -57,7 +60,8 @@ from app.providers.errors import (
     Unavailable,
 )
 from app.providers.registry import ProviderRegistry, build_registry
-from app.providers.types import GenParams
+from app.providers.types import GenParams, ModelSpec
+from app.quota.tracker import QuotaTracker
 from app.routing import router
 from app.routing.circuit_breaker import CircuitBreaker
 from app.usage.metrics import COMPLETE, MIN_SAMPLES, LatencyTable
@@ -118,6 +122,115 @@ def history() -> list[CanonicalMessage]:
 @pytest.fixture
 def breaker(redis_client: FakeRedis, frozen_clock: FixedClock) -> CircuitBreaker:
     return CircuitBreaker(redis_client, clock=frozen_clock)
+
+
+def _quota_limits(*, rpm: int = 1, tpm: int = 100_000) -> LimitsConfig:
+    """Every fleet model declares the same small budget, real Lua scripts and
+    all — real enough that a blocked reservation here is the same one Redis
+    would produce in production, not a stand-in for it."""
+    model_limits = {
+        "rpm": rpm,
+        "tpm": tpm,
+        "reset": {"rpm": "rolling_60s", "tpm": "rolling_60s"},
+    }
+    return LimitsConfig.model_validate(
+        {
+            "version": 1,
+            "limits": {PROVIDER: dict.fromkeys(FLEET, model_limits)},
+            "gateway": {"free": {"rpm": 20, "rpd": 500}},
+        }
+    )
+
+
+@pytest.fixture
+def quota(redis_client: FakeRedis, frozen_clock: FixedClock) -> QuotaTracker:
+    scripts = LuaScriptRegistry(redis_client)
+    scripts.load_dir()
+    return QuotaTracker(redis_client, scripts, _quota_limits(), clock=frozen_clock, headroom=0.0)
+
+
+def _spec_for(model: str) -> ModelSpec:
+    """A minimal, standalone :class:`ModelSpec` for driving the tracker directly
+    — the exhaustion setup below has no registry in hand yet."""
+    return ModelSpec(
+        slot="setup",
+        provider=PROVIDER,
+        model=model,
+        context_window=131072,
+        max_output_tokens=32768,
+        supports_streaming=True,
+        supports_vision=False,
+        supports_pdf=False,
+        supports_system_field=False,
+        max_file_bytes=None,
+        priority=0,
+    )
+
+
+async def exhaust_quota(
+    quota: QuotaTracker, model: str, *, request_id: str = "pre-exhausted"
+) -> None:
+    """Spend one candidate's whole ``rpm`` budget, the way a prior request would
+    have — never released, so the window stays exhausted for the test."""
+    decision = await quota.reserve(
+        _spec_for(model), scope=keys.SYSTEM_SCOPE, estimated_tokens=1, request_id=request_id
+    )
+    assert decision.allowed, f"test setup failed: could not exhaust {model}'s quota"
+
+
+def _sse_frame(**event: Any) -> bytes:
+    return f"data: {json.dumps(event)}\n\n".encode()
+
+
+def _sse_deltas(*texts: str) -> list[bytes]:
+    return [
+        _sse_frame(choices=[{"index": 0, "delta": {"content": text}, "finish_reason": None}])
+        for text in texts
+    ]
+
+
+def _sse_finished(*, tokens_in: int = 10, tokens_out: int = 5) -> list[bytes]:
+    """The terminal chunk plus ``[DONE]`` — a stream that ended because it was
+    done, in Groq's ``x_groq.usage`` shape."""
+    return [
+        _sse_frame(
+            choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            x_groq={
+                "usage": {
+                    "prompt_tokens": tokens_in,
+                    "completion_tokens": tokens_out,
+                    "total_tokens": tokens_in + tokens_out,
+                }
+            },
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+
+class _StreamScript:
+    """Serves a sequence of streaming upstream attempts, in order.
+
+    The streaming twin of :func:`scripted`, kept local and minimal rather than
+    imported from ``test_orchestrator.py``'s ``StreamingHandler`` — that module
+    already imports from this one, and a streaming test belongs in this file
+    per Step 5's own file list.
+    """
+
+    def __init__(self, *scripts: list[bytes | BaseException]) -> None:
+        self._scripts = list(scripts)
+        self.calls = 0
+
+    def __call__(self, _request: httpx.Request) -> httpx.Response:
+        item = self._scripts[self.calls]
+        self.calls += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=provider_fixtures.ScriptedByteStream(item),
+        )
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self))
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -516,6 +629,204 @@ async def test_every_breaker_open_produces_a_normalized_failure(
         await drive(handler, breaker, history)
 
     assert handler.calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# Quota (Phase 3 Step 5) — the router stops guessing
+# --------------------------------------------------------------------------- #
+async def test_a_quota_exhausted_candidate_fails_over_without_a_round_trip(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """The milestone this step exists for: the exhausted candidate receives
+    *zero* requests, asserted on the mock transport rather than inferred."""
+    await exhaust_quota(quota, "model-a")
+    handler = scripted("success")
+
+    outcome = await drive(handler, breaker, history, quota=quota)
+
+    assert outcome.spec.model == "model-b"
+    assert outcome.attempts == 1
+    assert handler.calls == 1
+    assert handler.models() == ["model-b"]
+    assert [record.outcome for record in outcome.trail] == ["skipped_quota", "ok"]
+    assert outcome.trail[0].blocked_window == "rpm"
+
+
+async def test_a_chain_of_three_quota_exhausted_candidates_still_reaches_the_fourth(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """Same reasoning as the breaker's version of this test: three exhausted
+    candidates at the head of the chain must not spend the budget of three
+    before a healthy provider at position four is ever asked."""
+    for model in FLEET[:3]:
+        await exhaust_quota(quota, model)
+    handler = scripted("success")
+
+    outcome = await drive(handler, breaker, history, quota=quota)
+
+    assert outcome.spec.model == "model-d"
+    assert outcome.attempts == 1
+    assert handler.calls == 1
+    assert [record.outcome for record in outcome.trail] == [
+        "skipped_quota",
+        "skipped_quota",
+        "skipped_quota",
+        "ok",
+    ]
+
+
+async def test_requesting_an_exhausted_slot_explicitly_still_gets_an_answer(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """D2, not the development plan's `slot_unavailable` error: quota knowledge
+    only changes *when* the spill happens — before the round trip instead of
+    after a 429 — never whether it happens."""
+    await exhaust_quota(quota, "model-c")
+    await exhaust_quota(quota, "model-d")
+    handler = scripted("success")
+
+    outcome = await drive(handler, breaker, history, requested="fast", quota=quota)
+
+    assert outcome.spec.slot == "general"
+    assert outcome.spec.model == "model-a"
+
+
+async def test_a_quota_skip_costs_no_attempt(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """Trap 8: a quota rejection must not consume one of the three tries a
+    message gets, exactly as a breaker skip does not (ADR-015). Two skips ahead
+    of two *real* candidates still leaves both of them a genuine attempt — if a
+    skip cost one, the second candidate's failure would exhaust the chain
+    instead of failing over to the third."""
+    await exhaust_quota(quota, "model-a")
+    await exhaust_quota(quota, "model-b")
+    handler = scripted("rate_limited", "success")
+
+    outcome = await drive(handler, breaker, history, quota=quota)
+
+    assert outcome.spec.model == "model-d"
+    assert outcome.attempts == 2
+    assert [record.outcome for record in outcome.trail] == [
+        "skipped_quota",
+        "skipped_quota",
+        "error",
+        "ok",
+    ]
+
+
+async def test_every_candidate_blocked_on_quota_reports_rate_limited(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """D17's generalization of `_all_skipped`: a fleet blocked entirely on quota
+    is a `RateLimited` with a `Retry-After` a client can use, not the breaker's
+    `Unavailable` — the gateway declined to spend a budget it knows is gone,
+    which is a different fact from every candidate being in cooldown."""
+    for model in FLEET:
+        await exhaust_quota(quota, model)
+    handler = scripted()
+
+    with failing_with(RateLimited, match="quota"):
+        await drive(handler, breaker, history, quota=quota)
+
+    assert handler.calls == 0
+
+
+async def test_a_mix_of_quota_and_breaker_skips_still_reports_rate_limited(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """Any quota skip in the trail tips the verdict — a client should not be told
+    to wait out a breaker cooldown when the real blocker is its own budget."""
+    await open_breaker(breaker, "model-a")
+    await exhaust_quota(quota, "model-b")
+    await exhaust_quota(quota, "model-c")
+    await exhaust_quota(quota, "model-d")
+    handler = scripted()
+
+    with failing_with(RateLimited):
+        await drive(handler, breaker, history, quota=quota)
+
+
+async def test_the_skipped_quota_record_serializes_the_blocked_window(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    await exhaust_quota(quota, "model-a")
+    handler = scripted("success")
+
+    outcome = await drive(handler, breaker, history, quota=quota)
+    skip = outcome.trail[0].to_json()
+
+    assert skip["outcome"] == "skipped_quota"
+    assert skip["blocked_window"] == "rpm"
+    assert skip["retry_after_s"] == pytest.approx(60.0)
+
+
+async def test_quota_disabled_behaves_exactly_like_phase_2(
+    breaker: CircuitBreaker, history: list[CanonicalMessage], quota: QuotaTracker
+) -> None:
+    """``quota=None`` is the escape hatch (D15/`QUOTA_ENFORCEMENT`): reservation
+    is skipped entirely and an exhausted counter is never consulted."""
+    await exhaust_quota(quota, "model-a")
+    handler = scripted("success")
+
+    outcome = await drive(handler, breaker, history)  # no `quota=` kwarg
+
+    assert outcome.spec.model == "model-a"
+    assert handler.calls == 1
+
+
+async def test_a_successful_attempt_commits_the_real_token_count(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    quota: QuotaTracker,
+    redis_client: FakeRedis,
+) -> None:
+    """Success corrects the reservation's estimate to the truth, in either
+    direction — asserted against the real counter a Lua script wrote."""
+    handler = scripted("success")
+
+    await drive(handler, breaker, history, quota=quota)
+
+    used = await redis_client.get(keys.quota(keys.SYSTEM_SCOPE, PROVIDER, "model-a", "tpm"))
+    fixture = provider_fixtures.load(PROVIDER, "success")
+    expected = fixture.body["usage"]["total_tokens"]  # type: ignore[index]
+    assert used == str(expected)
+
+
+async def test_a_mid_stream_abort_commits_the_tokens_it_really_generated(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    quota: QuotaTracker,
+    redis_client: FakeRedis,
+) -> None:
+    """D1 step 4 / D17 trap 7: a candidate that dies mid-sentence still generated
+    text the free tier charged for. The counter has to move on *that*
+    candidate, and it has to be exactly the discarded estimate — no more, no
+    less, and never lost to the restart that follows it."""
+    died: list[bytes | BaseException] = [
+        *_sse_deltas("hello there"),
+        httpx.RemoteProtocolError("peer closed the connection"),
+    ]
+    finished: list[bytes | BaseException] = [*_sse_deltas("hi"), *_sse_finished()]
+    script = _StreamScript(died, finished)
+    registry = build_registry(client=script.client(), config=FLEET_CONFIG)
+
+    events = router.route_stream(
+        registry=registry,
+        breaker=breaker,
+        history=history,
+        params=PARAMS,
+        requested="general",
+        sleep=_no_sleep,
+        quota=quota,
+    )
+    async for _event in events:
+        pass
+
+    wasted = len("hello there") // router.DISCARDED_CHARS_PER_TOKEN
+    used = await redis_client.get(keys.quota(keys.SYSTEM_SCOPE, PROVIDER, "model-a", "tpm"))
+    assert used == str(wasted)
+    assert script.calls == 2
 
 
 # --------------------------------------------------------------------------- #

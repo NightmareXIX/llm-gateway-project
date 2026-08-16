@@ -70,6 +70,7 @@ from app.providers.base import (
 )
 from app.providers.registry import ProviderRegistry
 from app.providers.types import GenParams, ModelSpec, Usage
+from app.quota.tracker import QuotaTracker
 from app.routing import router as routing
 from app.routing import selection
 from app.routing.circuit_breaker import CircuitBreaker
@@ -152,6 +153,8 @@ async def stream_completion(
     metrics: LatencyTable | None = None,
     rank_by_latency: bool = True,
     resolver: AttachmentResolver | None = None,
+    quota: QuotaTracker | None = None,
+    scope: keys.Scope = keys.SYSTEM_SCOPE,
     redis: Redis | None = None,
     persistence: StreamPersistence | None = None,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
@@ -182,6 +185,8 @@ async def stream_completion(
         metrics=metrics,
         rank_by_latency=rank_by_latency,
         resolver=resolver,
+        quota=quota,
+        scope=scope,
         timeout_s=timeout_s,
         idle_timeout_s=idle_timeout_s,
         first_token_timeout_s=first_token_timeout_s,

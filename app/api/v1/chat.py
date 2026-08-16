@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.dependency import PrincipalDep
 from app.auth.principal import Principal
+from app.cache import keys
 from app.config import get_settings
 from app.core.clock import SYSTEM_CLOCK
 from app.core.errors import InvalidRequest, NotFound
@@ -46,11 +47,20 @@ from app.core.logging import get_logger, get_request_id
 from app.db.models import Conversation
 from app.db.repo import conversations as conversations_repo
 from app.db.repo import messages as messages_repo
-from app.deps import BreakerDep, LatencyDep, RedisDep, RegistryDep, SessionDep, SessionFactoryDep
+from app.deps import (
+    BreakerDep,
+    LatencyDep,
+    QuotaDep,
+    RedisDep,
+    RegistryDep,
+    SessionDep,
+    SessionFactoryDep,
+)
 from app.memory.canonical import CanonicalMessage, MessageMeta, text_block
 from app.providers.errors import to_app_error
 from app.providers.registry import ProviderRegistry, UnknownSlot
 from app.providers.types import GenParams, ModelSpec
+from app.quota.tracker import QuotaTracker
 from app.routing import router as routing
 from app.routing import selection
 from app.routing.circuit_breaker import CircuitBreaker
@@ -93,6 +103,7 @@ async def create_chat_completion(
     breaker: BreakerDep,
     latency: LatencyDep,
     redis: RedisDep,
+    quota: QuotaDep,
 ) -> ChatCompletionResponse | StreamingResponse:
     """Answer one turn, persisting both halves of it.
 
@@ -149,6 +160,7 @@ async def create_chat_completion(
             breaker=breaker,
             latency=latency,
             redis=redis,
+            quota=quota,
             session_factory=session_factory,
         )
 
@@ -168,6 +180,10 @@ async def create_chat_completion(
             pinned=conversation.pinned_model,
             metrics=latency,
             rank_by_latency=get_settings().ROUTING_LATENCY_RANKING,
+            quota=quota,
+            # Constant until Phase 6's `resolve_provider_key` replaces it with a
+            # real per-user scope — the same pattern `registry.system_key` uses.
+            scope=keys.SYSTEM_SCOPE,
         )
     except routing.RoutingFailed as failure:
         # Includes `ContextTooLong` raised by the fitting step before a request
@@ -266,6 +282,7 @@ async def _stream_chat_completion(
     breaker: CircuitBreaker,
     latency: LatencyTable,
     redis: Redis,
+    quota: QuotaTracker | None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> StreamingResponse:
     """Drive the router loop far enough to know whether anything will be sent,
@@ -305,6 +322,9 @@ async def _stream_chat_completion(
         pinned=conversation.pinned_model,
         metrics=latency,
         rank_by_latency=get_settings().ROUTING_LATENCY_RANKING,
+        quota=quota,
+        # Same constant, same reason as the non-streaming path above.
+        scope=keys.SYSTEM_SCOPE,
         redis=redis,
         persistence=Collector(session_factory, principal=principal),
         is_disconnected=partial(sse.client_disconnected, request),

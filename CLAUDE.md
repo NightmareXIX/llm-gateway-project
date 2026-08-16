@@ -5,7 +5,8 @@ exposing one OpenAI-shaped API while it owns conversation state, routes across l
 when a free tier runs out, tracks heterogeneous quota (RPM/RPD/TPM) in Redis, and understands uploaded files
 through a separate "perception lane" even when the answering model can't. Portfolio/learning project, runs
 entirely on free tiers. Full specs: [contracts-and-phase1.md](doc/reference/contracts-and-phase1.md),
-[project-overview.md](doc/reference/project-overview.md), [development-plan.md](doc/reference/development-plan.md).
+[project-overview.md](doc/reference/project-overview.md), [development-plan.md](doc/reference/development-plan.md),
+[phase2.md](doc/reference/phase2.md), [phase3.md](doc/reference/phase3.md).
 Where the overview and the contracts doc disagree, the contracts doc wins.
 
 ## Locked decisions (§1) — do not relitigate
@@ -96,19 +97,31 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 1 (§4)
+## Current phase: Phase 3 — Quota-Aware Routing (§4)
 
-**Scope:** authenticated, persistent, single-provider (Groq) non-streaming chat, deployed. Supabase JWT +
-gateway API keys, first Alembic migration (`users`, `api_keys`, `conversations`, `messages`, `requests`),
-error envelope, full canonical schema + invariants, ownership-scoped repos, `providers/{types,errors,base}.py`
-before `groq.py`, render pipeline with all six steps present, `POST /v1/chat/completions` returning a top-level
-`served_by`, conversation CRUD endpoints, an ugly-but-real Next.js UI with `ModelIndicator`, tests, deploy.
+Phase 1 (single-provider proxy) and Phase 2 (multi-provider core, failover, streaming) are done and merged.
 
-**Explicitly NOT in Phase 1:** no streaming, no failover, no quota enforcement, no file handling. Redis runs in
-compose but is unused. Unused columns (`substituted`, `attempts`, `wasted_tokens_out`) get added now anyway.
+**Status:** Steps 1-2 (config surface, `quota/windows.py`) are committed. Steps 3-4 (`quota/tracker.py` +
+`quota/scripts/{reserve,commit,release}.lua`, `quota/lanes.py`) are implemented in the working tree but not
+yet committed. Steps 5-11 (wiring the tracker into both router paths, `QuotaHint` reconciliation, `GET
+/v1/models`, the frontend `ModelPicker`, exact-match cache, our own rate limiting, tests/ADRs/docs/deploy) have
+not started. Full step breakdown: [phase3.md](doc/reference/phase3.md).
 
-**Done means:** a logged-in user sends a message, gets a Groq answer, refreshes, history is still there, and a
-`requests` row records provider, model, tokens, latency, and status.
+**Scope:** the router stops guessing and starts knowing. A candidate that cannot be served is skipped before
+the round trip rather than after the 429, `GET /v1/models` reports live status a client can render, identical
+deterministic requests are answered from cache, and the gateway enforces its own limits on its own users.
+
+**Explicitly NOT in Phase 3:** no perception lane (Phase 4 writes `quota_perception_lane()`; this phase only
+reserves the budget and builds the accounting seam), no idempotency (D6 is Phase 7), no BYOK (`scope` is
+threaded as a real parameter but is `keys.SYSTEM_SCOPE` at every call site until Phase 6), no `pricing.yaml` /
+simulated cost / `/metrics` (Phase 7), no semantic cache (exact-match only, per D5).
+
+**Done means:** hammer the `fast` slot until Groq's RPD is spent — `/v1/models` flips it to `rate_limited`
+with an accurate `resets_at`, `auto` routes around it without a wasted round trip, and asking for `fast`
+explicitly still gets an answer (from a different model, disclosed) rather than a structured refusal — D2
+was overridden to silent failover, so quota knowledge only changes *when* the spill happens. Two identical
+`temperature: 0` requests: the second returns `X-Cache: HIT`, writes a `cache_hit=true` row, and makes no
+provider call.
 
 ## Conventions
 
