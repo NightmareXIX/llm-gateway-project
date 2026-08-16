@@ -45,6 +45,6 @@ doc
 Makefile
 docker-compose.yml
 Dockerfile
-fly.toml
+render.yaml
 README.md
 CLAUDE.md

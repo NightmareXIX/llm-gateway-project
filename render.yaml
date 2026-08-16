@@ -1,0 +1,101 @@
+# Render deployment. See docs/deploy.md for the runbook this file is half of,
+# and docs/decisions/ADR-017-render-as-deploy-target.md for why it replaced fly.toml.
+#
+# Checked in and authoritative. Render reads it as a Blueprint when the service is
+# created from this repo; every field below is also editable in the dashboard, and
+# a dashboard edit that is not mirrored here is a setting nobody can find again.
+#
+# `name` is a global namespace on Render the same way Fly's was — it becomes
+# `https://<name>.onrender.com`, which is the value Vercel's GATEWAY_URL and
+# OpenRouter's attribution header in config/providers.yaml both hardcode. Change
+# it here and in both of those, or not at all.
+
+services:
+  - type: web
+    name: llm-gateway-sed
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    branch: main
+
+    # Render places services, not databases, and has no Tokyo region — so unlike
+    # Fly this cannot sit next to a Supabase project in ap-northeast-1. Singapore
+    # is the closest of the five (oregon, ohio, virginia, frankfurt, singapore),
+    # and every request pays ~60-90ms per Postgres round trip for the gap. If the
+    # Supabase project is not in Asia-Pacific, read the region out of the pooler
+    # hostname (`aws-0-<region>.pooler.supabase.com`) and match it here instead:
+    # us-east-* -> virginia, us-west-* -> oregon, eu-* -> frankfurt.
+    #
+    # Render cannot change a service's region after creation. Getting this wrong
+    # means deleting the service and making a new one, under a new URL.
+    region: singapore
+
+    # OFF, deliberately, and the one setting here that is a correctness matter.
+    # Render's own auto-deploy fires on every push to `main` and knows nothing
+    # about CI — which would ship past a red test suite, defeating the
+    # `needs: [lint, test, frontend]` gate in .github/workflows/ci.yml. That
+    # workflow's deploy job calls the service's deploy hook instead, so the tests
+    # stay in front of every deploy.
+    autoDeploy: false
+
+    # Readiness, not liveness, for the same reasons as ADR-009: Render uses this
+    # to decide whether a deploy succeeded and whether a running instance takes
+    # traffic, and an instance that is up but cannot reach Postgres should do
+    # neither. /healthz stays the "is the process alive" answer and never touches
+    # the database.
+    #
+    # New on Render, and worth knowing before it happens: 15s of consecutive
+    # failures pauses traffic, and 60s of them *restarts the instance*. Fly only
+    # ever pulled a machine out of rotation. A Supabase outage is therefore a
+    # restart loop here, not a quiet degradation — see docs/limitations.md.
+    healthCheckPath: /readyz
+
+    # Migrations run here because they have nowhere better to go: Render's
+    # pre-deploy command — the direct equivalent of fly.toml's release_command —
+    # is a paid-plan feature, and free instances have no shell and no one-off
+    # jobs either. `/bin/sh -c` with a chained command is Render's own documented
+    # pattern for exactly this.
+    #
+    # It keeps the property that mattered: alembic/env.py resolves DATABASE_URL
+    # through app/config.py, so a missing or malformed variable fails here, before
+    # uvicorn binds. The container never becomes healthy, Render cancels the
+    # deploy, and the previous instance keeps serving. Same abort-on-failure,
+    # reached from the other direction.
+    #
+    # What it costs: this re-runs on every cold start after the 15-minute idle
+    # spin-down, not just on deploys. A no-op `upgrade head` is one round trip to
+    # Postgres, but it is a round trip to Singapore->Tokyo on a tenth of a CPU,
+    # and it is now on the critical path of waking up. It also means an
+    # unreachable Supabase during a wake-up leaves the service down rather than
+    # degraded; the escape hatch is editing this command in the dashboard to drop
+    # the `alembic` half.
+    #
+    # Single instance on the free plan, so nothing can race this. That stops
+    # being true the moment this service scales past one.
+    dockerCommand: >-
+      /bin/sh -c "alembic upgrade head && exec uvicorn app.main:app
+      --host 0.0.0.0 --port $PORT --workers ${WEB_CONCURRENCY:-1}
+      --proxy-headers --forwarded-allow-ips '*'"
+
+    envVars:
+      # Not secrets, and they belong in version control. Everything else — the
+      # nine in docs/deploy.md's table — is set in the dashboard and never here.
+      - key: ENV
+        value: prod
+        # What switches off the /docs route in app/main.py.
+
+      - key: PORT
+        value: "8000"
+        # Render defaults this to 10000 and expects the server to bind whatever
+        # it says. Pinned to 8000 so the image, docker-compose, the Dockerfile's
+        # EXPOSE and this host all name the same port; the command above still
+        # reads $PORT, so the two cannot drift.
+
+      - key: WEB_CONCURRENCY
+        value: "1"
+        # One uvicorn worker, not the image's default of two. The free instance
+        # is 0.1 CPU and 512MB: a second worker splits one tenth of a core and
+        # doubles the resident set, and it doubles the Postgres pool with it
+        # (pool_size 5 + max_overflow 5 per process, app/db/session.py). The app
+        # is async throughout, so one event loop still serves concurrent requests
+        # while they wait on a provider.

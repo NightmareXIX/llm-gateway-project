@@ -24,14 +24,35 @@ inconsistent at the paragraph level in a way this project does not attempt to sm
 this project is built to demonstrate is "what happens when a provider is slow but not fully down," not
 "how do you make three different free models sound like one."
 
-**A sleeping free-tier Fly instance can drop a stream mid-flight.** `fly.toml`'s
-`auto_stop_machines = "suspend"` is accepted deliberately (`development-plan.md` §5's risk register) for
-the cold-start cost it buys back on every quiet interval. The failure mode specific to streaming: a
-machine that is asked to suspend while a long-running SSE response is still open can end that response
-before `done` is ever sent, and the client sees a connection drop rather than an in-band failure — the
-one shape of failure `route_stream`'s error hierarchy cannot classify, because nothing about it comes
-from a provider. `min_machines_running = 0` is the setting to raise first if this becomes a recurring
-demo problem; it costs the free tier's idle-suspend savings to fix.
+**A sleeping free-tier Render instance can drop a stream mid-flight.** Free web services spin down
+after 15 minutes without inbound traffic and take about a minute to come back, which is accepted
+deliberately (`development-plan.md` §5's risk register). The failure mode specific to streaming: an
+instance reclaimed while a long-running SSE response is still open can end that response before `done`
+is ever sent, and the client sees a connection drop rather than an in-band failure — the one shape of
+failure `route_stream`'s error hierarchy cannot classify, because nothing about it comes from a
+provider. Unlike Fly's `min_machines_running`, there is no setting that removes the window: on Render
+the only fix is a paid instance type that does not spin down.
+
+**A cold start now includes a database migration, so an unreachable Supabase means the gateway does
+not come back at all.** Render's free plan has no pre-deploy command, so `alembic upgrade head` runs
+in the container's start command (`render.yaml`, [ADR-017](decisions/ADR-017-render-as-deploy-target.md)).
+On a deploy that is the right trade — a broken migration cancels the deploy instead of reaching
+traffic. On a *wake-up* it means a dependency failure that would previously have produced a running
+instance failing `/readyz` now produces no running instance, and the difference is visible to a user
+as a timeout rather than a 503. The escape hatch is editing `dockerCommand` in the dashboard.
+
+**`/readyz` failures restart the instance rather than just draining it.** Render pauses traffic to an
+instance after 15 seconds of consecutive health-check failures and restarts it after 60. Because the
+probe reaches Postgres by design (ADR-009), a Supabase outage cycles the service instead of leaving it
+up and honestly unready. This is the platform behaviour ADR-010's argument depends on not being
+extended to Redis: a fail-open dependency allowed to fail this probe would manufacture a restart loop
+out of an Upstash blip.
+
+**Every request pays a cross-region round trip to Postgres.** `fly.toml` co-located the app with its
+Supabase project on the argument that an app a continent from its database is slow in a way no tuning
+fixes. Render has no Tokyo region, so that co-location is gone: Singapore is the closest available and
+each of the several Postgres round trips per request costs roughly 60–90ms instead of single digits.
+Nothing about the gateway's logic changed; its floor latency did.
 
 **`auto`'s latency ranking leans toward the provider nearest its own limit, until Phase 3.** `ADR-014`
 names this as the standing caveat it inherited from D11: ranking by measured speed with no quota

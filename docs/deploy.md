@@ -1,10 +1,14 @@
 # Deploying the gateway
 
 Phase 1, Step 11. Four managed services, all on free tiers: **Supabase** (Postgres + Auth),
-**Upstash** (Redis), **Fly.io** (the FastAPI service), **Vercel** (the Next.js frontend).
+**Upstash** (Redis), **Render** (the FastAPI service), **Vercel** (the Next.js frontend).
 
 Run the steps in order. Several of them fail in ways that are only obvious in hindsight, and each
 of those has a note saying so.
+
+> The gateway ran on Fly.io until the free allowance ran out.
+> [ADR-017](decisions/ADR-017-render-as-deploy-target.md) records what the move to Render changed and
+> what it cost; this document is the current runbook and does not describe the old one.
 
 ---
 
@@ -19,11 +23,8 @@ make lint && make typecheck && make test    # must be green before anything ship
 make docker-build                           # the image the deploy will build, built locally first
 ```
 
-Install [`flyctl`](https://fly.io/docs/flyctl/install/) and sign in:
-
-```bash
-fly auth login
-```
+No CLI to install for the deploy itself. Render builds from the connected GitHub repo, and everything
+below is either the dashboard or `curl`.
 
 ---
 
@@ -84,8 +85,9 @@ postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.co
 > `DuplicatePreparedStatementError` on every concurrent request, not a graceful degradation. See
 > [`app/config.py`](../app/config.py).
 
-**Note the region in the pooler hostname** (`aws-0-<region>.pooler.supabase.com`). Step 3 has to put
-the Fly app next to it.
+**Note the region in the pooler hostname** (`aws-0-<region>.pooler.supabase.com`). Step 3 picks the
+Render region from it — as close as Render's five will get, which for an `ap-northeast-1` project is
+not close at all.
 
 ### Test the string before it becomes a secret
 
@@ -142,45 +144,75 @@ operating this: a green `/readyz` does not mean Redis is up. Check the body's `r
 
 ---
 
-## 3. Fly.io — the gateway
+## 3. Render — the gateway
 
-**Set `primary_region` in `fly.toml` to match the Supabase region** you noted in step 1, before
-anything else. `ap-northeast-1` → `nrt`, `us-east-1` → `iad`, `eu-central-1` → `fra`
-(`fly platform regions` lists them all). Every request makes several round trips to Postgres; an app
-a continent away from its database is slow in a way no amount of tuning fixes.
+**Set `region` in [`render.yaml`](../render.yaml) to match the Supabase region** you noted in step 1,
+before anything else. Render has five: `oregon`, `ohio`, `virginia`, `frankfurt`, `singapore`.
+`us-east-*` → `virginia`, `us-west-*` → `oregon`, `eu-*` → `frankfurt`, anything in Asia-Pacific →
+`singapore`.
 
-`fly.toml` is committed and authoritative, so create the app with `apps create` rather than
-`fly launch` — `launch` rewrites `fly.toml` from its own template and drops the comments explaining
-why each setting is what it is:
+There is **no Tokyo region**, so a Supabase project in `ap-northeast-1` cannot be co-located the way
+it was on Fly. Singapore is the closest available and still costs roughly 60–90ms per Postgres round
+trip, several times per request. That is a permanent, accepted cost of the move
+([ADR-017](decisions/ADR-017-render-as-deploy-target.md)), not something tuning fixes.
 
-```bash
-fly apps create llm-gateway-sed
-```
+**Render cannot change a service's region after creation.** Getting this wrong means deleting the
+service and making a new one, under a new URL — which then has to be re-pasted into Vercel and
+`config/providers.yaml`. Decide before you click Create.
 
-App names are a **global** namespace on Fly — plain `llm-gateway` is taken, which is why this one
-carries a suffix. Whatever you pick must match `app = ` in `fly.toml`, or `fly deploy` targets the
-wrong app (or none).
+### Create the service
 
-Everything below assumes the app exists. `fly secrets set` against a name Fly does not know fails
-with `Could not find App "<name>"`, which is what you get for running step 3 out of order.
+`render.yaml` is committed and authoritative. At [dashboard.render.com](https://dashboard.render.com):
+**New → Web Service → connect this repository**. Render detects `render.yaml` and offers to create
+the service from it; take that path rather than filling the form in by hand, and the region, health
+check, start command and non-secret environment variables all come from the file instead of from
+memory.
 
-### Set every secret before the first deploy
+Creating it by hand instead means setting, at minimum: Runtime **Docker**, Instance type **Free**,
+Region as above, Health check path **`/readyz`**, Auto-Deploy **Off**, and the Docker command from
+`render.yaml`'s `dockerCommand`. A hand-made service that disagrees with the file is the failure this
+whole document exists to prevent, so mirror any dashboard change back into it.
 
-This is the step that catches people. `fly.toml` runs `alembic upgrade head` as a release command,
-and [`alembic/env.py`](../alembic/env.py) resolves `DATABASE_URL` through `app/config.py` — which
-validates the *whole* settings object. A missing `GROQ_API_KEY` fails the migration exactly as
-loudly as it would fail the app, before any machine starts.
+The name becomes the hostname — `https://<name>.onrender.com` — and `onrender.com` is a **shared**
+namespace, so a near-miss is somebody else's live service rather than a DNS error. Two files hardcode
+it and must match whatever you pick:
+
+- `config/providers.yaml` → `options.HTTP-Referer` (OpenRouter attribution)
+- Vercel's `GATEWAY_URL` (step 4)
+
+### Turn Auto-Deploy off
+
+**Settings → Build & Deploy → Auto-Deploy → Off**, if the Blueprint did not already set it from
+`render.yaml`.
+
+This is a correctness setting, not a preference. Render's own push-triggered deploys know nothing
+about CI, so leaving it on ships every push to `main` whether or not the tests passed — which is
+exactly what the `deploy` job's `needs: [lint, test, frontend]` exists to prevent. Step 6 wires the
+deploy hook that replaces it.
+
+### Set every variable before the first deploy
+
+This is the step that catches people. `render.yaml`'s `dockerCommand` runs `alembic upgrade head`
+before uvicorn binds, and [`alembic/env.py`](../alembic/env.py) resolves `DATABASE_URL` through
+`app/config.py` — which validates the *whole* settings object. A missing `GROQ_API_KEY` fails the
+migration exactly as loudly as it would fail the app, before the service ever becomes healthy.
+
+> **Where this differs from a release command.** On Fly the migration ran in a one-off machine and a
+> failure aborted the rollout. Here it runs in the container itself: a failure means the container
+> exits, the health check never passes, Render cancels the deploy, and the previous instance keeps
+> serving. Same protection, different symptom — look in the **deploy log**, not the service log, and
+> expect "health check failed" as the headline with the real cause above it.
 
 > **Phase 2 added two.** `GEMINI_API_KEY` and `OPENROUTER_API_KEY` are required `Settings` fields
 > as of Phase 2 Step 1, even though both providers are `enabled: false` in `config/providers.yaml`
-> until Step 6. On an app that already exists, set them **before** the deploy that carries this
-> change — otherwise the release command fails config validation and the rollout aborts, which looks
-> like a broken migration and is not one.
+> until Step 6. On a service that already exists, set them **before** the deploy that carries this
+> change — otherwise the start command fails config validation and the deploy is cancelled, which
+> looks like a broken migration and is not one.
 
-Nine secrets, and **only six of them are the values from your local `.env`**. Copying that file
+Nine variables, and **only six of them are the values from your local `.env`**. Copying that file
 wholesale points production at your laptop:
 
-| Secret | Value |
+| Variable | Value |
 |---|---|
 | `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | same as `.env` |
 | `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
@@ -188,53 +220,36 @@ wholesale points production at your laptop:
 | `ENCRYPTION_KEY` | **generate a fresh one.** Nothing is encrypted with it until Phase 6, so a new key is free now; sharing dev's means a leaked dev `.env` also decrypts production, and rotating later is a migration |
 | `REQUIRE_VERIFIED_EMAIL` | type `true` **literally**. It has a default in `Settings`, so it is frequently absent from `.env` — scripting it out of that file yields an empty string, and an empty string is not a boolean |
 
-> That last row is a real failure, not a hypothetical. A shell that interpolates a missing key as
-> `""` produces `fly secrets set REQUIRE_VERIFIED_EMAIL=""`, and the release command dies with
-> `Input should be a valid boolean, unable to interpret input`. Anything with a default in
-> `app/config.py` is a candidate for this; only the five in the first row are safe to read out of
-> `.env` programmatically, because only those are always present.
+> That last row is a real failure, not a hypothetical. Anything scripted that interpolates a missing
+> key yields an empty string, and the start command dies with `Input should be a valid boolean,
+> unable to interpret input`. Anything with a default in `app/config.py` is a candidate for this;
+> only the five in the first row are safe to read out of `.env` programmatically, because only those
+> are always present. Typing them into the dashboard sidesteps it — paste each value, and do not
+> paste a trailing space.
 
-`ENV` is deliberately absent — it lives in `fly.toml`'s `[env]` block as `prod`, and a secret of the
-same name would override it.
-
-```bash
-fly secrets set \
-  DATABASE_URL='postgresql+asyncpg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?ssl=require' \
-  REDIS_URL='rediss://default:<password>@<host>.upstash.io:6379' \
-  SUPABASE_URL='https://<ref>.supabase.co' \
-  SUPABASE_JWT_AUDIENCE='authenticated' \
-  REQUIRE_VERIFIED_EMAIL='true' \
-  GROQ_API_KEY='gsk_...' \
-  GEMINI_API_KEY='...' \
-  OPENROUTER_API_KEY='sk-or-v1-...' \
-  ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
-```
-
-Then confirm all nine names landed — Fly never shows values back:
+Set them at **the service → Environment → Environment Variables**, one at a time or via *Add from
+.env* (which takes `KEY=value` lines pasted into a box). Generate the Fernet key first:
 
 ```bash
-fly secrets list
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 ```
 
-Names and digests only, so `fly secrets list` cannot tell you a value is *wrong* — only that it is
-present. An empty string looks identical to a correct one here. The release command is what catches
-it, which is the argument for having migrations run there rather than at app start.
+`ENV`, `PORT` and `WEB_CONCURRENCY` are **not** in that list and should not be added here. They live
+in [`render.yaml`](../render.yaml)'s `envVars` block, because none of them is a secret and all three
+belong in version control — `ENV=prod` is what disables the `/docs` route. A dashboard variable of
+the same name shadows the file's, silently.
 
-`ENV=prod` is not here — it is in `fly.toml`'s `[env]` block, because it is not a secret and it
-belongs in version control. It is what disables the `/docs` route.
-
-Single quotes around every value: connection strings contain `$` and `&`, and your shell will eat
-them otherwise.
+Render shows variable values back, unlike Fly's names-and-digests. Useful for catching a truncated
+paste; also worth knowing before treating the dashboard as a place secrets are hidden.
 
 ### Deploy
 
-```bash
-fly deploy
-fly logs
-```
+**Manual Deploy → Deploy latest commit**, or push to `main` and let CI's hook fire once step 6 is
+done. Watch the **Logs** tab.
 
-A healthy first deploy shows the release command applying `0001_initial_schema` and `0002`, then one
-`startup.complete` JSON line per uvicorn worker carrying the loaded slot table.
+A healthy first deploy shows `alembic` applying `0001_initial_schema` and `0002`, then exactly one
+`startup.complete` JSON line carrying the loaded slot table — one, not two, because
+`WEB_CONCURRENCY=1`. Then the health check turns green and the service takes traffic.
 
 ---
 
@@ -251,18 +266,20 @@ Environment variables:
 |---|---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://<ref>.supabase.co` | Browser. Public by design. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the anon key | Browser. Public by design. |
-| `GATEWAY_URL` | `https://llm-gateway-sed.fly.dev` | **Server only.** |
+| `GATEWAY_URL` | `https://llm-gateway-sed.onrender.com` | **Server only.** |
 
 **Set these in the Vercel dashboard, not in `frontend/.env.local`.** That file is gitignored and
 never leaves your machine — it configures `make frontend-dev` and nothing else. Filling it in does
 not configure the deployment.
 
-> **Get `GATEWAY_URL` exactly right.** Fly's app namespace is global, so a near-miss hostname is
-> usually a *live app belonging to somebody else* rather than a DNS error you would notice.
+> **Get `GATEWAY_URL` exactly right.** `onrender.com` is a shared namespace, so a near-miss hostname
+> is usually a *live service belonging to somebody else* rather than a DNS error you would notice.
 > [`lib/api.ts`](../frontend/lib/api.ts) attaches the user's Supabase JWT to every request that goes
 > through the rewrite, so a wrong host here sends valid session tokens for your project to a
 > stranger's server, silently, on every authenticated request. Verify before pasting:
-> `curl https://<app>.fly.dev/healthz` must return `{"status":"ok"}` — a 404 means it is not yours.
+> `curl https://<name>.onrender.com/healthz` must return `{"status":"ok"}` — a 404 means it is not
+> yours. Give it a minute if the service has been idle; a free instance spinning up serves a holding
+> page first.
 
 `GATEWAY_URL` is read server-side by [`next.config.ts`](../frontend/next.config.ts)'s rewrite. The
 browser only ever calls `/api/gw/*` on the Vercel origin, which keeps every request same-origin —
@@ -322,24 +339,20 @@ code:
 git push -u origin main
 ```
 
-The first run will show `deploy` failing — the token does not exist yet. `lint`, `test` and
+The first run will show `deploy` failing — the hook URL does not exist yet. `lint`, `test` and
 `frontend` should be green.
 
-### 6.2 Mint a deploy token
+### 6.2 Copy the deploy hook URL
 
-Run this from the repo root so it picks the app up from `fly.toml`:
+Render dashboard → the service → **Settings → Deploy Hook**. It is a URL of the form
+`https://api.render.com/deploy/srv-<id>?key=<secret>`.
 
-```bash
-fly tokens create deploy -x 8760h
-```
+**The URL is the credential** — the `key` query parameter is the whole of its authentication, and
+anyone holding it can deploy this service. Treat it exactly like a token: never paste it into a
+commit, an issue, or a log line. It can be regenerated from the same page if it leaks.
 
-It prints one line starting `FlyV1 ...`. **Copy the whole thing, including the `FlyV1 ` prefix and
-the trailing space-separated parts** — it is one value, and truncating it produces an
-authentication error at deploy time rather than a parse error now.
-
-`-x` is the expiry. A year is a reasonable default for a portfolio project; the token is scoped to
-this one app and can only deploy, so a leak cannot read secrets or touch other apps. It is shown
-exactly once.
+Unlike a Fly deploy token it does not expire, and it cannot do anything but deploy this one service —
+it cannot read your environment variables or touch anything else in the workspace.
 
 ### 6.3 Store it as a repository secret
 
@@ -347,12 +360,12 @@ GitHub → the repo → **Settings → Secrets and variables → Actions → New
 
 | Field | Value |
 |---|---|
-| Name | `FLY_API_TOKEN` |
-| Secret | the whole `FlyV1 …` string |
+| Name | `RENDER_DEPLOY_HOOK_URL` |
+| Secret | the whole `https://api.render.com/deploy/srv-…?key=…` URL |
 
 The name must match exactly — [`ci.yml`](../.github/workflows/ci.yml) reads
-`${{ secrets.FLY_API_TOKEN }}`, and a missing secret becomes an empty string rather than an error,
-so a typo surfaces as `Error: No access token available` in the deploy job.
+`${{ secrets.RENDER_DEPLOY_HOOK_URL }}`, and a missing secret becomes an empty string rather than an
+error. `curl -f` against an empty URL fails the job, which is the point of the `-f`.
 
 Use a **repository** secret, not an environment or organization one, unless you have a reason —
 environment secrets need a matching `environment:` key in the job, which this workflow does not set.
@@ -364,15 +377,19 @@ environment secrets need a matching `environment:` key in the job, which this wo
 | `lint` | push + PR | `ruff check`, `ruff format --check`, `mypy` |
 | `test` | push + PR | `pytest --cov` against a `postgres:16` service container |
 | `frontend` | push + PR | `npm ci`, lint, typecheck, `vitest` |
-| `deploy` | **push to `main` only** | `flyctl deploy --remote-only` |
+| `deploy` | **push to `main` only** | `POST` to the Render deploy hook, pinned to the tested commit |
 
 `deploy` has `needs: [lint, test, frontend]`, so a red test suite stops the deploy rather than
-shipping past it. `--remote-only` builds the image on Fly's builder, so the runner needs no Docker
-daemon. Migrations run inside that deploy, through `fly.toml`'s `release_command` — the same path
-step 3 used, with the same abort-on-failure behaviour.
+shipping past it — which only holds because Render's own Auto-Deploy is **off** (step 3). Turning it
+back on quietly restores push-deploys that ignore this table entirely.
 
-Verify by pushing anything to `main` and watching the **Actions** tab. A green `deploy` job means
-`fly releases` has a new entry.
+The job posts `ref=<the commit CI tested>` and returns as soon as Render queues the build. **A green
+`deploy` job means "Render accepted it", not "it shipped."** The image build, the `alembic upgrade
+head` inside the start command, and the health check all happen afterwards, and the Render dashboard
+is the only place they report.
+
+Verify by pushing anything to `main`, watching the **Actions** tab go green, then watching a new
+deploy appear in Render's **Events** tab.
 
 Vercel is not deployed from here — its own Git integration builds the frontend on push, which is one
 fewer long-lived token for this repository to hold.
@@ -386,7 +403,7 @@ PowerShell — use `Invoke-RestMethod`/`Invoke-WebRequest` rather than `curl`, w
 `-SkipHttpErrorCheck` flag is what stops a deliberate 401 or 404 from throwing:
 
 ```powershell
-$API = 'https://llm-gateway-sed.fly.dev'
+$API = 'https://llm-gateway-sed.onrender.com'
 
 Invoke-RestMethod "$API/healthz"            # status : ok
 Invoke-RestMethod "$API/readyz"             # status : ok, database : ok
@@ -402,7 +419,7 @@ $r.Content                                  # the error envelope
 bash:
 
 ```bash
-API=https://llm-gateway-sed.fly.dev
+API=https://llm-gateway-sed.onrender.com
 
 curl -s  $API/healthz                       # {"status":"ok"}
 curl -s  $API/readyz                        # {"status":"ok","database":"ok"}
@@ -412,9 +429,14 @@ curl -s  $API/docs -o /dev/null -w '%{http_code}\n'   # 404 — ENV=prod hides i
 
 Four things are being checked, and the third is the interesting one. `/healthz` proves the process
 is up; `/readyz` proves it reached Supabase through the pooler, which is the only part local testing
-cannot demonstrate; `/docs` returning 404 proves `ENV=prod` took effect. The `/v1/me` call proves the
-error envelope survived deployment — and the `x-request-id` header must equal the `request_id`
-inside the body, which is the promise that makes a user's bug report traceable to a log line.
+cannot demonstrate; `/docs` returning 404 proves `ENV=prod` reached the container from `render.yaml`.
+The `/v1/me` call proves the error envelope survived deployment — and the `x-request-id` header must
+equal the `request_id` inside the body, which is the promise that makes a user's bug report traceable
+to a log line.
+
+**Run the first request twice if the service has been idle.** A free instance spun down after 15
+quiet minutes takes about a minute to come back, and the first call can time out or land on Render's
+holding page while it does. That is the cold start, not a failure.
 
 Then in the browser, against the Vercel URL — this is the Phase 1 definition of done:
 
@@ -434,12 +456,14 @@ from requests order by created_at desc limit 5;
 
 `make dev` proves the SSE framing is correct. It cannot prove the response is not buffered, because
 nothing between `uvicorn` and a local browser can buffer it — the one place that trap (`phase2.md` §5
-Trap 1) actually shows up is a real proxy hop, and this deployment has two: Fly's edge in front of the
-gateway, and Vercel's rewrite in front of that. Test against the deployed URL, never against `make dev`,
-and watch the *timing* of the output, not just its content:
+Trap 1) actually shows up is a real proxy hop, and this deployment has two: Render's edge in front of
+the gateway, and Vercel's rewrite in front of that. **Re-run this after the move off Fly**: Render's
+proxy is a different implementation with its own buffering behaviour, and nothing about Fly streaming
+correctly carried over. Test against the deployed URL, never against `make dev`, and watch the
+*timing* of the output, not just its content:
 
 ```bash
-API=https://llm-gateway-sed.fly.dev
+API=https://llm-gateway-sed.onrender.com
 
 curl -N -s "$API/v1/chat/completions" \
   -H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json" \
@@ -455,8 +479,8 @@ it does nothing for a proxy that buffers for a different reason, which is why th
 more than the header's presence.
 
 **The Vercel leg needs the same test, through the rewrite** — `next.config.ts`'s `rewrites()` is a
-separate hop with its own buffering behavior, and Fly streaming correctly says nothing about whether
-Vercel's edge does:
+separate hop with its own buffering behavior, and Render streaming correctly says nothing about
+whether Vercel's edge does:
 
 ```bash
 curl -N -s "https://<your-app>.vercel.app/api/gw/v1/chat/completions" \
@@ -464,8 +488,11 @@ curl -N -s "https://<your-app>.vercel.app/api/gw/v1/chat/completions" \
   -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"count to five"}]}'
 ```
 
-If this one buffers while the direct Fly call above does not, the rewrite is the culprit, not the
+If this one buffers while the direct Render call above does not, the rewrite is the culprit, not the
 gateway — worth knowing before spending time re-reading `orchestrator.py`.
+
+Render caps a single request at 100 minutes, which no answer this gateway produces comes close to, so
+the connection lifetime is not a constraint on streaming here.
 
 **A pre-stream failure should still look like an ordinary error**, not a stalled connection — this is
 D13's payoff, checkable without a live provider outage:
@@ -481,31 +508,42 @@ curl -si "$API/v1/chat/completions" \
 
 ## Operating notes
 
-**Cold starts.** `min_machines_running = 0` lets machines suspend when idle, so the first request
-after a quiet spell pays a wake-up. Accepted deliberately — it is in the risk register
-([development-plan.md](../doc/reference/development-plan.md) §5). Before a demo:
-`curl https://llm-gateway-sed.fly.dev/healthz`.
+**Cold starts, and they are worse than Fly's.** A free instance spins down after 15 minutes with no
+inbound traffic and takes about a minute to come back — a full container start, not a resume, and it
+now runs `alembic upgrade head` on the way up. Accepted deliberately; it is in the risk register
+([development-plan.md](../doc/reference/development-plan.md) §5). Before a demo, wake it and wait for
+the answer: `curl https://llm-gateway-sed.onrender.com/healthz`.
 
-**A machine suspending mid-stream drops the connection, not the request.** `auto_stop_machines =
-"suspend"` does not know a `StreamingResponse` is open when it decides to reclaim an idle machine — a
-long streamed answer arriving just as the instance would otherwise have gone quiet can end with a dropped
-socket rather than a `done` event, and the client sees a connection error rather than an in-band
-failure ([docs/limitations.md](limitations.md)). It is a low-probability window in ordinary use — the
-provider call itself keeps the machine "active" — but worth ruling out first if a chaos demo shows an
-unexplained dropped stream with no matching provider-side fault in the logs. `min_machines_running = 1`
-removes the window entirely, at the cost of the idle-suspend savings this setting exists for.
+**A spin-down mid-stream drops the connection, not the request.** Render's idle timer does not know a
+`StreamingResponse` is open — a long streamed answer arriving just as the instance would otherwise
+have gone quiet can end before `done` is sent, and the client sees a connection error rather than an
+in-band failure ([docs/limitations.md](limitations.md)). Low-probability in ordinary use, since the
+traffic itself resets the timer, but worth ruling out first if a chaos demo shows an unexplained
+dropped stream with no matching provider-side fault in the logs. The only fix is a paid instance type
+that does not spin down.
 
-**Rolling back.** `fly releases` then `fly deploy --image <previous>`. Note that this does **not**
-roll back a migration; Alembic downgrades are separate and deliberate.
+**A restart loop is a new failure mode.** Render restarts an instance after 60 seconds of failing
+health checks, and `/readyz` fails when Postgres is unreachable — so a Supabase outage now cycles the
+service rather than quietly draining it. Add the migration in the start command and an outage during
+a cold start leaves it down entirely. If that ever needs breaking into: edit `dockerCommand` in the
+dashboard to drop the `alembic upgrade head &&` prefix, deploy, and put it back afterwards.
 
-**Reading logs.** Everything is JSON with `request_id` and `user_id` bound. To trace one user report:
-`fly logs | grep <request-id>` — the id in the error envelope they quote is the same one.
+**Rolling back.** The service's **Events** tab → the deploy you want → **Rollback**. The free plan
+keeps only the **two previous deploys**; past that, re-deploy the commit by pushing or by using the
+hook's `ref` parameter. Note that a rollback does **not** roll back a migration; Alembic downgrades
+are separate and deliberate.
 
-**Rotating a provider key.** `fly secrets set GROQ_API_KEY=...` (or `GEMINI_API_KEY` /
-`OPENROUTER_API_KEY`) restarts the machines. A revoked key surfaces as a clean 502 with a `requests`
-row at `status='error'`, never a traceback — and from Phase 2 Step 5 onward, as a failover to
-whichever provider is still live rather than as an error at all.
+**Reading logs.** Everything is JSON with `request_id` and `user_id` bound. To trace one user report,
+search the **Logs** tab for the request id — the one in the error envelope they quote is the same one.
+Free instances have no shell, so the dashboard (or `render logs` from the CLI, if you install it) is
+the only way in.
 
-**Database migrations on a live deploy.** They run before the new version takes traffic, which means
-a migration must be compatible with the *old* code for the length of the rollout. Additive changes
-only, or a two-deploy expand/contract.
+**Rotating a provider key.** Edit `GROQ_API_KEY` (or `GEMINI_API_KEY` / `OPENROUTER_API_KEY`) in the
+service's Environment tab; saving triggers a redeploy. A revoked key surfaces as a clean 502 with a
+`requests` row at `status='error'`, never a traceback — and from Phase 2 Step 5 onward, as a failover
+to whichever provider is still live rather than as an error at all.
+
+**Database migrations on a live deploy.** They run in the new container before it passes its health
+check and takes traffic, while the old one is still serving — so a migration must be compatible with
+the *old* code for the length of the rollout. Additive changes only, or a two-deploy
+expand/contract.

@@ -138,7 +138,7 @@ jobs:
       # second way to fail, not a second signal.
 
   deploy:
-    name: deploy to fly
+    name: deploy to render
     needs: [lint, test, frontend]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -147,16 +147,27 @@ jobs:
       group: deploy-production
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-
-      # --remote-only: the image builds on Fly's builder, so this runner needs no
-      # Docker daemon and the layer cache lives with the thing doing the deploying.
-      # Migrations run inside this command, via fly.toml's release_command.
-      - run: flyctl deploy --remote-only
+      # The image builds on Render, from the repo it is already connected to, so
+      # this job checks nothing out and needs no Docker daemon — it only says
+      # "now". Render's own auto-deploy is off (render.yaml's `autoDeploy: false`)
+      # precisely so this is the only thing that can trigger one, which is what
+      # puts `needs:` above in front of every deploy.
+      #
+      # `ref` pins the build to the commit this run actually tested, rather than
+      # whatever `main` happens to point at by the time Render picks the job up.
+      #
+      # `-f` is load-bearing: without it a 401 from a wrong or missing hook URL
+      # prints an error body and exits 0, and the deploy job goes green having
+      # deployed nothing.
+      #
+      # This returns as soon as Render *queues* the deploy. A green job here means
+      # "Render accepted it", not "it shipped" — the build, the `alembic upgrade
+      # head` in render.yaml's dockerCommand, and the health check all happen
+      # afterwards, and the Render dashboard is where they report.
+      - name: trigger render deploy
+        run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL" -d "ref=${{ github.sha }}"
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
 
     # The frontend is not deployed from here. Vercel's Git integration builds and
     # ships it on push, which is one fewer long-lived token for this repo to hold.

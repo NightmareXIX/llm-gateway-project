@@ -1,7 +1,7 @@
 # Normalize line endings in the repository to LF.
 #
 # Development happens on Windows; everything that consumes this repo — the
-# Docker image, the Fly release command, GitHub Actions — is Linux. Without
+# Docker image, Render's container start command, GitHub Actions — is Linux. Without
 # this, a file committed with CRLF reaches a container and fails in ways that
 # read as anything but a line-ending problem: a shell script whose shebang has
 # a trailing \r reports "no such file or directory" naming a binary that plainly

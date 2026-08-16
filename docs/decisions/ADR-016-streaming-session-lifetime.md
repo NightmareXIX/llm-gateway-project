@@ -18,7 +18,7 @@ Two ways of getting this wrong are both live options, not hypotheticals:
 
 - **Hold the request-scoped session for the whole generation.** A connection pinned open per
   concurrent streaming chat is a capacity problem before it is a correctness one — a free-tier Postgres
-  pool (`pool_size 5 + max_overflow 5` per worker, per `fly.toml`'s own comment) runs out of connections
+  pool (`pool_size 5 + max_overflow 5` per worker, per `app/db/session.py`) runs out of connections
   under a handful of concurrent streams, and the failure looks like unrelated requests timing out rather
   than like the streaming endpoint that is actually responsible.
 - **Let FastAPI tear the session down mid-generation anyway**, because the `yield`-dependency's teardown

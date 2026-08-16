@@ -72,14 +72,28 @@ docker-build:
 # The built image against the compose database. `host.docker.internal` because
 # this container is not on the compose network; DATABASE_URL from .env points at
 # 127.0.0.1, which inside a container means the container itself.
+#
+# PORT is set to Render's default rather than left at the image's 8000: the CMD
+# reads ${PORT:-8000}, and the point of running this is to prove it honours a
+# port the platform chose. Published as 8001 either way.
 docker-run:
-	docker run --rm -p 8001:8000 --env-file .env \
+	docker run --rm -p 8001:10000 --env-file .env \
+	  -e PORT=10000 -e WEB_CONCURRENCY=1 \
 	  -e DATABASE_URL=postgresql+asyncpg://gateway:gateway@host.docker.internal:5432/gateway \
 	  $(IMAGE)
 
-# Migrations run inside this, via fly.toml's release_command.
+# Asks Render to deploy the current `main`. Nothing is built or uploaded here —
+# Render builds from the connected repo — so this is a "now, please", not a push.
+#
+# Needs RENDER_DEPLOY_HOOK_URL in the environment (Render dashboard -> the
+# service -> Settings -> Deploy Hook). It is a secret: the URL *is* the
+# credential. CI does the same thing from .github/workflows/ci.yml, behind the
+# test gate; this target is the manual override for when that is not an option.
+#
+# Migrations are not run from here. They run inside the container's start
+# command, via render.yaml's dockerCommand — see docs/deploy.md.
 deploy:
-	flyctl deploy --remote-only
+	curl -fsS -X POST "$(RENDER_DEPLOY_HOOK_URL)"
 
 # --------------------------------------------------------------------------- #
 # frontend/ — Next.js. Needs the API running (`make dev`) to be useful.

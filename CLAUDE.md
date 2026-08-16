@@ -150,6 +150,12 @@ pydantic v2 and pydantic-settings (config fails loudly at startup on a missing v
 `request_id`/`user_id` bound as contextvars · ruff + mypy strict · pytest + pytest-asyncio ·
 `httpx.MockTransport` for all upstream HTTP.
 
+**Deployment:** Supabase (Postgres + Auth), Upstash (Redis), **Render** (the FastAPI service,
+`render.yaml`), Vercel (the frontend). Migrations run in the container's start command, not a
+pre-deploy hook — Render's free tier has none. Moved off Fly.io in Phase 3 when its free allowance ran
+out; [ADR-017](docs/decisions/ADR-017-render-as-deploy-target.md) has what that changed, and
+[docs/deploy.md](docs/deploy.md) is the runbook.
+
 ## Hard rules
 
 - **Never call a live provider API from tests.** Record fixtures once via `scripts/record_fixtures.py`; tests read them.

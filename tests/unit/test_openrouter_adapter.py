@@ -40,7 +40,7 @@ KEY = "sk-or-v1-not-a-real-key"
 MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 BASE_URL = "https://openrouter.ai/api/v1"
 
-OPTIONS = {"HTTP-Referer": "https://llm-gateway-sed.fly.dev", "X-Title": "LLM Gateway"}
+OPTIONS = {"HTTP-Referer": "https://llm-gateway-sed.onrender.com", "X-Title": "LLM Gateway"}
 
 # The `x-ratelimit-reset` in the fixtures is 1786622460000 ms — 2026-08-13T12:01Z,
 # one minute after this instant. Pinning "now" is what makes the conversion

@@ -35,7 +35,7 @@ providers:
     # and genuinely per-deployment, which is why they are config rather than constants
     # in the adapter. A fork pointing at its own deployment edits these two lines.
     options:
-      HTTP-Referer: https://llm-gateway-sed.fly.dev
+      HTTP-Referer: https://llm-gateway-sed.onrender.com
       X-Title: LLM Gateway
 
 # Each candidate carries every per-model fact `ModelSpec` needs. `priority` is not

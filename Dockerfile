@@ -45,18 +45,24 @@ USER app
 
 EXPOSE 8000
 
-# `--workers 2`: two processes on a shared-cpu-1x, which is what the free tier
-# gives. More would contend; one would mean a single slow provider call blocking
-# every other request on this machine, since the whole app is async but the
-# process is still one event loop.
+# Shell form, and deliberately so: `$PORT` is the platform's to choose, not the
+# image's. Render assigns one (10000 unless overridden) and expects the server to
+# bind it; an exec-form CMD would pass the literal string `$PORT` to uvicorn and
+# fail on a host that picks anything else. The defaults are what the image does
+# when nobody says otherwise — `docker run` and docker-compose both land here.
 #
-# `--proxy-headers` with `--forwarded-allow-ips "*"`: Fly terminates TLS at its
-# edge and forwards over the private network. Without these, `request.url.scheme`
-# is `http` on every request and the client address in every log line is Fly's
-# proxy rather than the caller. The wildcard is safe *here specifically* because
-# nothing but that proxy can route to this port — it would be a header-spoofing
-# hole on any host where the port is directly reachable.
-CMD ["uvicorn", "app.main:app", \
-     "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "2", \
-     "--proxy-headers", "--forwarded-allow-ips", "*"]
+# `WEB_CONCURRENCY` defaults to 2: two processes is right for a box with a whole
+# shared core. More would contend; one would mean any CPU-bound stretch — JSON,
+# token counting — stalling every other request on this instance, since the whole
+# app is async but a process is still one event loop. Render's free instance is
+# 0.1 CPU / 512MB and sets this to 1 (see render.yaml), where the arithmetic goes
+# the other way: two workers would split a tenth of a core and double both the
+# resident set and the Postgres pool (pool_size 5 + max_overflow 5 per process).
+#
+# `--proxy-headers` with `--forwarded-allow-ips "*"`: Render terminates TLS at its
+# edge and forwards to this container. Without these, `request.url.scheme` is
+# `http` on every request and the client address in every log line is the proxy
+# rather than the caller. The wildcard is safe *here specifically* because nothing
+# but that proxy can route to this port — it would be a header-spoofing hole on
+# any host where the port is directly reachable.
+CMD ["/bin/sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${WEB_CONCURRENCY:-2} --proxy-headers --forwarded-allow-ips '*'"]
