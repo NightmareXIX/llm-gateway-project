@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { cn } from "@/lib/cn";
+import type { ModelsResponse } from "@/lib/types";
+import { ModelPicker } from "./ModelPicker";
 import { Spinner } from "./ui/Spinner";
 
 const MAX_ROWS_HEIGHT = 200;
@@ -27,6 +29,9 @@ export function Composer({
   pending,
   autoFocus = false,
   placeholder = "Send a message…",
+  modelSlot,
+  onModelSlotChange,
+  models,
 }: {
   onSend: (text: string) => void;
   /** Abort the running stream. Given, the send button becomes Stop while pending. */
@@ -34,6 +39,11 @@ export function Composer({
   pending: boolean;
   autoFocus?: boolean;
   placeholder?: string;
+  /** The slot riding on the next `onSend`. Omitted, the picker doesn't render —
+   *  `NewConversation` and `ConversationView` both always pass it. */
+  modelSlot?: string;
+  onModelSlotChange?: (slot: string) => void;
+  models?: ModelsResponse;
 }) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -135,10 +145,15 @@ export function Composer({
           )}
         </div>
 
-        <p className="mt-2 px-1 text-[0.6875rem] text-ink-tertiary">
-          <kbd className="font-mono">Enter</kbd> to send ·{" "}
-          <kbd className="font-mono">Shift+Enter</kbd> for a new line
-        </p>
+        <div className="mt-2 flex items-center justify-between gap-2 px-1">
+          <p className="text-[0.6875rem] text-ink-tertiary">
+            <kbd className="font-mono">Enter</kbd> to send ·{" "}
+            <kbd className="font-mono">Shift+Enter</kbd> for a new line
+          </p>
+          {modelSlot !== undefined && onModelSlotChange && (
+            <ModelPicker value={modelSlot} onChange={onModelSlotChange} models={models} />
+          )}
+        </div>
       </form>
     </div>
   );

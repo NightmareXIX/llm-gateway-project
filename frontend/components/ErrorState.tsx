@@ -23,6 +23,19 @@ export function describeError(error: unknown): { title: string; detail: string }
   }
 
   if (error instanceof GatewayError) {
+    if (error.isRateLimited) {
+      // Not a failure — a wait. The gateway (or, once our own limit exists, its
+      // own guard) said exactly how much of its budget is left, not that
+      // anything is broken, and the copy should say that rather than "that
+      // didn't work".
+      return {
+        title: "Every model is at its limit right now",
+        detail:
+          error.retryAfterS !== null
+            ? `Try again in about ${formatWaitSeconds(error.retryAfterS)}.`
+            : "Try again shortly, or pick a different model above.",
+      };
+    }
     if (error.status === 502) {
       return {
         title: "The model provider failed",
@@ -39,6 +52,11 @@ export function describeError(error: unknown): { title: string; detail: string }
     title: "Something went wrong",
     detail: "An unexpected error occurred. Try again in a moment.",
   };
+}
+
+function formatWaitSeconds(seconds: number): string {
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  return `${Math.ceil(seconds / 60)} min`;
 }
 
 export function ErrorState({

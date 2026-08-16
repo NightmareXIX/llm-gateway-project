@@ -8,14 +8,21 @@ import { GatewayError, NetworkError, api, swrFetcher } from "./api";
 import { deriveTitle } from "./format";
 import { buildAttemptTrail, fromDoneEvent, fromMetaEvent, type Provenance } from "./provenance";
 import { openCompletionStream, type DoneEvent, type MetaEvent, type RestartEvent } from "./sse";
-import type { Conversation, ConversationDetail, Me, Message, MessageMeta } from "./types";
+import type {
+  Conversation,
+  ConversationDetail,
+  Me,
+  Message,
+  MessageMeta,
+  ModelsResponse,
+} from "./types";
 
 export const CONVERSATIONS_KEY = "/v1/conversations";
 export const conversationKey = (id: string) => `/v1/conversations/${id}`;
+export const MODELS_KEY = "/v1/models";
 
-/** The slot every Phase 1 request asks for. `auto` lets the gateway choose —
- *  which is also why `substituted` can only ever be false today. A picker
- *  replaces this constant in a later phase, once `/v1/models` exists. */
+/** The picker's default value. `auto` lets the gateway choose — which is also
+ *  why `substituted` can only ever be false for a turn nobody redirected. */
 export const DEFAULT_SLOT = "auto";
 
 export function useMe() {
@@ -23,6 +30,21 @@ export function useMe() {
     revalidateOnFocus: false,
   });
   return { me: data, error, isLoading };
+}
+
+/**
+ * Live per-slot status, for `ModelPicker`.
+ *
+ * Fetched on mount like every other SWR hook here, and additionally revalidated
+ * by `useSendMessage` after every completed turn — a status that only refreshes
+ * on page load is wrong exactly when it matters, which is the moment a slot a
+ * user is actively hammering flips to `rate_limited` mid-session.
+ */
+export function useModels() {
+  const { data, error, isLoading, mutate } = useSWR<ModelsResponse>(MODELS_KEY, swrFetcher, {
+    revalidateOnFocus: false,
+  });
+  return { models: data, error, isLoading, mutate };
 }
 
 export function useConversations() {
@@ -89,8 +111,13 @@ export type PendingTurn = {
  * collector persists *after* the final frame is yielded, so the response body
  * does not close until the row is written. Revalidating when the stream promise
  * resolves therefore reads the truth rather than racing it.
+ *
+ * `slot` rides on every `send` as the request's `model`. It is a plain
+ * parameter rather than something read off a ref because `ModelPicker` changes
+ * it between turns via `useState` in the calling component, and the value that
+ * belongs on the *next* message is whatever is selected right now.
  */
-export function useSendMessage(conversationId: string | null) {
+export function useSendMessage(conversationId: string | null, slot: string = DEFAULT_SLOT) {
   const router = useRouter();
   const [pending, setPending] = useState<PendingTurn | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -134,7 +161,7 @@ export function useSendMessage(conversationId: string | null) {
       try {
         await openCompletionStream(
           {
-            model: DEFAULT_SLOT,
+            model: slot,
             messages: [{ role: "user", content: trimmed }],
             ...(conversationId ? { conversation_id: conversationId } : {}),
           },
@@ -209,6 +236,9 @@ export function useSendMessage(conversationId: string | null) {
         if (conversationId && !(error instanceof NetworkError)) {
           void globalMutate(conversationKey(conversationId));
         }
+        // A pre-stream failure is exactly the moment a slot's status might have
+        // just changed — a quota-exhausted candidate is what produces it.
+        if (!(error instanceof NetworkError)) void globalMutate(MODELS_KEY);
         return;
       } finally {
         abortRef.current = null;
@@ -249,6 +279,7 @@ export function useSendMessage(conversationId: string | null) {
         // endpoint committed before any of this started.
         const id = conversationId ?? meta?.conversation_id;
         if (id) void globalMutate(conversationKey(id));
+        void globalMutate(MODELS_KEY);
         return;
       }
 
@@ -263,6 +294,9 @@ export function useSendMessage(conversationId: string | null) {
         done,
       });
       setPending(null);
+      // A completed turn is the moment a status the picker shows might be stale
+      // — the slot that just answered may now be closer to its own limit.
+      void globalMutate(MODELS_KEY);
 
       if (isNewConversation) {
         // Client-derived title. The gateway generates none, so without this every
@@ -278,7 +312,7 @@ export function useSendMessage(conversationId: string | null) {
         void globalMutate(CONVERSATIONS_KEY);
       }
     },
-    [conversationId, router, resetTurn],
+    [conversationId, slot, router, resetTurn],
   );
 
   /** Abort the in-flight stream. Not an error — a person changing their mind. */

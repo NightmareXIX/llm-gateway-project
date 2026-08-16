@@ -1,6 +1,8 @@
 "use client";
 
-import { useSendMessage } from "@/lib/hooks";
+import { useState } from "react";
+
+import { DEFAULT_SLOT, useModels, useSendMessage } from "@/lib/hooks";
 import { Composer } from "./Composer";
 import { EmptyState } from "./EmptyState";
 import { MessageList } from "./MessageList";
@@ -15,7 +17,9 @@ import { MessageList } from "./MessageList";
  * `/chat/{id}`, so the answer is on screen before the navigation lands.
  */
 export function NewConversation() {
-  const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(null);
+  const { models } = useModels();
+  const [modelSlot, setModelSlot] = useState(DEFAULT_SLOT);
+  const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(null, modelSlot);
   const busy = pending?.status === "sending" || pending?.status === "streaming";
   const showTranscript = pending !== null;
 
@@ -47,6 +51,9 @@ export function NewConversation() {
         pending={busy}
         autoFocus
         placeholder="Start a conversation…"
+        modelSlot={modelSlot}
+        onModelSlotChange={setModelSlot}
+        models={models}
       />
     </div>
   );

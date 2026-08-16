@@ -165,3 +165,47 @@ export type ChatCompletionResponse = {
   conversation_id: string;
   message_id: string;
 };
+
+// --------------------------------------------------------------------------- //
+// Live model status — app/schemas/models.py (D21)
+// --------------------------------------------------------------------------- //
+export type SlotStatus = "available" | "rate_limited" | "unavailable" | "unknown";
+
+export type BreakerStateOut = "closed" | "open" | "half_open";
+
+export type WindowStatus = {
+  window: "rpm" | "rpd" | "tpm" | "tpd";
+  limit: number;
+  remaining: number;
+  resets_at: string;
+};
+
+export type CandidateStatus = {
+  provider: string;
+  model: string;
+  status: SlotStatus;
+  breaker_state: BreakerStateOut;
+  /** When this candidate is expected to become available again. `null` when
+   *  `status` is `available` or `unknown` — there is nothing to wait out. */
+  resets_at: string | null;
+  windows: WindowStatus[];
+};
+
+/** One logical slot — `auto` or a named slot from `providers.yaml`. */
+export type ModelEntry = {
+  id: string;
+  object: "model";
+  created: number;
+  /** The primary candidate's provider. `null` for `auto`, which has no single owner. */
+  owned_by: string | null;
+  status: SlotStatus;
+  resets_at: string | null;
+  description: string;
+  candidates: CandidateStatus[];
+};
+
+/** `GET /v1/models`'s body: OpenAI's list envelope, plus everything the gateway knows. */
+export type ModelsResponse = {
+  object: "list";
+  data: ModelEntry[];
+};

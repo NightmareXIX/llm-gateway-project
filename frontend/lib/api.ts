@@ -8,6 +8,7 @@ import type {
   ConversationDetail,
   ErrorResponse,
   Me,
+  ModelsResponse,
 } from "./types";
 
 /** Same-origin prefix; `next.config.ts` rewrites it to the gateway. */
@@ -25,6 +26,10 @@ export class GatewayError extends Error {
   readonly code: string;
   readonly requestId: string | null;
   readonly details: Record<string, unknown>;
+  /** From the `Retry-After` header, in seconds. `null` when the response didn't
+   *  carry one — most failures don't. D17's all-quota-skipped path and, once
+   *  Step 10 lands, our own rate limit both set it on a `rate_limited` response. */
+  readonly retryAfterS: number | null;
 
   constructor(init: {
     status: number;
@@ -32,6 +37,7 @@ export class GatewayError extends Error {
     message: string;
     requestId: string | null;
     details?: Record<string, unknown>;
+    retryAfterS?: number | null;
   }) {
     super(init.message);
     this.name = "GatewayError";
@@ -39,6 +45,7 @@ export class GatewayError extends Error {
     this.code = init.code;
     this.requestId = init.requestId;
     this.details = init.details ?? {};
+    this.retryAfterS = init.retryAfterS ?? null;
   }
 
   get isNotFound() {
@@ -47,6 +54,12 @@ export class GatewayError extends Error {
 
   get isUnauthenticated() {
     return this.status === 401;
+  }
+
+  /** `code === "rate_limited"` is a wait, not a failure — the caller should
+   *  render it as such rather than as an ordinary error. */
+  get isRateLimited() {
+    return this.code === "rate_limited";
   }
 }
 
@@ -107,6 +120,8 @@ export async function gatewayErrorFrom(response: Response): Promise<GatewayError
     /* non-JSON error body */
   }
 
+  const retryAfterS = parseRetryAfter(response.headers.get("Retry-After"));
+
   if (isErrorResponse(body)) {
     return new GatewayError({
       status: response.status,
@@ -114,6 +129,7 @@ export async function gatewayErrorFrom(response: Response): Promise<GatewayError
       message: body.error.message,
       requestId: body.error.request_id ?? response.headers.get("X-Request-ID"),
       details: body.error.details,
+      retryAfterS,
     });
   }
 
@@ -122,7 +138,15 @@ export async function gatewayErrorFrom(response: Response): Promise<GatewayError
     code: "unexpected_response",
     message: `The gateway returned an unexpected ${response.status} response.`,
     requestId: response.headers.get("X-Request-ID"),
+    retryAfterS,
   });
+}
+
+/** `Retry-After` is always delta-seconds on this gateway, never an HTTP-date. */
+function parseRetryAfter(header: string | null): number | null {
+  if (header === null) return null;
+  const seconds = Number(header);
+  return Number.isFinite(seconds) ? seconds : null;
 }
 
 async function request<T>(
@@ -153,6 +177,9 @@ async function request<T>(
 
 export const api = {
   me: () => request<Me>("/v1/me"),
+
+  /** Live per-slot status, no upstream call (D21). `useModels` is the usual caller. */
+  fetchModels: () => request<ModelsResponse>("/v1/models"),
 
   listConversations: () => request<Conversation[]>("/v1/conversations"),
 

@@ -1,9 +1,10 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 
 import { GatewayError } from "@/lib/api";
-import { useConversation, useSendMessage } from "@/lib/hooks";
+import { DEFAULT_SLOT, useConversation, useModels, useSendMessage } from "@/lib/hooks";
 import { Composer } from "./Composer";
 import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
@@ -20,7 +21,12 @@ import { MessageList, MessageListSkeleton } from "./MessageList";
  */
 export function ConversationView({ conversationId }: { conversationId: string }) {
   const { conversation, error, isLoading, mutate } = useConversation(conversationId);
-  const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(conversationId);
+  const { models } = useModels();
+  const [modelSlot, setModelSlot] = useState(DEFAULT_SLOT);
+  const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(
+    conversationId,
+    modelSlot,
+  );
   const busy = pending?.status === "sending" || pending?.status === "streaming";
 
   if (isLoading && !conversation) {
@@ -29,7 +35,13 @@ export function ConversationView({ conversationId }: { conversationId: string })
         <div className="min-h-0 flex-1 overflow-y-auto">
           <MessageListSkeleton />
         </div>
-        <Composer onSend={send} pending={false} />
+        <Composer
+          onSend={send}
+          pending={false}
+          modelSlot={modelSlot}
+          onModelSlotChange={setModelSlot}
+          models={models}
+        />
       </div>
     );
   }
@@ -85,7 +97,15 @@ export function ConversationView({ conversationId }: { conversationId: string })
         )}
       </div>
 
-      <Composer onSend={send} onStop={stop} pending={busy} autoFocus />
+      <Composer
+        onSend={send}
+        onStop={stop}
+        pending={busy}
+        autoFocus
+        modelSlot={modelSlot}
+        onModelSlotChange={setModelSlot}
+        models={models}
+      />
     </div>
   );
 }

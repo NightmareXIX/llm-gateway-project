@@ -60,3 +60,24 @@ export function deriveTitle(text: string): string {
 export function formatTokens(count: number): string {
   return count >= 1000 ? `${(count / 1000).toFixed(count >= 10_000 ? 0 : 1)}k` : String(count);
 }
+
+/**
+ * "resets in ~4 min" — a future instant, rendered relative. `ModelPicker`'s
+ * label for a `rate_limited`/`unavailable` slot.
+ *
+ * `resets_at` off the wire is always an absolute ISO-8601 instant (D21) rather
+ * than a duration precisely so this can be computed against the reader's own
+ * clock instead of rotting inside a cached response — this function is that
+ * computation. A past or unparseable instant returns "" rather than a negative
+ * duration; the caller treats that as "no label", not as an error.
+ */
+export function resetsInLabel(iso: string, now: Date = new Date()): string {
+  const target = new Date(iso);
+  const delta = target.getTime() - now.getTime();
+
+  if (Number.isNaN(delta) || delta <= 0) return "";
+  if (delta < MINUTE) return "under a minute";
+  if (delta < HOUR) return `~${Math.round(delta / MINUTE)} min`;
+  if (delta < DAY) return `~${Math.round(delta / HOUR)}h`;
+  return `~${Math.round(delta / DAY)}d`;
+}
