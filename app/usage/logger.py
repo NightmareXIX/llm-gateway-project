@@ -177,6 +177,61 @@ async def record_failure(
     return row
 
 
+async def record_cache_hit(
+    session: AsyncSession,
+    *,
+    principal: Principal,
+    provider: str,
+    model: str,
+    slot: str,
+    requested_slot: str,
+    latency_ms: int,
+    conversation_id: UUID | None = None,
+    substituted: bool = False,
+) -> Request:
+    """Record a turn served entirely from D19's exact-match cache.
+
+    A fourth facade function rather than a special case bolted onto
+    :func:`record_success`: a cache hit never routed, so there is no
+    :class:`~app.providers.types.ModelSpec` in hand and no attempt trail to
+    write — only the three strings :class:`~app.cache.exact.CachedResponse`
+    carries. ``tokens_in``/``tokens_out`` are zero because a hit costs nothing;
+    ``provider``/``model``/``slot`` name the candidate that originally produced
+    the cached text, which is what ``served_by`` on the response continues to
+    disclose.
+    """
+    row = await requests_repo.create(
+        session,
+        user_id=principal.user_id,
+        api_key_id=principal.api_key_id,
+        conversation_id=conversation_id,
+        requested_slot=requested_slot,
+        served_slot=slot,
+        provider=provider,
+        model=model,
+        tokens_in=0,
+        tokens_out=0,
+        latency_ms=latency_ms,
+        status=requests_repo.STATUS_OK,
+        cache_hit=True,
+        substituted=substituted,
+        attempts=[],
+    )
+
+    logger.info(
+        "chat.cache_hit",
+        request_row_id=str(row.id),
+        conversation_id=str(conversation_id) if conversation_id else None,
+        requested_slot=requested_slot,
+        served_slot=slot,
+        provider=provider,
+        model=model,
+        latency_ms=latency_ms,
+        substituted=substituted,
+    )
+    return row
+
+
 async def record_stream_failure(
     session: AsyncSession,
     *,

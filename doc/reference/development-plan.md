@@ -295,7 +295,19 @@ This phase is where the interview value gets realized. Don't skip it for more fe
 3. `/metrics` in Prometheus format: request counts by provider/status, latency histogram, breaker state gauge, quota-remaining gauge.
 4. **Load/chaos demo:** a script that fires concurrent requests while randomly killing providers, with a recording or screenshots showing graceful degradation. This is your single most persuasive artifact.
 5. Idempotency (D6) if not already done.
-6. `docs/limitations.md` finalized — the honest-edges document.
+6. **Message pagination for long conversations:** `GET /v1/conversations/{id}` currently loads the full
+   thread unpaginated via `messages_repo.list_for_conversation`, and the frontend renders it in one flat
+   list with no windowing — fine at portfolio scale, but payload size and DOM node count both grow
+   unbounded with thread length. Add a **second** repo function, keyset-paginated on `seq` (`WHERE seq <
+   :before_seq ORDER BY seq DESC LIMIT :n`) — `seq` is already a per-conversation, gap-free, monotonic
+   counter (Contract B invariant 2) and `messages(conversation_id, seq)` is already indexed, so this is a
+   cursor for free rather than new infra. **Do not touch `list_for_conversation` itself** — it stays
+   unpaginated because D4's fitting step needs the *complete* history to decide what to truncate for the
+   provider, and that need is independent of how much the UI has paginated into view. Frontend: load the
+   latest N messages on open (oldest-first within the page, matching how Slack/Discord/ChatGPT do it),
+   fetch older pages on scroll-up via `has_more`/`next_before_seq`, and turn `useConversation` from a
+   single fetch into paginated state.
+7. `docs/limitations.md` finalized — the honest-edges document.
 
 ---
 

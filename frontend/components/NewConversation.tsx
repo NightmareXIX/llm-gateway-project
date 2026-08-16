@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { DEFAULT_SLOT, useModels, useSendMessage } from "@/lib/hooks";
 import { Composer } from "./Composer";
@@ -22,10 +22,11 @@ export function NewConversation() {
   const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(null, modelSlot);
   const busy = pending?.status === "sending" || pending?.status === "streaming";
   const showTranscript = pending !== null;
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto">
         {showTranscript ? (
           <MessageList
             messages={[]}
@@ -33,6 +34,7 @@ export function NewConversation() {
             onRetry={retry}
             onDismiss={dismiss}
             onKeepPartial={keepPartial}
+            scrollContainerRef={scrollContainerRef}
           />
         ) : (
           <div className="flex h-full items-center justify-center">

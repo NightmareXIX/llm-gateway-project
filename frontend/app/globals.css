@@ -129,6 +129,15 @@
 html {
   color-scheme: light;
   -webkit-text-size-adjust: 100%;
+  /* Same colour as `body`, and not decoration: the chat route holds its own
+     layout to exactly `100dvh` and scrolls only its internal transcript pane,
+     so `html`/`body` should never need to move at all. But an element's own
+     background never paints *beyond* its box, so if anything ever did shift
+     the document by a pixel — a momentary reflow mid-stream, a trackpad's
+     elastic overscroll — the strip revealed below `body` used to be whatever
+     the browser paints by default, which reads as a stray black bar on a dark
+     theme. Matching the colour here is the fallback for exactly that case. */
+  background-color: var(--ground);
 }
 
 .dark html,
@@ -143,6 +152,11 @@ body {
   line-height: 1.6;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+  /* The chat shell already scrolls its own transcript pane; the document
+     itself scrolling is always a bug on that route, never a feature — and
+     `overscroll-behavior` is what stops a trackpad's elastic bounce from
+     dragging the whole page past its own content to show that off. */
+  overscroll-behavior-y: none;
 }
 
 /* One focus treatment for the whole app. `outline: none` appears nowhere;

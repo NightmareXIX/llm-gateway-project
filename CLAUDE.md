@@ -90,7 +90,7 @@ app/
   keys_resolution/resolver.py
   usage/{logger,metrics}.py
   db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,extractions}.py}
-frontend/            # Next.js App Router + Tailwind; lib/sse.ts, components/ModelIndicator.tsx
+frontend/            # Next.js App Router + Tailwind; lib/sse.ts, components/ModelIndicator.tsx, components/ModelPicker.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
 docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ holds the source specs
@@ -101,20 +101,31 @@ Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/
 
 Phase 1 (single-provider proxy) and Phase 2 (multi-provider core, failover, streaming) are done and merged.
 
-**Status:** Steps 1-6 are committed — **Milestone A** (the router knows: a candidate that cannot be served
-is skipped before the round trip) plus `QuotaHint` reconciliation. Config surface, `quota/windows.py`,
-`quota/tracker.py` + `quota/scripts/{reserve,commit,release}.lua`, `quota/lanes.py`, both router paths
-(`route`/`route_stream`) reserving before each attempt and committing/releasing after, and a `ContextVar`
-sink in `providers/base.py` (`publish_hint`/`take_hint`) published by `HttpProviderAdapter._request`/
-`_stream_events` and drained by the router after every attempt into `QuotaTracker.apply_hint`, which
-corrects a counter upward only, disambiguating `rpm`/`rpd` and `tpm`/`tpd` by the hint's reported reset
-duration. Step 7 (`GET /v1/models`) is implemented in the working tree but not yet committed:
-`schemas/models.py` + `api/v1/models.py`, mounted in `main.py`, reporting per-candidate and per-slot status
+**Status:** Steps 1-9 are committed — **Milestone A** (the router knows: a candidate that cannot be served
+is skipped before the round trip), **Milestone B** (the client can see: live status, a working picker), and
+the first half of **Milestone C**. Config surface, `quota/windows.py`, `quota/tracker.py` +
+`quota/scripts/{reserve,commit,release}.lua`, `quota/lanes.py`, both router paths (`route`/`route_stream`)
+reserving before each attempt and committing/releasing after, and a `ContextVar` sink in `providers/base.py`
+(`publish_hint`/`take_hint`) published by `HttpProviderAdapter._request`/`_stream_events` and drained by the
+router after every attempt into `QuotaTracker.apply_hint`, which corrects a counter upward only,
+disambiguating `rpm`/`rpd` and `tpm`/`tpd` by the hint's reported reset duration. `GET /v1/models`
+(`schemas/models.py` + `api/v1/models.py`, mounted in `main.py`) reports per-candidate and per-slot status
 from the breaker's hash and the quota tracker's counters with zero upstream calls — including
 `CircuitBreaker.peek`, a read-only sibling of `allows` added so a status read cannot claim a half-open
-breaker's one probe slot. Steps 8-11 (the frontend `ModelPicker`; Milestone C: exact-match cache, our own
-rate limiting, tests/ADRs/docs/deploy) have not started. Full step breakdown:
-[phase3.md](doc/reference/phase3.md).
+breaker's one probe slot. The frontend `ModelPicker` (`frontend/components/ModelPicker.tsx`) replaces
+`hooks.ts`'s `DEFAULT_SLOT` constant against that live status, and `ErrorState`/`api.ts` render a
+`rate_limited` response as a wait rather than a failure. `app/cache/exact.py` (D5/D19) — `request_hash`
+over the requested slot, full canonical history and generation knobs; `is_cacheable`, shared verbatim by
+the read and write sides; `ExactCache.get`/`put`, failing open in both directions. The non-streaming path
+in `api/v1/chat.py` checks the cache before `routing.route`; the streaming path
+(`streaming/orchestrator.py::stream_cached_completion`) replays a hit as `meta` → `delta`* → `done` framed
+identically to a live stream, chunked on whitespace via `cache/exact.py::chunk_for_replay`, with no
+artificial delay. `streaming/collector.py::Collector` writes the cache after a live stream's `done` and
+gained `persist_cache_hit` for the replay's own write; `usage/logger.py::record_cache_hit` is the fourth
+facade function alongside `record_success`/`record_failure`/`record_stream_failure`, since a hit never
+routed and has no `ModelSpec` to log one off. `X-Cache: HIT|MISS|BYPASS` on every response, both paths.
+Step 10 (our own rate limiting) and Step 11 (tests/ADRs/docs/deploy — the rest of **Milestone C**) have not
+started. Full step breakdown: [phase3.md](doc/reference/phase3.md).
 
 **Scope:** the router stops guessing and starts knowing. A candidate that cannot be served is skipped before
 the round trip rather than after the 429, `GET /v1/models` reports live status a client can render, identical

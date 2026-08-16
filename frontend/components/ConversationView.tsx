@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
 
 import { GatewayError } from "@/lib/api";
@@ -28,6 +28,7 @@ export function ConversationView({ conversationId }: { conversationId: string })
     modelSlot,
   );
   const busy = pending?.status === "sending" || pending?.status === "streaming";
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   if (isLoading && !conversation) {
     return (
@@ -78,7 +79,7 @@ export function ConversationView({ conversationId }: { conversationId: string })
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto">
         {messages.length === 0 && pending === null ? (
           <div className="flex h-full items-center justify-center">
             <EmptyState
@@ -93,6 +94,7 @@ export function ConversationView({ conversationId }: { conversationId: string })
             onRetry={retry}
             onDismiss={dismiss}
             onKeepPartial={keepPartial}
+            scrollContainerRef={scrollContainerRef}
           />
         )}
       </div>

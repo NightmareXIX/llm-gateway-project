@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, type RefObject } from "react";
 
 import type { PendingTurn as PendingTurnState } from "@/lib/hooks";
 import type { Message } from "@/lib/types";
@@ -24,6 +24,17 @@ import { Skeleton } from "./ui/Skeleton";
  * Auto-scroll is anchored to message count rather than to a scroll event: it
  * follows new turns, and does not fight a user who has scrolled up to re-read
  * something.
+ *
+ * `scrollContainerRef` names the actual `overflow-y-auto` element the caller
+ * scrolls this list inside of, and the effect below moves *that element's own*
+ * `scrollTop` — never `Element.scrollIntoView()`. `scrollIntoView` walks every
+ * scrollable ancestor to bring its target into view, including `<html>`/`<body>`
+ * if the document is even a pixel taller than the viewport at the moment it
+ * fires (exactly what happens mid-stream, when the transcript's height changes
+ * every render); that is what let auto-scroll drag the *whole page* past its own
+ * content, leaving unpainted space below the composer once the layout settled
+ * back down. Setting `scrollTop` on the container this list is actually
+ * rendered inside of cannot touch any ancestor's scroll position.
  */
 export function MessageList({
   messages,
@@ -31,21 +42,23 @@ export function MessageList({
   onRetry,
   onDismiss,
   onKeepPartial,
+  scrollContainerRef,
 }: {
   messages: Message[];
   pending: PendingTurnState | null;
   onRetry: () => void;
   onDismiss: () => void;
   onKeepPartial?: () => void;
+  scrollContainerRef?: RefObject<HTMLDivElement | null>;
 }) {
-  const bottomRef = useRef<HTMLDivElement>(null);
-
   // Follows the answer as it streams, not only as turns are added — but on
   // `restarts.length` rather than on every delta, so a long answer does not fight
   // a user who has scrolled up to re-read something while it is still writing.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, pending?.status, pending?.restarts.length]);
+    const container = scrollContainerRef?.current;
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+  }, [scrollContainerRef, messages.length, pending?.status, pending?.restarts.length]);
 
   return (
     <div className="mx-auto flex w-full max-w-[46rem] flex-col gap-6 px-4 py-6">
@@ -69,8 +82,6 @@ export function MessageList({
           />
         )}
       </div>
-
-      <div ref={bottomRef} aria-hidden />
     </div>
   );
 }

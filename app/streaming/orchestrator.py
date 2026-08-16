@@ -59,6 +59,7 @@ from uuid import UUID
 from redis.asyncio import Redis
 
 from app.cache import keys
+from app.cache.exact import CachedResponse, chunk_for_replay
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
 from app.memory.canonical import CanonicalMessage
@@ -135,6 +136,110 @@ class StreamPersistence(Protocol):
     """
 
     async def persist(self, result: StreamResult) -> None: ...
+
+
+class CacheReplayPersistence(Protocol):
+    """What :meth:`~app.streaming.collector.Collector.persist_cache_hit`
+    implements — D19's streaming write.
+
+    A separate protocol from :class:`StreamPersistence` rather than a second
+    ``StreamResult`` shape: a cache hit never routed, so there is no
+    :class:`~app.providers.types.ModelSpec`, no attempt trail and no
+    :attr:`StreamResult.spec` to be ``None`` in a way callers have to guard
+    against. This is the whole of what a replay needs to persist, and nothing
+    it does not have.
+    """
+
+    async def persist_cache_hit(
+        self,
+        *,
+        conversation_id: UUID,
+        message_id: UUID,
+        requested_slot: str,
+        provider: str,
+        model: str,
+        slot: str,
+        text: str,
+        substituted: bool,
+        latency_ms: int,
+    ) -> None: ...
+
+
+async def stream_cached_completion(
+    cached: CachedResponse,
+    *,
+    requested_slot: str,
+    conversation_id: UUID,
+    message_id: UUID,
+    latency_ms: int,
+    persistence: CacheReplayPersistence | None = None,
+) -> AsyncIterator[bytes]:
+    """Replay a D19 cache hit as a stream that looks like a real one.
+
+    No candidate is attempted — the text already exists — so there is none of
+    :func:`stream_completion`'s restart machinery, and no possibility of a
+    pre-first-byte failure (D13): every frame below is guaranteed to be sent,
+    which is what lets the caller skip the priming dance the live path needs
+    before it can safely construct a ``StreamingResponse``.
+
+    **No artificial delay.** Chunking the text via
+    :func:`~app.cache.exact.chunk_for_replay` is what makes the *shape* of the
+    stream match a real one — same events, same field names — but inserting a
+    typing-speed sleep between chunks would be a lie about where the answer
+    came from. ``X-Cache: HIT`` is the honest signal instead.
+    """
+    substituted = selection.is_substitution(requested_slot, cached.slot)
+
+    yield sse.format_event(
+        sse.MetaEvent(
+            attempt=0,
+            slot=cached.slot,
+            provider=cached.provider,
+            model=cached.model,
+            requested_slot=requested_slot,
+            conversation_id=str(conversation_id),
+            message_id=str(message_id),
+        )
+    )
+    for piece in chunk_for_replay(cached.text):
+        yield sse.format_event(sse.DeltaEvent.of(piece))
+
+    yield sse.format_event(
+        sse.DoneEvent(
+            served_by=ServedBy(slot=cached.slot, provider=cached.provider, model=cached.model),
+            requested_slot=requested_slot,
+            substituted=substituted,
+            attempts=0,
+            usage=sse.StreamUsage(
+                prompt_tokens=cached.tokens_in,
+                completion_tokens=cached.tokens_out,
+                total_tokens=cached.tokens_in + cached.tokens_out,
+                estimated=cached.usage_estimated,
+                wasted_tokens_out=0,
+            ),
+            degraded=False,
+            status="ok",
+        )
+    )
+
+    if persistence is None:
+        return
+    try:
+        await persistence.persist_cache_hit(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            requested_slot=requested_slot,
+            provider=cached.provider,
+            model=cached.model,
+            slot=cached.slot,
+            text=cached.text,
+            substituted=substituted,
+            latency_ms=latency_ms,
+        )
+    except Exception:
+        # D14's rule applies here too: the client already has the answer, and
+        # there is no response left to turn a raised exception into.
+        logger.exception("stream.cache_persist_failed", message_id=str(message_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -570,8 +675,10 @@ async def _client_gone(is_disconnected: Callable[[], Awaitable[bool]] | None) ->
 
 __all__ = [
     "MIN_PARTIAL_CONTENT_CHARS",
+    "CacheReplayPersistence",
     "StreamPersistence",
     "StreamResult",
     "record_attempt",
+    "stream_cached_completion",
     "stream_completion",
 ]

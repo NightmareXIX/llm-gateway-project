@@ -32,14 +32,14 @@ from collections.abc import AsyncIterator
 from functools import partial
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.dependency import PrincipalDep
 from app.auth.principal import Principal
-from app.cache import keys
+from app.cache import exact, keys
 from app.config import get_settings
 from app.core.clock import SYSTEM_CLOCK
 from app.core.errors import InvalidRequest, NotFound
@@ -49,6 +49,7 @@ from app.db.repo import conversations as conversations_repo
 from app.db.repo import messages as messages_repo
 from app.deps import (
     BreakerDep,
+    ExactCacheDep,
     LatencyDep,
     QuotaDep,
     RedisDep,
@@ -59,7 +60,7 @@ from app.deps import (
 from app.memory.canonical import CanonicalMessage, MessageMeta, text_block
 from app.providers.errors import to_app_error
 from app.providers.registry import ProviderRegistry, UnknownSlot
-from app.providers.types import GenParams, ModelSpec
+from app.providers.types import GenParams
 from app.quota.tracker import QuotaTracker
 from app.routing import router as routing
 from app.routing import selection
@@ -75,7 +76,7 @@ from app.schemas.chat import (
 from app.schemas.errors import AUTHENTICATED_ERROR_RESPONSES, NOT_FOUND_RESPONSE, ErrorResponse
 from app.streaming import sse
 from app.streaming.collector import Collector
-from app.streaming.orchestrator import stream_completion
+from app.streaming.orchestrator import stream_cached_completion, stream_completion
 from app.usage import logger as usage_logger
 from app.usage.metrics import LatencyTable
 
@@ -96,6 +97,7 @@ router = APIRouter(prefix="/v1/chat", tags=["chat"], responses=AUTHENTICATED_ERR
 async def create_chat_completion(
     body: ChatCompletionRequest,
     request: Request,
+    response: Response,
     principal: PrincipalDep,
     session: SessionDep,
     session_factory: SessionFactoryDep,
@@ -104,6 +106,7 @@ async def create_chat_completion(
     latency: LatencyDep,
     redis: RedisDep,
     quota: QuotaDep,
+    cache: ExactCacheDep,
 ) -> ChatCompletionResponse | StreamingResponse:
     """Answer one turn, persisting both halves of it.
 
@@ -161,10 +164,39 @@ async def create_chat_completion(
             latency=latency,
             redis=redis,
             quota=quota,
+            cache=cache,
             session_factory=session_factory,
         )
 
+    # --- D5/D19: an exact-match hit skips routing, the breaker and quota ---- #
+    # entirely. `cache_key` stays `None` when the request was never eligible
+    # (`temperature > 0`, or a history carrying a `file_ref`), which is what
+    # tells the write branch below not to bother computing one twice.
     started = time.perf_counter()
+    cache_key: str | None = None
+    x_cache: exact.CacheStatus = exact.BYPASS
+    if cache is not None and exact.is_cacheable(temperature=body.temperature, history=history):
+        cache_key = exact.request_hash(
+            requested_slot=body.model,
+            history=history,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            top_p=body.top_p,
+            stop=body.stop,
+        )
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            return await _serve_cache_hit(
+                session=session,
+                response=response,
+                principal=principal,
+                body=body,
+                conversation_id=conversation_id,
+                cached=cached,
+                started=started,
+            )
+        x_cache = exact.MISS
+
     try:
         # One call, and everything that used to be here is behind it: the
         # candidate chain, the breaker, the render, the attempt, the failover and
@@ -251,9 +283,35 @@ async def create_chat_completion(
     )
     await session.commit()
 
+    # D19's write: only when the pre-call check passed *and* this particular
+    # answer turned out non-degraded — the one half of `is_cacheable` that
+    # could not be known until now.
+    if (
+        cache is not None
+        and cache_key is not None
+        and exact.is_cacheable(
+            temperature=body.temperature, history=history, degraded=outcome.report.degraded
+        )
+    ):
+        await cache.put(
+            cache_key,
+            exact.CachedResponse(
+                text=completion.text,
+                provider=spec.provider,
+                model=spec.model,
+                slot=spec.slot,
+                finish_reason=completion.finish_reason,
+                tokens_in=completion.usage.tokens_in,
+                tokens_out=completion.usage.tokens_out,
+                usage_estimated=completion.usage.estimated,
+                created_at=SYSTEM_CLOCK.now().isoformat(),
+            ),
+        )
+
+    response.headers[exact.CACHE_HEADER] = x_cache
     return _to_response(
         body=body,
-        spec=spec,
+        served_by=ServedBy(slot=spec.slot, provider=spec.provider, model=spec.model),
         completion_text=completion.text,
         finish_reason=completion.finish_reason,
         tokens_in=completion.usage.tokens_in,
@@ -261,6 +319,73 @@ async def create_chat_completion(
         estimated=completion.usage.estimated,
         degraded=outcome.report.degraded,
         attempts=outcome.attempts,
+        conversation_id=conversation_id,
+        assistant=assistant,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# D5/D19 — the exact-match cache's non-streaming hit
+# --------------------------------------------------------------------------- #
+async def _serve_cache_hit(
+    *,
+    session: AsyncSession,
+    response: Response,
+    principal: Principal,
+    body: ChatCompletionRequest,
+    conversation_id: UUID,
+    cached: exact.CachedResponse,
+    started: float,
+) -> ChatCompletionResponse:
+    """A hit still writes a message row and a ``requests`` row (D19) — the user
+    sees an answer, refreshes, and the turn is still there. ``served_by`` names
+    the model that originally produced the text; some model really did write
+    those words, even though nothing was attempted this turn.
+    """
+    substituted = selection.is_substitution(body.model, cached.slot)
+
+    assistant = await messages_repo.append(
+        session,
+        conversation_id=conversation_id,
+        user_id=principal.user_id,
+        role="assistant",
+        content=[text_block(cached.text)],
+        meta=MessageMeta(
+            provider_used=cached.provider,
+            model_used=cached.model,
+            slot_used=cached.slot,
+            requested_slot=body.model,
+            substituted=substituted,
+            attempts=0,
+            tokens_in=0,
+            tokens_out=0,
+            degraded=False,
+        ),
+    )
+    await usage_logger.record_cache_hit(
+        session,
+        principal=principal,
+        provider=cached.provider,
+        model=cached.model,
+        slot=cached.slot,
+        requested_slot=body.model,
+        latency_ms=_elapsed_ms(started),
+        conversation_id=conversation_id,
+        substituted=substituted,
+    )
+    await session.commit()
+
+    response.headers[exact.CACHE_HEADER] = exact.HIT
+    return _to_response(
+        body=body,
+        served_by=ServedBy(slot=cached.slot, provider=cached.provider, model=cached.model),
+        completion_text=cached.text,
+        finish_reason=cached.finish_reason,
+        tokens_in=0,
+        tokens_out=0,
+        estimated=False,
+        degraded=False,
+        attempts=0,
         conversation_id=conversation_id,
         assistant=assistant,
     )
@@ -283,6 +408,7 @@ async def _stream_chat_completion(
     latency: LatencyTable,
     redis: Redis,
     quota: QuotaTracker | None,
+    cache: exact.ExactCache | None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> StreamingResponse:
     """Drive the router loop far enough to know whether anything will be sent,
@@ -305,9 +431,44 @@ async def _stream_chat_completion(
     below is the only thing that writes anything from that point on (Step 10),
     working off a session it opens for itself well after this function has
     already returned.
+
+    A D19 cache hit is checked first and, on a hit, never reaches any of the
+    above — there is no candidate chain to prime, because nothing was going to
+    be attempted. :func:`~app.streaming.orchestrator.stream_cached_completion`
+    cannot fail before its first byte the way a live attempt can, so it skips
+    the priming dance entirely.
     """
     message_id = uuid4()
     started = time.perf_counter()
+
+    cache_key: str | None = None
+    if cache is not None and exact.is_cacheable(temperature=body.temperature, history=history):
+        cache_key = exact.request_hash(
+            requested_slot=body.model,
+            history=history,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            top_p=body.top_p,
+            stop=body.stop,
+        )
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            headers = {**sse.SSE_HEADERS, exact.CACHE_HEADER: exact.HIT}
+            return StreamingResponse(
+                stream_cached_completion(
+                    cached,
+                    requested_slot=body.model,
+                    conversation_id=conversation.id,
+                    message_id=message_id,
+                    latency_ms=_elapsed_ms(started),
+                    persistence=Collector(session_factory, principal=principal),
+                ),
+                media_type=sse.SSE_MEDIA_TYPE,
+                headers=headers,
+            )
+
+    x_cache: exact.CacheStatus = exact.MISS if cache_key is not None else exact.BYPASS
+
     frames = stream_completion(
         registry=registry,
         breaker=breaker,
@@ -326,7 +487,9 @@ async def _stream_chat_completion(
         # Same constant, same reason as the non-streaming path above.
         scope=keys.SYSTEM_SCOPE,
         redis=redis,
-        persistence=Collector(session_factory, principal=principal),
+        persistence=Collector(
+            session_factory, principal=principal, cache=cache, cache_key=cache_key
+        ),
         is_disconnected=partial(sse.client_disconnected, request),
     ).__aiter__()
 
@@ -354,7 +517,8 @@ async def _stream_chat_completion(
         async for chunk in frames:
             yield chunk
 
-    return StreamingResponse(rest(), media_type=sse.SSE_MEDIA_TYPE, headers=sse.SSE_HEADERS)
+    headers = {**sse.SSE_HEADERS, exact.CACHE_HEADER: x_cache}
+    return StreamingResponse(rest(), media_type=sse.SSE_MEDIA_TYPE, headers=headers)
 
 
 # --------------------------------------------------------------------------- #
@@ -455,7 +619,7 @@ def _elapsed_ms(started: float) -> int:
 def _to_response(
     *,
     body: ChatCompletionRequest,
-    spec: ModelSpec,
+    served_by: ServedBy,
     completion_text: str,
     finish_reason: str,
     tokens_in: int,
@@ -466,12 +630,19 @@ def _to_response(
     conversation_id: UUID,
     assistant: CanonicalMessage,
 ) -> ChatCompletionResponse:
-    """Assemble the wire body. Pure, so the shape is testable without a database."""
+    """Assemble the wire body. Pure, so the shape is testable without a database.
+
+    Takes the disclosure block directly rather than a
+    :class:`~app.providers.types.ModelSpec`, because a D19 cache hit never
+    built one — there was no candidate to route to — and the three strings
+    :class:`~app.cache.exact.CachedResponse` carries are everything this
+    function actually reads off a spec anyway.
+    """
     return ChatCompletionResponse(
         # The request id, so what a user quotes from the UI is a log query.
         id=get_request_id() or str(assistant.id),
         created=int(SYSTEM_CLOCK.now().timestamp()),
-        model=spec.model,
+        model=served_by.model,
         choices=[
             Choice(
                 index=0,
@@ -485,9 +656,9 @@ def _to_response(
             total_tokens=tokens_in + tokens_out,
             estimated=estimated,
         ),
-        served_by=ServedBy(slot=spec.slot, provider=spec.provider, model=spec.model),
+        served_by=served_by,
         requested_slot=body.model,
-        substituted=_is_substitution(body.model, spec.slot),
+        substituted=_is_substitution(body.model, served_by.slot),
         attempts=attempts,
         degraded=degraded,
         conversation_id=conversation_id,

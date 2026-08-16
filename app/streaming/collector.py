@@ -35,10 +35,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.principal import Principal
+from app.cache.exact import CachedResponse, ExactCache
+from app.core.clock import SYSTEM_CLOCK
 from app.db.repo import messages as messages_repo
 from app.memory.canonical import MessageMeta, text_block
 from app.streaming.orchestrator import StreamResult
@@ -67,9 +70,18 @@ class Collector:
         session_factory: SessionFactory,
         *,
         principal: Principal,
+        cache: ExactCache | None = None,
+        cache_key: str | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._principal = principal
+        self._cache = cache
+        self._cache_key = cache_key
+        """D19's write side, threaded in rather than recomputed: ``cache_key`` is
+        only ever non-``None`` when the endpoint already established, before the
+        stream started, that ``(temperature, history)`` was eligible
+        (``is_cacheable``) — this class checks only the one dimension that
+        cannot be known until the turn is over, ``result.degraded``."""
 
     async def persist(self, result: StreamResult) -> None:
         """One transaction, whichever branch it takes.
@@ -126,6 +138,82 @@ class Collector:
             substituted=result.substituted,
             wasted_tokens_out=result.wasted_tokens_out,
         )
+
+        # D5/D19's streaming write, exactly where this docstring promised it
+        # would land. `result.degraded` is the one half of `is_cacheable` the
+        # endpoint could not have checked before the turn existed; the other
+        # half is why `self._cache_key` is `None` at all whenever it does not
+        # hold.
+        if self._cache is not None and self._cache_key is not None and not result.degraded:
+            await self._cache.put(
+                self._cache_key,
+                CachedResponse(
+                    text=result.text,
+                    provider=spec.provider,
+                    model=spec.model,
+                    slot=spec.slot,
+                    finish_reason=result.finish_reason,
+                    tokens_in=result.usage.tokens_in,
+                    tokens_out=result.usage.tokens_out,
+                    usage_estimated=result.usage.estimated,
+                    created_at=SYSTEM_CLOCK.now().isoformat(),
+                ),
+            )
+
+    async def persist_cache_hit(
+        self,
+        *,
+        conversation_id: UUID,
+        message_id: UUID,
+        requested_slot: str,
+        provider: str,
+        model: str,
+        slot: str,
+        text: str,
+        substituted: bool,
+        latency_ms: int,
+    ) -> None:
+        """The write side of a *replayed* turn — D19's streaming cache hit.
+
+        Not a :class:`StreamResult` branch: a cache hit never routed, so there
+        is no attempt trail and no served :class:`~app.providers.types.ModelSpec`
+        to read one off — only the pieces
+        :func:`~app.streaming.orchestrator.stream_cached_completion` already
+        has in hand, the same pieces the non-streaming endpoint's own cache-hit
+        branch persists.
+        """
+        async with self._session_factory() as session:
+            await messages_repo.append(
+                session,
+                conversation_id=conversation_id,
+                user_id=self._principal.user_id,
+                role="assistant",
+                content=[text_block(text)],
+                message_id=message_id,
+                meta=MessageMeta(
+                    provider_used=provider,
+                    model_used=model,
+                    slot_used=slot,
+                    requested_slot=requested_slot,
+                    substituted=substituted,
+                    attempts=0,
+                    tokens_in=0,
+                    tokens_out=0,
+                    degraded=False,
+                ),
+            )
+            await usage_logger.record_cache_hit(
+                session,
+                principal=self._principal,
+                provider=provider,
+                model=model,
+                slot=slot,
+                requested_slot=requested_slot,
+                latency_ms=latency_ms,
+                conversation_id=conversation_id,
+                substituted=substituted,
+            )
+            await session.commit()
 
     async def _persist_failure(self, session: AsyncSession, result: StreamResult) -> None:
         """No ``messages`` row. Invariant 4 — an empty or half-written

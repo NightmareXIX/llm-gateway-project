@@ -16,6 +16,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.cache.client import LuaScriptRegistry
+from app.cache.exact import ExactCache
 from app.config import get_limits_config, get_settings
 from app.providers.registry import ProviderRegistry
 from app.quota.tracker import QuotaTracker
@@ -133,6 +134,23 @@ def get_quota(request: Request) -> QuotaTracker | None:
     )
 
 
+def get_exact_cache(request: Request) -> ExactCache | None:
+    """The exact-match cache over the process-wide Redis client, or ``None`` when
+    D5/D19's cache is switched off (``CACHE_EXACT_ENABLED``).
+
+    Constructed per request for the same reason the breaker and the quota
+    tracker are: the cache holds no state of its own — ``cache:exact:{sha256}``
+    is the state, shared by every worker and every instance. ``None`` rather
+    than a no-op cache mirrors ``get_quota``: every read becomes an unconditional
+    ``BYPASS`` and every write a no-op, without either call site having to know
+    why.
+    """
+    settings = get_settings()
+    if not settings.CACHE_EXACT_ENABLED:
+        return None
+    return ExactCache(get_redis(request))
+
+
 def get_latency(request: Request) -> LatencyTable:
     """The in-process EWMA latency table `auto` ranks with (ADR-014).
 
@@ -152,4 +170,5 @@ HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
 BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]
 QuotaDep = Annotated[QuotaTracker | None, Depends(get_quota)]
+ExactCacheDep = Annotated[ExactCache | None, Depends(get_exact_cache)]
 LatencyDep = Annotated[LatencyTable, Depends(get_latency)]
