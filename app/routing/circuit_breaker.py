@@ -281,6 +281,46 @@ class CircuitBreaker:
         except Exception as exc:
             return self._fail_open(provider, model, exc, action="claim_probe")
 
+    async def peek(self, provider: str, model: str) -> BreakerDecision:
+        """Read the stored state without claiming a half-open probe.
+
+        For ``GET /v1/models`` (Phase 3 Step 7), which has to answer "is this
+        candidate available" without the side effect :meth:`allows` has: on a
+        breaker whose cooldown has elapsed, ``allows`` claims the one probe slot
+        via ``HSETNX``, on the assumption that the caller is about to spend it on
+        a real attempt. A status read is not an attempt, and claiming the probe
+        for one would strand a real request behind a stale holder for a full
+        cooldown, for nothing.
+
+        So this reads the hash and reports the state exactly as stored — never
+        computing a fresh ``half_open`` eligibility the way ``allows`` does.
+        ``open`` and ``half_open`` are both "not allowed" here, whether or not a
+        probe happens to be claimable right now: half-open means *at most one*
+        request gets through, which is not the same claim as "available".
+        """
+        key = keys.breaker(provider, model)
+
+        try:
+            raw: _Hash = await self._redis.hgetall(key)
+        except Exception as exc:
+            return self._fail_open(provider, model, exc, action="peek")
+
+        state = _read_state(raw)
+        if state == CLOSED:
+            return BreakerDecision(provider=provider, model=model, allowed=True, state=CLOSED)
+
+        opened_at = _read_float(raw.get(_FIELD_OPENED_AT))
+        cooldown_s = _read_float(raw.get(_FIELD_COOLDOWN)) or self._cooldown_initial_s
+        elapsed = self._now() - opened_at
+        return BreakerDecision(
+            provider=provider,
+            model=model,
+            allowed=False,
+            state=state,
+            failures=_read_int(raw.get(_FIELD_FAILURES)),
+            retry_after_s=max(cooldown_s - elapsed, 0.0),
+        )
+
     # ----------------------------------------------------------------- #
     # Recording
     # ----------------------------------------------------------------- #
