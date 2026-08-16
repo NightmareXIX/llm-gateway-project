@@ -13,6 +13,10 @@ export const metadata = { title: "Sign in · LLM Gateway" };
  * back to their conversations.
  */
 export default function LoginPage() {
+  // Read server-side: the credentials themselves stay on the server (/auth/demo
+  // uses them), and only the fact that a demo exists crosses into the client.
+  const demoAvailable = Boolean(process.env.DEMO_MAIL && process.env.DEMO_PASSWORD);
+
   return (
     <main className="relative flex min-h-[100dvh] flex-col items-center justify-center px-4 py-12">
       <div className="absolute right-4 top-4">
@@ -31,7 +35,7 @@ export default function LoginPage() {
         </div>
 
         <Suspense fallback={<Skeleton className="h-[22rem] w-full rounded-card" />}>
-          <LoginForm />
+          <LoginForm demoAvailable={demoAvailable} />
         </Suspense>
       </div>
     </main>

@@ -33,10 +33,13 @@ constraints touch decisions this repo had already made and written down:
 by CI through a deploy hook.**
 
 - `render.yaml` is checked in and authoritative, the way `fly.toml` was.
-- `dockerCommand` is `alembic upgrade head && exec uvicorn …`, unwrapped and unquoted. Render runs it
-  through a shell itself, so the `&&` works; a `/bin/sh -c "…"` wrapper does not, because Render
-  passes quote characters through as literal text rather than consuming them as syntax. The first
-  deploy proved it: `/bin/sh: 1: alembic upgrade head && exec uvicorn …: not found`, exit 127.
+- `dockerCommand` is `sh /srv/app/start.sh`, and the chain lives in [`start.sh`](../../start.sh).
+  **Render does not run the Docker Command through a shell** — it interpolates environment variables
+  into the string, splits the result into argv, and execs it. Neither obvious spelling survives that,
+  and both were found by deploying them: `alembic upgrade head && exec uvicorn …` reaches alembic
+  with `&&` as an argument (exit 2), and `/bin/sh -c "alembic upgrade head && …"` reaches an inner
+  shell as one quoted word, because the quote characters are kept as literal text rather than
+  consumed as syntax (`/bin/sh: 1: alembic upgrade head && …: not found`, exit 127).
 - `healthCheckPath: /readyz`, unchanged in intent from ADR-009.
 - `autoDeploy: false`. The `deploy` job in `.github/workflows/ci.yml` calls the service's deploy hook,
   so `needs: [lint, test, frontend]` stays in front of every deploy.
@@ -46,7 +49,8 @@ by CI through a deploy hook.**
   the same name, so declaring one only creates a number that looks authoritative and is not.
 - `--workers` and `--forwarded-allow-ips` are set as `WEB_CONCURRENCY` and `FORWARDED_ALLOW_IPS`
   environment variables rather than command-line flags. uvicorn reads both natively when the flags
-  are absent, which keeps the `*` — a glob unquoted, and a parse failure quoted — out of a shell.
+  are absent, and `render.yaml` is a better home for a deployment's concurrency and trust settings
+  than a string inside a script.
 
 ## Why
 
@@ -57,6 +61,15 @@ resolves `DATABASE_URL` through `app/config.py`, so a bad migration or a missing
 uvicorn binds, the health check never passes, Render cancels the deploy, and the previous instance
 keeps serving. The free plan runs a single instance, so the concurrency argument for a release
 command — two machines racing to apply one revision — has no target either.
+
+**A script rather than a one-liner, because the host's command field is not a shell.** Two deploys
+were spent discovering that, and the second failure mode — a quoted string handed to `sh -c` with its
+quotes intact — is the kind that reads as a broken image rather than a broken configuration. Moving
+the sequence into `start.sh` reduces `dockerCommand` to two bare tokens with nothing left to
+misparse, puts the reasoning next to the code it governs, and makes the exact production start path
+runnable locally: `docker run … llm-gateway:local sh /srv/app/start.sh`. The image's own `CMD` stays
+serve-only, so `make docker-run` and docker-compose still do not migrate a database as a side effect
+of starting a container.
 
 **One worker, because the arithmetic reversed.** Two was right for a whole shared core. On 0.1 CPU and
 512MB, a second worker splits a tenth of a core, doubles the resident set, and doubles the Postgres

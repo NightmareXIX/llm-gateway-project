@@ -24,12 +24,13 @@ const MIN_PASSWORD_LENGTH = 8;
  * the confirmation link is clicked. Redirecting to /chat there would hand the
  * user a wall of 401s and no explanation.
  */
-export function LoginForm() {
+export function LoginForm({ demoAvailable = false }: { demoAvailable?: boolean }) {
   const router = useRouter();
   const params = useSearchParams();
   const next = params.get("next") ?? "/chat";
 
   const [mode, setMode] = useState<Mode>("signin");
+  const [demoLoading, setDemoLoading] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
@@ -119,6 +120,28 @@ export function LoginForm() {
     }
   }
 
+  /** No credentials in the browser: /auth/demo signs in server-side and writes
+   *  the session cookies, so all this has to do is navigate afterwards. */
+  async function onDemo() {
+    setFormError(null);
+    setFieldErrors({});
+    setDemoLoading(true);
+    try {
+      const response = await fetch("/auth/demo", { method: "POST" });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        setFormError(body?.error ?? "Couldn't open the demo account. Try again in a moment.");
+        return;
+      }
+      router.replace(next);
+      router.refresh();
+    } catch {
+      setFormError("Couldn't reach the authentication service. Check your connection and retry.");
+    } finally {
+      setDemoLoading(false);
+    }
+  }
+
   if (confirmationSentTo) {
     return (
       <ConfirmationPanel
@@ -163,7 +186,7 @@ export function LoginForm() {
       </div>
 
       <form onSubmit={onSubmit} noValidate className="flex flex-col gap-4">
-        <fieldset disabled={submitting} className="flex flex-col gap-4">
+        <fieldset disabled={submitting || demoLoading} className="flex flex-col gap-4">
           <TextField
             label="Email"
             type="email"
@@ -198,12 +221,40 @@ export function LoginForm() {
         <Button
           type="submit"
           variant="primary"
+          disabled={demoLoading}
           loading={submitting}
           loadingLabel={mode === "signup" ? "Creating account…" : "Signing in…"}
         >
           {mode === "signup" ? "Create account" : "Sign in"}
         </Button>
       </form>
+
+      {demoAvailable && (
+        <div className="mt-6">
+          <div className="flex items-center gap-3" aria-hidden>
+            <span className="h-px flex-1 bg-subtle" />
+            <span className="text-xs text-ink-tertiary">or</span>
+            <span className="h-px flex-1 bg-subtle" />
+          </div>
+
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={onDemo}
+            disabled={submitting}
+            loading={demoLoading}
+            loadingLabel="Opening demo…"
+            className="mt-4 w-full"
+          >
+            Try the demo account
+          </Button>
+
+          <p className="mt-2 text-xs leading-relaxed text-ink-tertiary">
+            Signs you into a shared, pre-confirmed account — no email needed. Its conversations are
+            visible to every other visitor, so treat it as public.
+          </p>
+        </div>
+      )}
 
       {mode === "signup" && (
         <p className="mt-4 text-xs leading-relaxed text-ink-tertiary">

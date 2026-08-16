@@ -169,9 +169,10 @@ check, start command and non-secret environment variables all come from the file
 memory.
 
 Creating it by hand instead means setting, at minimum: Runtime **Docker**, Instance type **Free**,
-Region as above, Health check path **`/readyz`**, Auto-Deploy **Off**, and the Docker command from
-`render.yaml`'s `dockerCommand`. A hand-made service that disagrees with the file is the failure this
-whole document exists to prevent, so mirror any dashboard change back into it.
+Region as above, Health check path **`/readyz`**, Auto-Deploy **Off**, Docker command
+**`sh /srv/app/start.sh`**, and the three environment variables from `render.yaml`'s `envVars`. A
+hand-made service that disagrees with the file is the failure this whole document exists to prevent,
+so mirror any dashboard change back into it.
 
 The name becomes the hostname — `https://<name>.onrender.com` — and `onrender.com` is a **shared**
 namespace, so a near-miss is somebody else's live service rather than a DNS error. Two files hardcode
@@ -192,7 +193,8 @@ deploy hook that replaces it.
 
 ### Set every variable before the first deploy
 
-This is the step that catches people. `render.yaml`'s `dockerCommand` runs `alembic upgrade head`
+This is the step that catches people. The start command ([`start.sh`](../start.sh), invoked by
+`render.yaml`'s `dockerCommand`) runs `alembic upgrade head`
 before uvicorn binds, and [`alembic/env.py`](../alembic/env.py) resolves `DATABASE_URL` through
 `app/config.py` — which validates the *whole* settings object. A missing `GROQ_API_KEY` fails the
 migration exactly as loudly as it would fail the app, before the service ever becomes healthy.
@@ -271,6 +273,8 @@ Environment variables:
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://<ref>.supabase.co` | Browser. Public by design. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the anon key | Browser. Public by design. |
 | `GATEWAY_URL` | `https://llm-gateway-sed.onrender.com` | **Server only.** |
+| `DEMO_MAIL` | the shared demo account's address | **Server only.** Optional. |
+| `DEMO_PASSWORD` | its password | **Server only.** Optional. |
 
 **Set these in the Vercel dashboard, not in `frontend/.env.local`.** That file is gitignored and
 never leaves your machine — it configures `make frontend-dev` and nothing else. Filling it in does
@@ -288,11 +292,37 @@ not configure the deployment.
 `GATEWAY_URL` is read server-side by [`next.config.ts`](../frontend/next.config.ts)'s rewrite. The
 browser only ever calls `/api/gw/*` on the Vercel origin, which keeps every request same-origin —
 no preflight, no `Access-Control-Allow-*` to get wrong, and no CORS middleware in
-[`app/main.py`](../app/main.py). Do not "fix" this by pointing the browser at the Fly URL directly;
-that trades a working setup for a CORS configuration.
+[`app/main.py`](../app/main.py). Do not "fix" this by pointing the browser at the Render URL
+directly; that trades a working setup for a CORS configuration.
+
+> **`rewrites()` runs at build time, so editing the variable is only half the change.** The value is
+> baked into the deployment; until you redeploy, the old target is still in use — and *promoting* an
+> existing deployment re-uses its baked value too, so it has to be a fresh build.
+>
+> The symptom of a stale or wrong target is a **502 whose body is not the gateway's error envelope**
+> — `ROUTER_EXTERNAL_TARGET_HANDSHAKE_ERROR` from Vercel's edge, surfacing in the UI as
+> `unexpected_response`, because [`lib/api.ts`](../frontend/lib/api.ts) refuses to mangle a foreign
+> body into a fake error code. Confirm which leg is broken before touching the gateway:
+> `/healthz` on the Render host answering 200 while `…vercel.app/api/gw/v1/me` returns 502 means the
+> request never left Vercel. A working rewrite answers that path with **401** and an error envelope.
 
 Never set `SUPABASE_SERVICE_ROLE_KEY` here. The frontend has no use for it and Vercel env vars are
 readable by anyone with project access.
+
+**`DEMO_MAIL` / `DEMO_PASSWORD` — the "Try the demo account" button.** Both are deliberately without
+a `NEXT_PUBLIC_` prefix: [`app/auth/demo/route.ts`](../frontend/app/auth/demo/route.ts) signs in with
+them server-side and returns only the session cookies, so the credentials never enter the client
+bundle. Leave either unset and the button does not render — the login page reads them at render time
+purely to decide that. The account must already have a confirmed email; the gateway runs with
+`REQUIRE_VERIFIED_EMAIL=true` and will reject its token otherwise.
+
+> **`/login` is statically prerendered, so this is the same build-time trap as `GATEWAY_URL`.** The
+> button's presence is baked into the deployment. Adding the variables to an already-built project
+> changes nothing until a *fresh build* runs — and promoting an existing deployment re-uses the old
+> one. Push a commit, or use Redeploy, after setting them.
+>
+> Its conversations are visible to every visitor who presses the button. That is what a shared demo
+> account is; the copy under the button says so, and nothing sensitive belongs in it.
 
 ---
 
@@ -529,8 +559,12 @@ that does not spin down.
 **A restart loop is a new failure mode.** Render restarts an instance after 60 seconds of failing
 health checks, and `/readyz` fails when Postgres is unreachable — so a Supabase outage now cycles the
 service rather than quietly draining it. Add the migration in the start command and an outage during
-a cold start leaves it down entirely. If that ever needs breaking into: edit `dockerCommand` in the
-dashboard to drop the `alembic upgrade head &&` prefix, deploy, and put it back afterwards.
+a cold start leaves it down entirely. If that ever needs breaking into: change the Docker Command in
+the dashboard to `uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers` — which skips
+`start.sh` and therefore the migration — deploy, and put `sh /srv/app/start.sh` back afterwards.
+That replacement is a single command with no chaining, which is the only shape Render's command field
+can express (it execs argv directly rather than running a shell; see
+[ADR-017](decisions/ADR-017-render-as-deploy-target.md)).
 
 **Rolling back.** The service's **Events** tab → the deploy you want → **Rollback**. The free plan
 keeps only the **two previous deploys**; past that, re-deploy the commit by pushing or by using the
