@@ -620,12 +620,107 @@ async def test_two_scopes_do_not_share_a_counter(
 
 
 # --------------------------------------------------------------------------- #
-# Step 6's seam
+# QuotaHint reconciliation — Step 6, D18
 # --------------------------------------------------------------------------- #
-async def test_apply_hint_is_a_typed_signature_not_a_silent_stub(
-    tracker: QuotaTracker,
+async def test_apply_hint_corrects_the_window_closest_to_its_reported_reset(
+    tracker: QuotaTracker, redis_client: FakeRedis
 ) -> None:
-    """The hard rule: a seam raises, because a stub that returns ``None`` looks
-    exactly like a hint that was applied."""
-    with pytest.raises(NotImplementedError):
-        await tracker.apply_hint(_spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=5))
+    """``rpm`` (60s) and ``rpd`` (fixed daily) are both declared for this model,
+    so a hint that only says "requests" is ambiguous on its own — the reported
+    reset duration is what disambiguates it. A reset a few seconds out reads
+    as the minute window."""
+    await tracker.apply_hint(
+        _spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=7, requests_reset_s=12.0)
+    )
+
+    assert await redis_client.get(_counter("rpm")) == "3"  # limit 10 - remaining 7
+    assert await redis_client.get(_counter("rpd")) is None
+
+
+async def test_apply_hint_picks_the_daily_window_for_a_reset_far_in_the_future(
+    tracker: QuotaTracker, redis_client: FakeRedis
+) -> None:
+    """The mirror case: a reset tens of thousands of seconds out is nowhere
+    near a 60-second window, so it lands on ``rpd`` instead."""
+    await tracker.apply_hint(
+        _spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=80, requests_reset_s=40_000.0)
+    )
+
+    assert await redis_client.get(_counter("rpd")) == "20"  # limit 100 - remaining 80
+    assert await redis_client.get(_counter("rpm")) is None
+
+
+async def test_apply_hint_needs_no_disambiguation_with_one_declared_window(
+    redis_client: FakeRedis, scripts: LuaScriptRegistry, clock: FixedClock
+) -> None:
+    """Gemini-shaped models declare no ``tpd`` (``config/limits.yaml``); with
+    only one token window to begin with, a hint carrying no reset at all still
+    lands correctly."""
+    tracker = QuotaTracker(redis_client, scripts, _limits(tpd=None), clock=clock)
+
+    await tracker.apply_hint(_spec(), scope=SCOPE, hint=QuotaHint(tokens_remaining=760))
+
+    assert await redis_client.get(_counter("tpm")) == "240"  # limit 1000 - remaining 760
+
+
+async def test_apply_hint_applies_nothing_when_it_cannot_disambiguate(
+    tracker: QuotaTracker, redis_client: FakeRedis
+) -> None:
+    """Two candidate windows and no reported reset: guessing could apply a
+    minute's worth of usage to a day's counter, so nothing is written."""
+    await tracker.apply_hint(_spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=1))
+
+    assert await redis_client.get(_counter("rpm")) is None
+    assert await redis_client.get(_counter("rpd")) is None
+
+
+async def test_apply_hint_drops_a_correction_that_would_lower_the_counter(
+    tracker: QuotaTracker, redis_client: FakeRedis
+) -> None:
+    """A hint is at best one request stale; letting it move a counter *down*
+    would let a later, more-restrictive count be undone by an earlier,
+    now-outdated header (D18)."""
+    await redis_client.set(_counter("rpm"), 5, ex=60)
+
+    await tracker.apply_hint(
+        _spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=9, requests_reset_s=12.0)
+    )  # used = 10 - 9 = 1, less than the 5 already tracked
+
+    assert await redis_client.get(_counter("rpm")) == "5"
+
+
+async def test_apply_hint_never_writes_above_the_limit(
+    tracker: QuotaTracker, redis_client: FakeRedis
+) -> None:
+    await tracker.apply_hint(
+        _spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=-5, requests_reset_s=12.0)
+    )
+
+    assert await redis_client.get(_counter("rpm")) == "10"
+
+
+async def test_apply_hint_does_not_refresh_a_rolling_windows_ttl(
+    tracker: QuotaTracker, redis_client: FakeRedis
+) -> None:
+    """Trap 1, reached through a new door: a hint that renewed ``rpm``'s TTL on
+    every application would keep a per-minute counter alive under sustained
+    traffic exactly like a naive increment would."""
+    await redis_client.set(_counter("rpm"), 1, ex=20)
+
+    await tracker.apply_hint(
+        _spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=2, requests_reset_s=12.0)
+    )
+
+    assert await redis_client.get(_counter("rpm")) == "8"  # limit 10 - remaining 2
+    assert await redis_client.ttl(_counter("rpm")) <= 20
+
+
+async def test_apply_hint_is_never_fatal_when_redis_is_unreachable(clock: FixedClock) -> None:
+    """Nothing left to refuse by the time a hint arrives — the attempt it
+    describes already happened. A Redis failure here costs a correction, not
+    a decision."""
+    tracker = QuotaTracker(_BrokenRedis(), _broken_scripts(), _limits(), clock=clock)  # type: ignore[arg-type]
+
+    await tracker.apply_hint(
+        _spec(), scope=SCOPE, hint=QuotaHint(requests_remaining=1, requests_reset_s=12.0)
+    )

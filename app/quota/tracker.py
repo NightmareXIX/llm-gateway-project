@@ -418,14 +418,107 @@ class QuotaTracker:
     async def apply_hint(self, spec: ModelSpec, *, scope: keys.Scope, hint: QuotaHint) -> None:
         """Correct the local counters toward a provider's own published remainder.
 
-        Step 6's seam, typed rather than stubbed (D18). The transport — a
-        contextvar sink in ``providers/base.py``, because ``complete()`` returns a
-        ``Completion`` and the ``httpx.Response`` never escapes the adapter —
-        lands with it, as does the rule that a hint may only ever move a counter
-        *up*: a hint is up to one request stale, and letting it grant budget
-        reintroduces the race the reserve script exists to close.
+        The transport is a contextvar sink in ``providers/base.py`` — because
+        ``complete()`` returns a ``Completion`` and the ``httpx.Response`` never
+        escapes the adapter — drained by the router immediately after each
+        attempt. What lands here is the reconciliation itself: a hint may only
+        ever move a counter *up*. A hint is up to one request stale, and letting
+        it *grant* budget back reintroduces the check-then-increment race the
+        reserve script exists to close (D18) — it corrects drift, it does not
+        authorize spending.
+
+        Never fatal. This runs after the attempt it describes already happened;
+        a Redis failure here costs a correction, not a decision.
         """
-        raise NotImplementedError("QuotaHint reconciliation lands in Phase 3 Step 6")
+        now = self._clock.now()
+        declared = self._declared(spec.provider, spec.model)
+
+        if hint.requests_remaining is not None:
+            await self._apply_one(
+                spec,
+                scope,
+                declared,
+                cost_is_tokens=False,
+                remaining=hint.requests_remaining,
+                reported_reset_s=hint.requests_reset_s,
+                now=now,
+            )
+        if hint.tokens_remaining is not None:
+            await self._apply_one(
+                spec,
+                scope,
+                declared,
+                cost_is_tokens=True,
+                remaining=hint.tokens_remaining,
+                reported_reset_s=hint.tokens_reset_s,
+                now=now,
+            )
+
+    async def _apply_one(
+        self,
+        spec: ModelSpec,
+        scope: keys.Scope,
+        declared: tuple[WindowSpec, ...],
+        *,
+        cost_is_tokens: bool,
+        remaining: int,
+        reported_reset_s: float | None,
+        now: datetime,
+    ) -> None:
+        """Reconcile one dimension (requests or tokens) of one hint.
+
+        A hint names a resource, not a window — Groq's ``x-ratelimit-remaining-
+        requests`` does not say whether it is describing ``rpm`` or ``rpd``. When
+        a model declares only one window of that dimension there is nothing to
+        disambiguate; when it declares two, the reported reset duration is the
+        only signal available, and :func:`_closest_window` picks by comparing it
+        against each candidate's own reset width — a reset a few seconds out
+        reads as the rolling window, one tens of thousands of seconds out reads
+        as the daily one. With no reset reported and more than one candidate,
+        the honest move is to apply nothing rather than guess.
+        """
+        candidates = tuple(window for window in declared if window.cost_is_tokens == cost_is_tokens)
+        window = _closest_window(candidates, reported_reset_s=reported_reset_s, now=now)
+        if window is None:
+            return
+
+        effective_limit = self._effective_limit(window.limit, spec)
+        used = min(effective_limit, max(0, effective_limit - remaining))
+        key = keys.quota(scope, spec.provider, spec.model, window.window)
+
+        try:
+            current = _read_int(await self._redis.get(key))
+            if used <= current:
+                # The hint would lower or match what is already tracked —
+                # dropped, per D18: it is at best one request stale, and only
+                # ever allowed to move a counter up.
+                return
+
+            if window.reset in _CONVERGING_RESETS:
+                # Idempotent to re-set (D16): the TTL converges on the same
+                # real instant no matter how many times it is written.
+                await self._redis.set(key, used, ex=windows.ttl_s(window.reset, now=now))
+                return
+
+            # rolling_60s must not have its TTL refreshed on every write (D16,
+            # trap 1) — a per-minute counter kept alive by hints under
+            # sustained traffic would never expire. `KEEPTTL` when the key is
+            # already live; only a genuinely absent key gets a fresh one.
+            ttl = await self._redis.ttl(key)
+            if ttl is not None and ttl > 0:
+                await self._redis.set(key, used, keepttl=True)
+            else:
+                await self._redis.set(key, used, ex=windows.ttl_s(window.reset, now=now))
+        except Exception as exc:
+            logger.warning(
+                "quota.hint_apply_failed",
+                provider=spec.provider,
+                model=spec.model,
+                scope=scope,
+                window=window.window,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     # ----------------------------------------------------------------- #
     # Internals
@@ -480,6 +573,29 @@ class QuotaTracker:
     ) -> list[str]:
         """Counter keys in window order — the order the scripts index KEYS by."""
         return [keys.quota(scope, provider, model, window) for window in settled]
+
+
+def _closest_window(
+    candidates: tuple[WindowSpec, ...], *, reported_reset_s: float | None, now: datetime
+) -> WindowSpec | None:
+    """Pick the declared window a hint's reset duration most plausibly describes.
+
+    Zero candidates: the model declares no window of this dimension, so the
+    hint describes something the tracker does not enforce. One: unambiguous,
+    the reset duration is not even consulted. More than one and no reset
+    reported: no signal to disambiguate with, so ``None`` rather than a guess
+    that could apply a minute's worth of usage to a day's counter.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if reported_reset_s is None:
+        return None
+    return min(
+        candidates,
+        key=lambda window: abs(windows.ttl_s(window.reset, now=now) - reported_reset_s),
+    )
 
 
 def _as_window(name: str) -> keys.QuotaWindow | None:

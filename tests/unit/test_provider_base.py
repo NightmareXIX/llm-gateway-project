@@ -7,6 +7,8 @@ them) and applying a per-request timeout that is not the shared client's.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import httpx
 import pytest
 
@@ -15,12 +17,23 @@ from app.providers.base import (
     DEFAULT_READ_TIMEOUT_S,
     HttpProviderAdapter,
     ProviderAdapter,
+    publish_hint,
+    take_hint,
 )
 from app.providers.errors import Unavailable
 from app.providers.groq import GroqAdapter
+from app.providers.types import QuotaHint
 from tests import provider_fixtures as fx
 
 BASE_URL = "https://api.groq.com/openai/v1"
+
+
+@pytest.fixture(autouse=True)
+def clean_quota_hint() -> Iterator[None]:
+    """No test inherits another's published hint, and none leaks its own."""
+    take_hint()
+    yield
+    take_hint()
 
 
 class _BareAdapter(HttpProviderAdapter):
@@ -257,3 +270,85 @@ async def test_stream_events_raises_the_normalized_error_for_a_non_2xx_status() 
 
         with pytest.raises(Unavailable):
             await _collect_frames(adapter)
+
+
+# --------------------------------------------------------------------------- #
+# The QuotaHint sink — Phase 3 Step 6, D18
+# --------------------------------------------------------------------------- #
+def test_take_hint_clears_as_it_reads() -> None:
+    """The second read must not see the first read's hint again — that is what
+    stops a hint from one attempt being wrongly attributed to the next."""
+    published = QuotaHint(requests_remaining=5)
+    publish_hint(published)
+
+    assert take_hint() is published
+    assert take_hint() is None
+
+
+def test_publish_hint_of_none_does_not_erase_a_pending_hint() -> None:
+    """A response that carried no hint is not the same event as 'clear the
+    slate' — only `take_hint` (called once per attempt, by the router) does
+    that. This is what lets `_request` call `publish_hint` unconditionally."""
+    published = QuotaHint(requests_remaining=5)
+    publish_hint(published)
+    publish_hint(None)
+
+    assert take_hint() is published
+
+
+async def test_request_publishes_the_hint_from_a_successful_response() -> None:
+    """`_request` is the transport every adapter shares, so this is where the
+    sink has to be wired for every adapter to benefit from it."""
+    async with fx.client_returning(fx.load("groq", "success")) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+        await adapter._request("POST", "/chat/completions", headers={}, model="m")
+
+    hint = take_hint()
+    assert hint is not None
+    assert hint.requests_remaining == 997
+    assert hint.tokens_remaining == 11873
+
+
+async def test_request_publishes_the_hint_from_an_error_response_too() -> None:
+    """A 429's headers are the most informative ones the system ever sees
+    (D18) — `_request` returns the response rather than raising on a non-2xx,
+    so the hint is available exactly the same way."""
+    async with fx.client_returning(fx.load("groq", "rate_limited")) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+        await adapter._request("POST", "/chat/completions", headers={})
+
+    assert take_hint() is not None
+
+
+async def test_request_publishes_nothing_for_an_adapter_that_declares_no_hint() -> None:
+    """The base class's default `rate_limit_headers` returns `None`; `_request`
+    must not manufacture a hint out of nothing."""
+    async with fx.client_returning(fx.load("groq", "success")) as client:
+        adapter = _BareAdapter(client=client, base_url=BASE_URL)
+        await adapter._request("POST", "/chat/completions", headers={})
+
+    assert take_hint() is None
+
+
+async def test_stream_events_publishes_the_hint_before_the_first_chunk_is_read() -> None:
+    """The opening response's headers are available the moment the connection
+    is made — before a single `data:` line has been parsed — and a stream
+    that goes on to fail mid-generation must not lose them."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "10s",
+            },
+            stream=fx.ScriptedByteStream([b"data: hi\n\n", b"data: [DONE]\n\n"]),
+        )
+
+    async with fx.client_from(handler) as client:
+        adapter = GroqAdapter(client=client, base_url=BASE_URL)
+        await _collect_frames(adapter)
+
+    hint = take_hint()
+    assert hint is not None
+    assert hint.requests_remaining == 5

@@ -101,11 +101,16 @@ Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/
 
 Phase 1 (single-provider proxy) and Phase 2 (multi-provider core, failover, streaming) are done and merged.
 
-**Status:** Steps 1-2 (config surface, `quota/windows.py`) are committed. Steps 3-4 (`quota/tracker.py` +
-`quota/scripts/{reserve,commit,release}.lua`, `quota/lanes.py`) are implemented in the working tree but not
-yet committed. Steps 5-11 (wiring the tracker into both router paths, `QuotaHint` reconciliation, `GET
-/v1/models`, the frontend `ModelPicker`, exact-match cache, our own rate limiting, tests/ADRs/docs/deploy) have
-not started. Full step breakdown: [phase3.md](doc/reference/phase3.md).
+**Status:** Steps 1-5 are committed — **Milestone A** (the router knows: a candidate that cannot be served
+is skipped before the round trip). Config surface, `quota/windows.py`, `quota/tracker.py` +
+`quota/scripts/{reserve,commit,release}.lua`, `quota/lanes.py`, and both router paths (`route`/`route_stream`)
+reserving before each attempt and committing/releasing after. Step 6 (`QuotaHint` reconciliation) is
+implemented in the working tree but not yet committed: a `ContextVar` sink in `providers/base.py`
+(`publish_hint`/`take_hint`) published by `HttpProviderAdapter._request`/`_stream_events` and drained by the
+router after every attempt into `QuotaTracker.apply_hint`, which corrects a counter upward only,
+disambiguating `rpm`/`rpd` and `tpm`/`tpd` by the hint's reported reset duration. Steps 7-11 (rest of
+Milestone B: `GET /v1/models`, the frontend `ModelPicker`; Milestone C: exact-match cache, our own rate
+limiting, tests/ADRs/docs/deploy) have not started. Full step breakdown: [phase3.md](doc/reference/phase3.md).
 
 **Scope:** the router stops guessing and starts knowing. A candidate that cannot be served is skipped before
 the round trip rather than after the 429, `GET /v1/models` reports live status a client can render, identical

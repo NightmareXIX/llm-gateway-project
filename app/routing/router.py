@@ -54,6 +54,7 @@ from app.providers.base import (
     DEFAULT_FIRST_TOKEN_TIMEOUT_S,
     DEFAULT_IDLE_TIMEOUT_S,
     DEFAULT_READ_TIMEOUT_S,
+    take_hint,
 )
 from app.providers.errors import (
     ContextTooLong,
@@ -455,6 +456,7 @@ async def route(
                     # (trap 6) — only the token estimate corrects, down to what
                     # was really generated: nothing, on this path.
                     await quota.commit(reservation, tokens_in=0, tokens_out=0)
+                await _reconcile_hint(quota, spec, scope=scope)
                 last_error = exc
                 last_spec = spec
                 trail.append(
@@ -546,6 +548,7 @@ async def route(
                         tokens_in=completion.usage.tokens_in,
                         tokens_out=completion.usage.tokens_out,
                     )
+                await _reconcile_hint(quota, spec, scope=scope)
                 await breaker.record_success(decision)
                 if metrics is not None:
                     # Successful attempts only — a provider that 429s in 80ms is
@@ -817,6 +820,7 @@ async def route_stream(
                     # (§1.1 step 4, D17 trap 7) — zero here only when nothing was
                     # delivered before the fault, same as the non-streaming path.
                     await quota.commit(reservation, tokens_in=0, tokens_out=wasted)
+                await _reconcile_hint(quota, spec, scope=scope)
                 last_error = exc
                 last_spec = spec
                 trail.append(
@@ -928,6 +932,7 @@ async def route_stream(
                         tokens_in=final_usage.tokens_in,
                         tokens_out=final_usage.tokens_out,
                     )
+                await _reconcile_hint(quota, spec, scope=scope)
                 await breaker.record_success(decision)
                 if metrics is not None:
                     metrics.record(spec.provider, spec.model, STREAM, first_token_ms)
@@ -983,6 +988,23 @@ async def route_stream(
         latency_ms=_elapsed_ms(clock, started),
         wasted_tokens_out=wasted_total,
     )
+
+
+async def _reconcile_hint(
+    quota: QuotaTracker | None, spec: ModelSpec, *, scope: keys.Scope
+) -> None:
+    """Drain Step 6's contextvar sink after every attempt, success or failure.
+
+    Draining happens unconditionally, even with ``quota`` disabled, because
+    :func:`~app.providers.base.take_hint` clearing on read is what stops a
+    hint from being misattributed to the *next* attempt in the loop (D18) —
+    the next candidate's own response, if any, publishes its own. Applying
+    the hint is what costs a Redis round trip, so that part is skipped
+    outright when there is no tracker to correct.
+    """
+    hint = take_hint()
+    if quota is not None and hint is not None:
+        await quota.apply_hint(spec, scope=scope, hint=hint)
 
 
 def _estimate_discarded_tokens(chars: int) -> int:

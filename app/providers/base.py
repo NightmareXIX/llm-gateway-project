@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Mapping
+from contextvars import ContextVar
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import httpx
@@ -86,6 +87,47 @@ signature to move a decision that belongs to the loop that can act on it."""
 
 DEFAULT_WRITE_TIMEOUT_S = 10.0
 DEFAULT_POOL_TIMEOUT_S = 5.0
+
+_quota_hint_var: ContextVar[QuotaHint | None] = ContextVar("quota_hint", default=None)
+"""Phase 3 Step 6 (D18): the sink that gets a `QuotaHint` out of an adapter
+without widening frozen `Completion`.
+
+`complete()` returns a `Completion` and `stream()` yields `StreamChunk`s;
+neither carries the `httpx.Response` a rate-limit header lives on, and Contract
+A is frozen against adding a field to either. A contextvar set by
+:meth:`HttpProviderAdapter._request` (and `_stream_events`) and drained by the
+router immediately after each attempt is per-request by construction — unlike
+instance state on the adapter singleton, which every concurrent request would
+share and race on. The same mechanism already carries `request_id` in
+`app/core/logging.py`.
+"""
+
+
+def publish_hint(hint: QuotaHint | None) -> None:
+    """Record the response just received, for the router to drain.
+
+    Called after every response an adapter's transport layer gets back,
+    success or error — a 429's headers are the most informative ones the
+    system ever sees. `None` (or, by construction, an empty hint — every
+    caller already returns `None` rather than an empty one) writes nothing,
+    so an attempt that published no hint leaves whatever :func:`take_hint`
+    last left behind rather than erasing it; :func:`take_hint` is what
+    actually clears the slate between attempts.
+    """
+    if hint is not None:
+        _quota_hint_var.set(hint)
+
+
+def take_hint() -> QuotaHint | None:
+    """Read and clear, so a hint can never be attributed to the next attempt.
+
+    Called by the router once per attempt, whether it succeeded or failed —
+    there is exactly one response per attempt, so there is at most one hint
+    to drain.
+    """
+    hint = _quota_hint_var.get()
+    _quota_hint_var.set(None)
+    return hint
 
 
 @runtime_checkable
@@ -273,7 +315,7 @@ class HttpProviderAdapter:
         an ``httpx.Response`` at all, so nothing downstream could normalize them.
         """
         try:
-            return await self._client.request(
+            response = await self._client.request(
                 method,
                 self._url(path),
                 headers=headers,
@@ -284,6 +326,12 @@ class HttpProviderAdapter:
             error = self.parse_error(exc, model=model)
             logger.warning("provider.transport_error", **error.log_fields(), path=path)
             raise error from exc
+
+        # Published on a 200 and on a 429 alike (D18) — deciding what the
+        # status means is `parse_error`'s job, not this method's, and the
+        # headers on an error response are frequently the more useful half.
+        publish_hint(self.rate_limit_headers(response))
+        return response
 
     # ---- defaults subclasses may keep ------------------------------------- #
     def parse_error(
@@ -377,6 +425,11 @@ class HttpProviderAdapter:
                 json=json,
                 timeout=self._timeout(timeout_s),
             ) as response:
+                # Same sink as `_request` (D18): a streamed attempt gets
+                # exactly one response object, and its headers are available
+                # the moment the connection opens — before a single chunk is
+                # read, and whether the stream goes on to succeed or fail.
+                publish_hint(self.rate_limit_headers(response))
                 if response.status_code >= 400:
                     await response.aread()
                     error = self.parse_error(response, model=model)

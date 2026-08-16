@@ -36,6 +36,7 @@ a quarter-second per retry test.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import random
 from collections.abc import Iterator
@@ -782,15 +783,47 @@ async def test_a_successful_attempt_commits_the_real_token_count(
     redis_client: FakeRedis,
 ) -> None:
     """Success corrects the reservation's estimate to the truth, in either
-    direction — asserted against the real counter a Lua script wrote."""
+    direction — asserted against the real counter a Lua script wrote.
+
+    Stripped of its rate-limit headers so Step 6's hint reconciliation makes
+    no further correction here; that effect is the next test's whole point,
+    and conflating the two would leave neither cleanly isolated.
+    """
+    fixture = provider_fixtures.load(PROVIDER, "success")
+    handler = provider_fixtures.ScriptedHandler(dataclasses.replace(fixture, headers={}))
+
+    await drive(handler, breaker, history, quota=quota)
+
+    used = await redis_client.get(keys.quota(keys.SYSTEM_SCOPE, PROVIDER, "model-a", "tpm"))
+    expected = fixture.body["usage"]["total_tokens"]  # type: ignore[index]
+    assert used == str(expected)
+
+
+async def test_a_quota_hint_corrects_the_counter_past_what_commit_wrote(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    quota: QuotaTracker,
+    redis_client: FakeRedis,
+) -> None:
+    """D18, end to end. The `success` fixture's own
+    `x-ratelimit-remaining-tokens` header describes far more cumulative usage
+    (other requests against the same real Groq window) than the 75 tokens
+    this one call generated — the case a hint exists to fix: the local
+    tracker undercounted, and Groq's own number is allowed to move the
+    counter up past what the reservation lifecycle alone would ever write.
+    """
     handler = scripted("success")
 
     await drive(handler, breaker, history, quota=quota)
 
     used = await redis_client.get(keys.quota(keys.SYSTEM_SCOPE, PROVIDER, "model-a", "tpm"))
     fixture = provider_fixtures.load(PROVIDER, "success")
-    expected = fixture.body["usage"]["total_tokens"]  # type: ignore[index]
-    assert used == str(expected)
+    committed = int(fixture.body["usage"]["total_tokens"])  # type: ignore[index]
+    remaining = int(fixture.headers["x-ratelimit-remaining-tokens"])
+    hinted = 100_000 - remaining  # `_quota_limits`'s `tpm`, headroom off
+
+    assert hinted > committed
+    assert used == str(hinted)
 
 
 async def test_a_mid_stream_abort_commits_the_tokens_it_really_generated(
