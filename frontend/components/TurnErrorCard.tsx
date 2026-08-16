@@ -8,18 +8,30 @@ import { Button } from "./ui/Button";
 /**
  * A failed send, shown in the transcript where the answer would have been.
  *
- * Two things it must not do. It must not swallow the user's text — that is
- * echoed above it, and the message itself is already stored server-side, since
- * the gateway persists the inbound turn before calling the provider. And it
- * must not hide the `request_id`: the error envelope carries one on every
- * failure precisely so a user report maps to a log line.
+ * Two things it must not do. It must not swallow the user's text — that is shown
+ * above it as a stored row, since the gateway persists the inbound turn before
+ * calling the provider. And it must not hide the `request_id`: the error envelope
+ * carries one on every failure precisely so a user report maps to a log line.
+ *
+ * Since Step 11 it also carries the salvage offer. When a stream burns through
+ * every candidate mid-generation, `done` hands over the longest buffer any of
+ * them managed as `partial_content` — and note what the gateway does *not* do
+ * with it: invariant 4 says an unfinished generation is an error rather than a
+ * stored message, so nothing was written and the fragment exists only here. It
+ * is offered rather than pinned into the transcript, because a fragment nobody
+ * finished should not silently take the shape of an answer.
  */
 export function TurnErrorCard({
   error,
+  partial,
+  onKeep,
   onRetry,
   onDismiss,
 }: {
   error: GatewayError | NetworkError | undefined;
+  /** The longest buffer a failed stream produced, if it was worth keeping. */
+  partial?: string;
+  onKeep?: () => void;
   onRetry: () => void;
   onDismiss: () => void;
 }) {
@@ -41,10 +53,28 @@ export function TurnErrorCard({
         </p>
       )}
 
+      {partial && (
+        <div className="mt-3 rounded-card border border-dashed border-strong bg-sunken/60 p-3">
+          <p className="text-[0.6875rem] font-medium uppercase tracking-wide text-ink-tertiary">
+            Partial answer
+          </p>
+          <p className="prose-answer mt-1.5 text-sm text-ink-secondary">{partial}</p>
+          <p className="mt-2 text-[0.6875rem] text-ink-tertiary">
+            Generated before the last provider gave up. Keeping it puts it on screen for this
+            session only — nothing incomplete is written to your history.
+          </p>
+        </div>
+      )}
+
       <div className="mt-3 flex items-center gap-2">
         <Button size="sm" variant="secondary" onClick={onRetry}>
           Try again
         </Button>
+        {partial && onKeep && (
+          <Button size="sm" variant="ghost" onClick={onKeep}>
+            Keep partial answer
+          </Button>
+        )}
         <Button size="sm" variant="ghost" onClick={onDismiss}>
           Dismiss
         </Button>

@@ -1,39 +1,111 @@
 "use client";
 
+import type { PendingTurn as PendingTurnState } from "@/lib/hooks";
+import { modelLabel } from "@/lib/models";
+import { restartReason } from "@/lib/provenance";
+import { ModelIndicator } from "./ModelIndicator";
+
 /**
- * The two rows shown while a message is in flight.
+ * The turn in flight.
  *
  * The user's own text is echoed immediately and dimmed — it has not been
  * acknowledged by the server yet, and pretending otherwise is how an optimistic
- * UI lies. The thinking row is a real waiting affordance: Phase 1 has no
- * streaming, so a Groq answer arrives all at once after a few seconds of
- * nothing, and that silence needs to be filled by something other than a frozen
- * screen.
+ * UI lies.
+ *
+ * Below it, the answer as it is being written. **This component renders
+ * `pending.answer` and nothing else**, which is what makes §1.1's client-side
+ * restart contract structurally true rather than merely intended: the hook
+ * clears that string on `restart`, so there is no code path here that could
+ * splice one attempt onto another even if someone tried. What the user sees is a
+ * bubble that empties, an indicator that changes model, and an answer that starts
+ * over — a deliberate product behaviour rather than a glitch.
+ *
+ * The thinking dots are still a real state and not a legacy of Phase 1: D13 says
+ * the gateway sends no byte at all until a provider produces its first token, so
+ * the silence before `meta` is genuine and can last seconds.
  */
-export function PendingTurn({ text }: { text: string }) {
+export function PendingTurn({ pending }: { pending: PendingTurnState }) {
+  const restart = pending.restarts.at(-1);
+
   return (
     <>
-      <article className="flex justify-end opacity-60" aria-label="Your message, sending">
+      <article className="flex justify-end opacity-60" aria-label="Your message">
         <div className="max-w-[min(42rem,85%)] rounded-card rounded-br-sm border border-subtle bg-raised px-4 py-3">
-          <p className="prose-answer text-[0.9375rem] text-ink">{text}</p>
-          <p className="mt-1.5 text-right text-[0.6875rem] text-ink-tertiary">Sending…</p>
+          <p className="prose-answer text-[0.9375rem] text-ink">{pending.text}</p>
+          {/* Dropped once tokens are arriving: by then the message has provably
+              landed, and a label still claiming otherwise is just wrong. */}
+          {pending.status === "sending" && (
+            <p className="mt-1.5 text-right text-[0.6875rem] text-ink-tertiary">Sending…</p>
+          )}
         </div>
       </article>
 
-      <article className="max-w-[46rem]" aria-label="Waiting for the model">
-        <span className="inline-flex items-center gap-2 text-sm text-ink-tertiary">
-          <span aria-hidden className="flex items-center gap-1">
-            {[0, 1, 2].map((dot) => (
-              <span
-                key={dot}
-                className="size-1.5 rounded-full bg-ink-tertiary [animation:thinking-pulse_1.2s_ease-in-out_infinite]"
-                style={{ animationDelay: `${dot * 160}ms` }}
-              />
-            ))}
-          </span>
-          Thinking
-        </span>
-      </article>
+      {pending.status === "sending" ? (
+        <Thinking />
+      ) : (
+        <article
+          className="max-w-[46rem]"
+          aria-label="Model response"
+          // Opted out of the transcript's polite live region while it is being
+          // written: a region that re-announces on every delta reads a half
+          // sentence aloud ten times a second. The stored row that replaces this
+          // one rejoins the region, so the finished answer is still announced.
+          aria-live={pending.status === "streaming" ? "off" : "polite"}
+          aria-busy={pending.status === "streaming" || undefined}
+        >
+          {/* Disclosure, not decoration: the answer above was thrown away and this
+              one started from nothing, and a user who scrolled away deserves to
+              know why the text changed under them. */}
+          {restart && (
+            <p className="mb-2 text-xs text-warn">
+              Restarted on {modelLabel(restart.next.model)} — {restartReason(restart.reason)}
+            </p>
+          )}
+
+          <div className="prose-answer text-[0.9375rem] text-ink">
+            <p>
+              {pending.answer}
+              {pending.status === "streaming" && (
+                <span
+                  aria-hidden
+                  className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[0.15em] bg-accent [animation:thinking-pulse_1.1s_ease-in-out_infinite]"
+                />
+              )}
+            </p>
+          </div>
+
+          {pending.provenance && (
+            <ModelIndicator provenance={pending.provenance} className="mt-2.5" />
+          )}
+
+          {pending.status === "unsaved" && (
+            <p className="mt-2 text-xs text-ink-tertiary">
+              Not saved — this answer was cut short, so the gateway stored no message for it and it
+              will not survive a refresh.
+            </p>
+          )}
+        </article>
+      )}
     </>
   );
 }
+
+function Thinking() {
+  return (
+    <article className="max-w-[46rem]" aria-label="Waiting for the model">
+      <span className="inline-flex items-center gap-2 text-sm text-ink-tertiary">
+        <span aria-hidden className="flex items-center gap-1">
+          {[0, 1, 2].map((dot) => (
+            <span
+              key={dot}
+              className="size-1.5 rounded-full bg-ink-tertiary [animation:thinking-pulse_1.2s_ease-in-out_infinite]"
+              style={{ animationDelay: `${dot * 160}ms` }}
+            />
+          ))}
+        </span>
+        Thinking
+      </span>
+    </article>
+  );
+}
+

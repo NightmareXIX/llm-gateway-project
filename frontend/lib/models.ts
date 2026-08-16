@@ -17,9 +17,17 @@ const PROVIDER_LABELS: Record<string, string> = {
 };
 
 const MODEL_LABELS: Record<string, string> = {
-  // config/providers.yaml, slot `general` and `fast`
+  // config/providers.yaml, slots `general` and `fast` — three candidates each
+  // since Phase 2 Step 6, which is when substitution became something a user can
+  // actually see under a message.
   "llama-3.3-70b-versatile": "Llama 3.3 70B",
   "llama-3.1-8b-instant": "Llama 3.1 8B",
+  "gemini-3.6-flash": "Gemini 3.6 Flash",
+  "gemini-3.5-flash-lite": "Gemini 3.5 Flash Lite",
+  // The `:free` suffix is load-bearing on the wire (dropping it routes to the
+  // paid variant) and noise on screen, so it is dropped here and only here.
+  "nvidia/nemotron-3-super-120b-a12b:free": "Nemotron 3 Super 120B",
+  "openai/gpt-oss-20b:free": "GPT-OSS 20B",
 };
 
 export function providerLabel(provider: string): string {

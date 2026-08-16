@@ -20,7 +20,8 @@ import { MessageList, MessageListSkeleton } from "./MessageList";
  */
 export function ConversationView({ conversationId }: { conversationId: string }) {
   const { conversation, error, isLoading, mutate } = useConversation(conversationId);
-  const { pending, send, retry, dismiss } = useSendMessage(conversationId);
+  const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(conversationId);
+  const busy = pending?.status === "sending" || pending?.status === "streaming";
 
   if (isLoading && !conversation) {
     return (
@@ -79,11 +80,12 @@ export function ConversationView({ conversationId }: { conversationId: string })
             pending={pending}
             onRetry={retry}
             onDismiss={dismiss}
+            onKeepPartial={keepPartial}
           />
         )}
       </div>
 
-      <Composer onSend={send} pending={pending?.status === "sending"} autoFocus />
+      <Composer onSend={send} onStop={stop} pending={busy} autoFocus />
     </div>
   );
 }

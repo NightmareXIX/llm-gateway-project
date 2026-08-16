@@ -15,7 +15,14 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { ModelIndicator } from "@/components/ModelIndicator";
-import { fromCompletion, fromMessageMeta, type Provenance } from "@/lib/provenance";
+import {
+  buildAttemptTrail,
+  fromCompletion,
+  fromDoneEvent,
+  fromMessageMeta,
+  type Provenance,
+} from "@/lib/provenance";
+import type { DoneEvent, MetaEvent, RestartEvent } from "@/lib/sse";
 import type { ChatCompletionResponse, MessageMeta } from "@/lib/types";
 
 const BASE: Provenance = {
@@ -176,5 +183,60 @@ describe("provenance adapters", () => {
     // The two sources must agree: a message rendered from the response and the
     // same message rendered from history after a refresh have to look identical.
     expect(fromCompletion(response)).toEqual(fromMessageMeta(meta));
+  });
+});
+
+describe("a restarted stream, end to end", () => {
+  // The case the whole phase exists for, rendered the way a user sees it: Groq
+  // died mid-sentence, Gemini finished the answer, and the chip has to say so.
+  // Nothing in `ModelIndicator` was changed to make this work — the events go
+  // through `provenance.ts` and come out as the props it has always taken, which
+  // is the check that the Phase 1 contract really was frozen.
+  const meta: MetaEvent = {
+    attempt: 1,
+    slot: "fast",
+    provider: "groq",
+    model: "llama-3.1-8b-instant",
+    requested_slot: "fast",
+    conversation_id: "8b0d1f6e-0000-4000-8000-000000000000",
+    message_id: "8b0d1f6e-0000-4000-8000-000000000001",
+  };
+
+  const restart: RestartEvent = {
+    reason: "provider_unavailable",
+    failed: { provider: "groq", model: "llama-3.1-8b-instant" },
+    next: { slot: "general", provider: "gemini", model: "gemini-3.6-flash" },
+    attempt: 2,
+    discarded_chars: 412,
+  };
+
+  const done: DoneEvent = {
+    served_by: { slot: "general", provider: "gemini", model: "gemini-3.6-flash" },
+    requested_slot: "fast",
+    substituted: true,
+    attempts: 2,
+    usage: {
+      prompt_tokens: 812,
+      completion_tokens: 340,
+      total_tokens: 1152,
+      estimated: false,
+      wasted_tokens_out: 96,
+    },
+    degraded: false,
+    status: "ok",
+  };
+
+  it("names the model that finished, the slot that failed, and the trail", () => {
+    render(
+      <ModelIndicator
+        provenance={fromDoneEvent(done, buildAttemptTrail(meta, [restart], "ok"))}
+      />,
+    );
+
+    expect(screen.getByText("Gemini 3.6 Flash")).toBeInTheDocument();
+    expect(screen.getByText("fast was unavailable")).toBeInTheDocument();
+    expect(screen.getByText("2 attempts")).toBeInTheDocument();
+    // The trail, without a pointer: the attempt that died and why.
+    expect(screen.getByText(/provider unavailable/)).toBeInTheDocument();
   });
 });

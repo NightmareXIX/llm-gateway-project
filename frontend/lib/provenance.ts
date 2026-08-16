@@ -8,13 +8,16 @@
  *   - a fresh completion response          → `fromCompletion`    (Phase 1)
  *   - a stream's `done` event              → `fromDoneEvent`     (Phase 2)
  *
- * The first two ship now. The third is why the component's contract can be
- * frozen today: adding it is a function in this file, not a change to the
- * component or to any of its callers.
+ * The third landed in Step 11 and cost exactly what Phase 1 predicted it would:
+ * one function here, and not a line in `ModelIndicator` or in any of its callers.
+ * `fromMetaEvent` is the one thing the original note did not anticipate — a
+ * half-written bubble still needs something under it, and `done` has not arrived
+ * yet.
  *
  * §1.1 and §2.2.2 of doc/reference/contracts-and-phase1.md are the spec.
  */
 
+import type { DoneEvent, MetaEvent, RestartEvent } from "./sse";
 import type { ChatCompletionResponse, Message, MessageMeta, ServedBy } from "./types";
 
 /** One provider attempt, for the `attempts > 1` trail. Phase 2 populates it. */
@@ -98,3 +101,134 @@ export function fromCompletion(response: ChatCompletionResponse): Provenance {
     wastedTokensOut: 0,
   };
 }
+
+/**
+ * A stream's `done` event → `Provenance`.
+ *
+ * Near-identical to `fromCompletion`, and that is the contract paying out rather
+ * than duplication: `DoneEvent` was defined to be structurally the non-streaming
+ * response's provenance block precisely so that a streamed answer and a stored
+ * one render through the same component with the same props. A test asserts the
+ * two produce an equal object from the same facts.
+ *
+ * The trail is passed in because `done` does not carry one — see
+ * `buildAttemptTrail`.
+ */
+export function fromDoneEvent(done: DoneEvent, attemptTrail?: Attempt[]): Provenance {
+  return {
+    servedBy: done.served_by,
+    requestedSlot: done.requested_slot,
+    substituted: done.substituted,
+    attempts: done.attempts,
+    degraded: done.degraded,
+    tokensIn: done.usage.prompt_tokens,
+    tokensOut: done.usage.completion_tokens,
+    // The one number `fromCompletion` can never have: tokens a discarded attempt
+    // really generated and the free tier really charged for.
+    wastedTokensOut: done.usage.wasted_tokens_out ?? 0,
+    attemptTrail,
+  };
+}
+
+/**
+ * A stream's `meta` event → `Provenance`, mid-flight.
+ *
+ * Everything here is provisional and gets overwritten by `fromDoneEvent` the
+ * moment the stream ends. It exists because the indicator sits *under* the
+ * bubble while the bubble is still being written, and rendering nothing there
+ * until `done` would mean the model name appears only after the answer is
+ * complete — turning the disclosure into a footnote.
+ *
+ * `substituted` is computed rather than read: `meta` carries the two slots but
+ * not the verdict. This mirrors `selection.is_substitution` server-side —
+ * resolving `auto` is not a substitution, because nothing was overridden.
+ */
+export function fromMetaEvent(meta: MetaEvent): Provenance {
+  return {
+    servedBy: { slot: meta.slot, provider: meta.provider, model: meta.model },
+    requestedSlot: meta.requested_slot,
+    substituted: meta.requested_slot !== "auto" && meta.requested_slot !== meta.slot,
+    attempts: meta.attempt,
+    degraded: false,
+    // Unknown until `done`. Null rather than 0: the indicator renders a token
+    // count it is given, and "0 in · 0 out" under a streaming answer is a lie.
+    tokensIn: null,
+    tokensOut: null,
+    wastedTokensOut: 0,
+  };
+}
+
+/**
+ * The attempt trail, assembled from what the client watched happen.
+ *
+ * This is the only place the trail can come from on this side of the wire.
+ * `done` carries a count and no history, and a stored `MessageMeta` carries the
+ * same — the full record lives in the `requests` row, which the chat UI has no
+ * endpoint for (that is Phase 7's dashboard). So the trail is built from the
+ * `meta` and `restart` events actually observed during *this* stream.
+ *
+ * The consequence, worth knowing rather than papering over: a candidate that
+ * failed before producing a single token restarts silently, so it never appears
+ * here even though it counts toward `done.attempts`. The indicator falls back to
+ * the count when the trail is shorter, which is why `AttemptTrail` was written to
+ * degrade to a count in the first place.
+ */
+export function buildAttemptTrail(
+  meta: MetaEvent | null,
+  restarts: RestartEvent[],
+  status: "ok" | "failed",
+): Attempt[] {
+  if (!meta) return [];
+
+  const trail: Attempt[] = [];
+  let current: Attempt = {
+    attempt: meta.attempt,
+    provider: meta.provider,
+    model: meta.model,
+    slot: meta.slot,
+    outcome: "failed",
+  };
+
+  for (const restart of restarts) {
+    // A restart names what died and what takes over: it closes the open attempt
+    // and opens the next one.
+    trail.push({ ...current, outcome: "failed", reason: restartReason(restart.reason) });
+    current = {
+      attempt: restart.attempt,
+      provider: restart.next.provider,
+      model: restart.next.model,
+      slot: restart.next.slot,
+      outcome: "failed",
+    };
+  }
+
+  trail.push(
+    status === "ok"
+      ? { ...current, outcome: "served" }
+      : { ...current, outcome: "failed", reason: "no providers left to try" },
+  );
+
+  return trail;
+}
+
+/**
+ * A normalized error code → something a person can read.
+ *
+ * The codes come off `ProviderError.code`, so the map is the normalized error
+ * hierarchy and nothing else — provider-specific strings die inside
+ * `parse_error` and never reach a browser. An unmapped code falls through to
+ * itself rather than to "unknown", the same rule `models.ts` follows.
+ */
+export function restartReason(code: string): string {
+  return RESTART_REASONS[code] ?? code.replace(/_/g, " ");
+}
+
+const RESTART_REASONS: Record<string, string> = {
+  // app/providers/errors.py, the `code` class attribute on each normalized class.
+  // Only the failover-eligible ones can ever appear on a restart; the rest are
+  // terminal by their own flags and end the stream instead.
+  rate_limited: "rate limited",
+  provider_unavailable: "provider unavailable",
+  provider_auth_failed: "provider rejected our key",
+  empty_response: "returned nothing usable",
+};

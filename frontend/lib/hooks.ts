@@ -1,18 +1,14 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import useSWR, { mutate as globalMutate } from "swr";
 
 import { GatewayError, NetworkError, api, swrFetcher } from "./api";
 import { deriveTitle } from "./format";
-import type {
-  ChatCompletionResponse,
-  Conversation,
-  ConversationDetail,
-  Me,
-  Message,
-} from "./types";
+import { buildAttemptTrail, fromDoneEvent, fromMetaEvent, type Provenance } from "./provenance";
+import { openCompletionStream, type DoneEvent, type MetaEvent, type RestartEvent } from "./sse";
+import type { Conversation, ConversationDetail, Me, Message, MessageMeta } from "./types";
 
 export const CONVERSATIONS_KEY = "/v1/conversations";
 export const conversationKey = (id: string) => `/v1/conversations/${id}`;
@@ -48,85 +44,265 @@ export function useConversation(id: string | null) {
   return { conversation: data, error, isLoading, mutate };
 }
 
-/** What the composer area is currently doing. */
+/**
+ * The turn currently in flight, and everything on screen because of it.
+ *
+ * The four statuses are four different things to render, not four flavours of
+ * "busy":
+ *
+ * - `sending`   — the request is out, nothing has come back. Thinking dots. The
+ *                 gateway sends no byte at all until a provider produces its
+ *                 first token (D13), so this state is real and can last seconds.
+ * - `streaming` — `meta` has landed and deltas are arriving. A live bubble.
+ * - `unsaved`   — the user stopped it, or kept a failed stream's partial. There
+ *                 is text on screen and no row behind it, and saying so is the
+ *                 honest option.
+ * - `failed`    — no answer. Error card, with the partial offered if there is one.
+ */
 export type PendingTurn = {
   text: string;
-  status: "sending" | "failed";
+  status: "sending" | "streaming" | "unsaved" | "failed";
+  /**
+   * The **current attempt's** text. Cleared on every `restart`, never appended
+   * across one: splicing half an answer from one model onto a full answer from
+   * another reads as a broken model rather than as a client bug (§1.1).
+   */
+  answer: string;
+  /** Who is answering *right now* — from `meta`, swapped on `restart`, finalized by `done`. */
+  provenance: Provenance | null;
+  /** Every restart this turn has been through. Drives the notice and the trail. */
+  restarts: RestartEvent[];
+  /** A failed stream's salvageable text, until the user keeps or discards it. */
+  partial?: string;
   error?: GatewayError | NetworkError;
 };
 
 /**
- * The send path: optimistic user turn, a thinking row, and an honest failure.
+ * The send path: a live streamed turn, an optimistic transcript, honest failure.
  *
- * The optimistic messages are built from the completion response rather than
- * waiting on a refetch, so the answer appears the instant it arrives; SWR then
- * revalidates in the background and the local rows are replaced by the stored
- * ones. On failure the transcript is revalidated too — the gateway persists the
- * user's message *before* calling the provider, so the stored history is the
- * truth and the UI should show it rather than a locally invented state.
+ * Streaming is not optional here — the UI always asks for it. The non-streaming
+ * path stays alive in `api.createCompletion` as the documented fallback, but a
+ * second code path in the component tree would be a second place for the
+ * restart contract to be got wrong.
+ *
+ * The ordering that makes this work is a property of the gateway, not luck: the
+ * collector persists *after* the final frame is yielded, so the response body
+ * does not close until the row is written. Revalidating when the stream promise
+ * resolves therefore reads the truth rather than racing it.
  */
 export function useSendMessage(conversationId: string | null) {
   const router = useRouter();
   const [pending, setPending] = useState<PendingTurn | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  // Held outside React state because the handlers need to *read* them, and a
+  // state setter's argument is the only place a component can see the value it
+  // just queued. State is what gets rendered; these are what gets assembled.
+  const metaRef = useRef<MetaEvent | null>(null);
+  const doneRef = useRef<DoneEvent | null>(null);
+  const answerRef = useRef("");
+
+  /**
+   * Clear the previous turn's accumulators.
+   *
+   * A function rather than three inline assignments so that TypeScript's flow
+   * analysis does not narrow every later read of these refs to the `null` it can
+   * see being written — the handlers' writes happen in callbacks it cannot follow.
+   */
+  const resetTurn = useCallback(() => {
+    metaRef.current = null;
+    doneRef.current = null;
+    answerRef.current = "";
+  }, []);
 
   const send = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
 
-      setPending({ text: trimmed, status: "sending" });
+      const controller = new AbortController();
+      abortRef.current = controller;
+      resetTurn();
+
+      setPending({
+        text: trimmed,
+        status: "sending",
+        answer: "",
+        provenance: null,
+        restarts: [],
+      });
 
       try {
-        const response = await api.createCompletion({
-          model: DEFAULT_SLOT,
-          messages: [{ role: "user", content: trimmed }],
-          ...(conversationId ? { conversation_id: conversationId } : {}),
-        });
+        await openCompletionStream(
+          {
+            model: DEFAULT_SLOT,
+            messages: [{ role: "user", content: trimmed }],
+            ...(conversationId ? { conversation_id: conversationId } : {}),
+          },
+          {
+            onMeta: (meta) => {
+              metaRef.current = meta;
+              setPending((current) =>
+                current && { ...current, status: "streaming", provenance: fromMetaEvent(meta) },
+              );
+            },
 
-        const isNewConversation = conversationId === null;
-        const id = response.conversation_id;
+            onDelta: (delta) => {
+              const chunk = delta.choices[0]?.delta.content;
+              if (!chunk) return;
+              answerRef.current += chunk;
+              setPending((current) => current && { ...current, answer: answerRef.current });
+            },
 
-        await applyOptimisticTurn(id, trimmed, response);
-        setPending(null);
+            onRestart: (restart) => {
+              // The contract, in one assignment: `answer: ""`. Not a diff, not a
+              // splice, not a "keep the longer one" heuristic.
+              answerRef.current = "";
+              setPending((current) => {
+                if (!current) return current;
+                const restarts = [...current.restarts, restart];
+                return {
+                  ...current,
+                  answer: "",
+                  restarts,
+                  // The indicator swaps with the bubble, not after it. Both halves
+                  // of "something else is answering now" have to move together or
+                  // the disclosure is briefly wrong.
+                  provenance: current.provenance && {
+                    ...current.provenance,
+                    servedBy: restart.next,
+                    attempts: restart.attempt,
+                    attemptTrail: buildAttemptTrail(metaRef.current, restarts, "ok"),
+                  },
+                };
+              });
+            },
 
-        if (isNewConversation) {
-          // Client-derived title. Phase 1 generates none server-side, so without
-          // this every sidebar row reads "New conversation". Deliberately not
-          // awaited on the critical path — a failed rename must not look like a
-          // failed message.
-          void api
-            .renameConversation(id, deriveTitle(trimmed))
-            .then(() => globalMutate(CONVERSATIONS_KEY))
-            .catch(() => globalMutate(CONVERSATIONS_KEY));
-
-          router.replace(`/chat/${id}`);
-        } else {
-          void globalMutate(CONVERSATIONS_KEY);
-        }
+            onDone: (done) => {
+              doneRef.current = done;
+            },
+          },
+          controller.signal,
+        );
       } catch (error) {
-        setPending({
-          text: trimmed,
-          status: "failed",
-          error: error instanceof Error ? (error as GatewayError | NetworkError) : undefined,
-        });
+        // Two things reach here, and neither is a provider giving up mid-answer:
+        // a pre-stream failure, which D13 keeps as an ordinary error envelope,
+        // and a connection that died before `done`. A *provider* failure with the
+        // stream already open arrives in-band instead, as `done` with
+        // `status: "failed"`, and is handled below.
+        //
+        // The half-written answer goes with it. It was never stored, no model
+        // finished it, and leaving it under an error card would present an
+        // abandoned fragment as a result.
+        setPending((current) =>
+          current
+            ? {
+                ...current,
+                status: "failed",
+                answer: "",
+                error: error instanceof Error ? (error as GatewayError | NetworkError) : undefined,
+              }
+            : current,
+        );
 
         // The user's message did land server-side unless the request never
         // arrived. Re-read rather than guess.
         if (conversationId && !(error instanceof NetworkError)) {
           void globalMutate(conversationKey(conversationId));
         }
+        return;
+      } finally {
+        abortRef.current = null;
+      }
+
+      const meta = metaRef.current;
+      const done = doneRef.current;
+
+      if (controller.signal.aborted) {
+        // Not a failure. The gateway saw the disconnect, stopped the upstream
+        // generation and persisted nothing, so what is on screen is all there is.
+        //
+        // Deliberately no revalidation: the stored history holds the user's turn
+        // and no answer, and pulling it in now would render that turn twice —
+        // once stored, once as this pending echo. The next navigation or refresh
+        // reconciles it, and losing the text then is precisely what "not saved"
+        // was telling the user would happen.
+        setPending((current) => current && { ...current, status: "unsaved" });
+        return;
+      }
+
+      if (!meta || !done || done.status === "failed") {
+        setPending(
+          (current) =>
+            current && {
+              ...current,
+              status: "failed",
+              answer: "",
+              partial: done?.partial_content,
+              provenance:
+                done && meta
+                  ? fromDoneEvent(done, buildAttemptTrail(meta, current.restarts, "failed"))
+                  : current.provenance,
+            },
+        );
+        // A failed stream writes no `messages` row — only a `requests` one — so
+        // revalidating restores the transcript to exactly the user turn the
+        // endpoint committed before any of this started.
+        const id = conversationId ?? meta?.conversation_id;
+        if (id) void globalMutate(conversationKey(id));
+        return;
+      }
+
+      const isNewConversation = conversationId === null;
+      const id = meta.conversation_id;
+
+      await applyOptimisticTurn({
+        conversationId: id,
+        messageId: meta.message_id,
+        userText: trimmed,
+        answer: answerRef.current,
+        done,
+      });
+      setPending(null);
+
+      if (isNewConversation) {
+        // Client-derived title. The gateway generates none, so without this every
+        // sidebar row reads "New conversation". Deliberately not awaited on the
+        // critical path — a failed rename must not look like a failed message.
+        void api
+          .renameConversation(id, deriveTitle(trimmed))
+          .then(() => globalMutate(CONVERSATIONS_KEY))
+          .catch(() => globalMutate(CONVERSATIONS_KEY));
+
+        router.replace(`/chat/${id}`);
+      } else {
+        void globalMutate(CONVERSATIONS_KEY);
       }
     },
-    [conversationId, router],
+    [conversationId, router, resetTurn],
   );
+
+  /** Abort the in-flight stream. Not an error — a person changing their mind. */
+  const stop = useCallback(() => abortRef.current?.abort(), []);
 
   const retry = useCallback(() => {
     if (pending?.status === "failed") void send(pending.text);
   }, [pending, send]);
 
-  const dismiss = useCallback(() => setPending(null), []);
+  /** Pin a failed stream's partial into the transcript, unsaved and labelled so. */
+  const keepPartial = useCallback(() => {
+    setPending((current) =>
+      current?.partial
+        ? { ...current, status: "unsaved", answer: current.partial, partial: undefined }
+        : current,
+    );
+  }, []);
 
-  return { pending, send, retry, dismiss };
+  const dismiss = useCallback(() => {
+    abortRef.current?.abort();
+    setPending(null);
+  }, []);
+
+  return { pending, send, stop, retry, keepPartial, dismiss };
 }
 
 /**
@@ -135,12 +311,26 @@ export function useSendMessage(conversationId: string | null) {
  * For a brand-new conversation there is no cache entry yet, so this also stops
  * the redirect to `/chat/{id}` from flashing a loading skeleton over an answer
  * the user can already see.
+ *
+ * The assistant row carries the **real** `message_id`, promised to the client in
+ * `meta` before the first token and used verbatim by the collector when it writes
+ * the row. So the seeded row and the stored row are the same row, and the
+ * revalidation below replaces it rather than duplicating it — which is why Step 9
+ * minted the id up front instead of correcting a provisional one in `done`.
  */
-async function applyOptimisticTurn(
-  conversationId: string,
-  userText: string,
-  response: ChatCompletionResponse,
-) {
+async function applyOptimisticTurn({
+  conversationId,
+  messageId,
+  userText,
+  answer,
+  done,
+}: {
+  conversationId: string;
+  messageId: string;
+  userText: string;
+  answer: string;
+  done: DoneEvent;
+}) {
   const key = conversationKey(conversationId);
 
   await globalMutate<ConversationDetail>(
@@ -150,7 +340,7 @@ async function applyOptimisticTurn(
       const baseSeq = current?.messages.at(-1)?.seq ?? -1;
 
       const userMessage: Message = {
-        id: `local-${response.message_id}-user`,
+        id: `local-${messageId}-user`,
         seq: baseSeq + 1,
         role: "user",
         content: [{ type: "text", text: userText }],
@@ -159,22 +349,24 @@ async function applyOptimisticTurn(
       };
 
       const assistantMessage: Message = {
-        id: response.message_id,
+        id: messageId,
         seq: baseSeq + 2,
         role: "assistant",
-        content: [{ type: "text", text: response.choices[0]?.message.content ?? "" }],
+        content: [{ type: "text", text: answer }],
+        // Field-for-field what the collector is writing to Postgres for this same
+        // row, so the optimistic render and the render after a refresh agree.
         meta: {
-          provider_used: response.served_by.provider,
-          model_used: response.served_by.model,
-          slot_used: response.served_by.slot,
-          requested_slot: response.requested_slot,
-          substituted: response.substituted,
-          attempts: response.attempts,
-          tokens_in: response.usage.prompt_tokens,
-          tokens_out: response.usage.completion_tokens,
-          wasted_tokens_out: 0,
-          degraded: response.degraded,
-        },
+          provider_used: done.served_by.provider,
+          model_used: done.served_by.model,
+          slot_used: done.served_by.slot,
+          requested_slot: done.requested_slot,
+          substituted: done.substituted,
+          attempts: done.attempts,
+          tokens_in: done.usage.prompt_tokens,
+          tokens_out: done.usage.completion_tokens,
+          wasted_tokens_out: done.usage.wasted_tokens_out ?? 0,
+          degraded: done.degraded,
+        } satisfies Partial<MessageMeta>,
         created_at: now,
       };
 
@@ -185,15 +377,17 @@ async function applyOptimisticTurn(
         : {
             id: conversationId,
             title: null,
-            preferred_slot: response.requested_slot,
+            preferred_slot: done.requested_slot,
             pinned_model: null,
             created_at: now,
             updated_at: now,
             messages,
           };
     },
-    // Revalidate: the local rows carry invented ids and seq numbers, and the
-    // stored ones are authoritative.
+    // Revalidate: the user row's id and both seq numbers are invented here, and
+    // the stored ones are authoritative. Safe to do immediately — the gateway's
+    // collector commits before the response body closes, so the promise this
+    // runs under has already outlived the write.
     { revalidate: true },
   );
 }

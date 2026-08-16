@@ -14,8 +14,12 @@ import { Skeleton } from "./ui/Skeleton";
  *
  * `role="log"` with `aria-live="polite"` so a new answer is announced without
  * interrupting whatever the user is doing — a chat transcript is the textbook
- * case for a log region, and Phase 1's non-streamed answers arrive as one
- * complete addition, which is exactly what a polite live region handles well.
+ * case for a log region.
+ *
+ * Streaming complicates that, and `PendingTurn` handles it: a bubble that grows
+ * by a few characters at a time would have a polite live region re-announcing a
+ * half sentence every hundred milliseconds, so the in-flight answer opts out of
+ * the region while it is being written and rejoins it once it is stored.
  *
  * Auto-scroll is anchored to message count rather than to a scroll event: it
  * follows new turns, and does not fight a user who has scrolled up to re-read
@@ -26,17 +30,22 @@ export function MessageList({
   pending,
   onRetry,
   onDismiss,
+  onKeepPartial,
 }: {
   messages: Message[];
   pending: PendingTurnState | null;
   onRetry: () => void;
   onDismiss: () => void;
+  onKeepPartial?: () => void;
 }) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Follows the answer as it streams, not only as turns are added — but on
+  // `restarts.length` rather than on every delta, so a long answer does not fight
+  // a user who has scrolled up to re-read something while it is still writing.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, pending?.status]);
+  }, [messages.length, pending?.status, pending?.restarts.length]);
 
   return (
     <div className="mx-auto flex w-full max-w-[46rem] flex-col gap-6 px-4 py-6">
@@ -45,10 +54,19 @@ export function MessageList({
           <MessageTurn key={message.id} message={message} />
         ))}
 
-        {pending?.status === "sending" && <PendingTurn text={pending.text} />}
+        {/* Not on `failed`: that branch revalidates the transcript, so the user's
+            message is already above as a stored row and echoing it again would
+            show it twice. */}
+        {pending && pending.status !== "failed" && <PendingTurn pending={pending} />}
 
         {pending?.status === "failed" && (
-          <TurnErrorCard error={pending.error} onRetry={onRetry} onDismiss={onDismiss} />
+          <TurnErrorCard
+            error={pending.error}
+            partial={pending.partial}
+            onKeep={onKeepPartial}
+            onRetry={onRetry}
+            onDismiss={onDismiss}
+          />
         )}
       </div>
 

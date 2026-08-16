@@ -1,8 +1,10 @@
-# Frontend — Phase 1
+# Frontend
 
 Next.js (App Router) + Tailwind v4 + the Supabase JS client, talking to the FastAPI gateway.
-This is Step 9 of Phase 1: a login page, a conversation sidebar, a message view with a composer,
-and `ModelIndicator` — nothing else.
+Phase 1 Step 9 built it: a login page, a conversation sidebar, a message view with a composer, and
+`ModelIndicator`. Phase 2 Step 11 made it stream — `lib/sse.ts` reads §1.1's event protocol, answers
+arrive token by token, and a provider dying mid-sentence clears the bubble and starts over on
+another model.
 
 ## Running it
 
@@ -22,7 +24,7 @@ against that project's JWKS.
 | `npm run build` | Production build |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run lint` | ESLint |
-| `npm test` | Vitest — the `ModelIndicator` contract suite |
+| `npm test` | Vitest — the `ModelIndicator` contract, the SSE frame parser, the streaming send path |
 
 ## How it talks to the gateway
 
@@ -43,14 +45,34 @@ and this component implements all four rules now even though Phase 1 can only ex
 4. `degraded` → say the answer was read with local extraction.
 
 It takes one `Provenance` object. `lib/provenance.ts` builds that from a stored message's `meta`
-(`fromMessageMeta`) or from a completion response (`fromCompletion`); Phase 2 adds `fromDoneEvent`
-for the SSE `done` event and touches neither the component nor its callers. `tests/` pins the four
-rules and the agreement between the two adapters — a message must look identical whether it was
-just sent or read back after a refresh.
+(`fromMessageMeta`), from a completion response (`fromCompletion`), or from a stream's `done` event
+(`fromDoneEvent`). The third landed in Phase 2 and cost exactly what Phase 1 predicted: one function
+in that file, and not a line in the component or in any of its callers. `tests/` pins the four rules
+and the agreement between the adapters — a message must look identical whether it was just streamed,
+just sent, or read back after a refresh.
 
-`lib/sse.ts` declares §1.1's `meta` / `delta` / `restart` / `done` event types and throws from
-`openCompletionStream`. Typed signature, deferred body — the frontend's version of the repo rule
-that a Phase 2+ seam is never a silently-passing stub.
+## Streaming (Phase 2 Step 11)
+
+`lib/sse.ts` implements §1.1's wire protocol. `EventSource` cannot do it — GET-only, and no way to
+set `Authorization` — so the transport is `fetch` + `response.body.getReader()` + a hand-rolled frame
+parser, with the `AbortSignal` wired through so the Stop button really closes the upstream
+connection.
+
+Three behaviours worth knowing, because each of them is a decision rather than an accident:
+
+- **A restart clears the bubble.** On `restart` the hook sets `answer` to `""` and swaps the
+  indicator; `PendingTurn` renders that string and nothing else, so there is no code path that could
+  splice two attempts together. Splicing is the trap here: half an answer from one model welded to a
+  full answer from another reads as a broken *model*, and whoever investigates starts with the
+  provider.
+- **A pre-stream failure is still an error envelope.** The gateway commits to a 200 only once a
+  candidate has produced its first token (D13), so a dead provider pool arrives as an ordinary
+  `GatewayError` with a `request_id` — no special client handling at all. Only genuine mid-stream
+  faults come back in-band, as `done` with `status: "failed"`.
+- **Stopped and partial answers say they are unsaved.** The gateway persists nothing for a client
+  that disconnected, and it writes no `messages` row for a failed stream (invariant 4 — an unfinished
+  generation is an error, not a stored message). So text left on screen in either case is labelled as
+  session-only rather than quietly presented as history.
 
 ## Dependency overrides
 
@@ -66,7 +88,7 @@ are absent here. Phase 1 has no `/v1/models` endpoint, no `POST /v1/files` and n
 a control for a capability the backend lacks is worse than its absence. They arrive with the phases
 that give them something to do.
 
-## Known Phase 1 rough edge
+## Known rough edges
 
 **Retrying a failed send duplicates the user's turn.** The gateway persists the inbound message
 *before* calling the provider (deliberately — a thread that loses what you typed when the provider
@@ -74,6 +96,11 @@ fails is worse than one that shows an error next to it), so a resend appends a s
 invariant 3 tolerates consecutive user messages, so this is legal rather than corrupt, and the error
 card says so plainly instead of producing a confusing transcript. The fix is a backend one: a
 continuation request that carries no new message. Out of scope for Step 9.
+
+**A stopped answer disappears on refresh.** Aborting the stream disconnects the client, and the
+gateway's rule for a disconnect is to stop the upstream generation and persist nothing further — so
+the text stays on screen for the session and no more. The alternative would be storing a message the
+user deliberately interrupted. The UI says which it is rather than letting the reload be a surprise.
 
 **Conversation titles are derived client-side.** `conversations.title` starts null and Phase 1
 generates none, so after the first turn the client `PATCH`es the title to the first ~60 characters

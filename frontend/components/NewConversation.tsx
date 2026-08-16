@@ -15,15 +15,21 @@ import { MessageList } from "./MessageList";
  * `/chat/{id}`, so the answer is on screen before the navigation lands.
  */
 export function NewConversation() {
-  const { pending, send, retry, dismiss } = useSendMessage(null);
-  const busy = pending?.status === "sending";
+  const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(null);
+  const busy = pending?.status === "sending" || pending?.status === "streaming";
   const showTranscript = pending !== null;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto">
         {showTranscript ? (
-          <MessageList messages={[]} pending={pending} onRetry={retry} onDismiss={dismiss} />
+          <MessageList
+            messages={[]}
+            pending={pending}
+            onRetry={retry}
+            onDismiss={dismiss}
+            onKeepPartial={keepPartial}
+          />
         ) : (
           <div className="flex h-full items-center justify-center">
             <EmptyState
@@ -35,7 +41,13 @@ export function NewConversation() {
         )}
       </div>
 
-      <Composer onSend={send} pending={busy} autoFocus placeholder="Start a conversation…" />
+      <Composer
+        onSend={send}
+        onStop={stop}
+        pending={busy}
+        autoFocus
+        placeholder="Start a conversation…"
+      />
     </div>
   );
 }
