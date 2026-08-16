@@ -17,6 +17,20 @@ import { IconButton } from "./ui/IconButton";
  *
  * Height is `100dvh` rather than `100vh`: on mobile the dynamic viewport unit is
  * what keeps the composer above the on-screen keyboard instead of underneath it.
+ *
+ * The root is `relative`, and that one word is load-bearing rather than leftover.
+ * `overflow-hidden` only clips descendants whose containing block is this box or
+ * something inside it; an absolutely positioned descendant with *no* positioned
+ * ancestor resolves against the initial containing block instead, which puts it
+ * outside this clip entirely and lets it contribute to the **document's** scroll
+ * height at its static position. The app is full of such boxes — every
+ * `sr-only` / `VisuallyHidden` span is `position: absolute` — and
+ * `ModelIndicator` renders three per assistant turn, so a long transcript grew
+ * `<html>` to the depth of its last turn (7605px against an 861px viewport in
+ * the repro) and handed the window a real scrollbar. Scrolling it slid this
+ * fixed-height shell up and exposed bare `html` background below the composer.
+ * Positioning the shell makes it the containing block for all of them, so the
+ * clip above finally applies and the document stays exactly one viewport tall.
  */
 export function ChatShell({ children }: { children: ReactNode }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -45,7 +59,7 @@ export function ChatShell({ children }: { children: ReactNode }) {
   }, [drawerOpen]);
 
   return (
-    <div className="flex h-[100dvh] overflow-hidden bg-ground">
+    <div className="relative flex h-[100dvh] overflow-hidden bg-ground">
       <a
         href="#composer"
         className="sr-only rounded-control bg-accent px-3 py-2 text-sm text-accent-ink focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50"

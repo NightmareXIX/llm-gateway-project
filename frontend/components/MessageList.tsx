@@ -36,12 +36,19 @@ import { Skeleton } from "./ui/Skeleton";
  * back down. Setting `scrollTop` on the container this list is actually
  * rendered inside of cannot touch any ancestor's scroll position.
  *
- * The other half of the same bug: once a wheel/trackpad scroll runs the
+ * The second half of the same bug: once a wheel/trackpad scroll runs the
  * container to *its own* scroll limit, the browser chains the leftover delta
  * to the next scrollable ancestor by default — `overflow-hidden` on the shell
  * blocks that ancestor's own scrollbar but not the chaining itself, so the
  * remainder still reached `<html>`. `overscroll-y-contain` on this container
  * (see `ConversationView`/`NewConversation`) stops the chain at its boundary.
+ *
+ * The third and last: neither of those two matters if the document is genuinely
+ * taller than the viewport, and it was — the `VisuallyHidden` spans inside every
+ * `ModelIndicator` are `position: absolute` and, before `ChatShell` was
+ * positioned, resolved against the initial containing block, escaping the
+ * shell's clip and stretching `<html>` to the depth of the last turn. That one
+ * is fixed in `ChatShell`, where the note explaining it lives.
  */
 export function MessageList({
   messages,
