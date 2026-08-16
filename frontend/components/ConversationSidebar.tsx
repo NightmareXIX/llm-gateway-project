@@ -108,7 +108,7 @@ export function ConversationSidebar({ onNavigate }: { onNavigate?: () => void })
         </Button>
       </div>
 
-      <nav aria-label="Conversations" className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+      <nav aria-label="Conversations" className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-2 pb-2">
         {isLoading && <SidebarSkeleton />}
 
         {!isLoading && error && (

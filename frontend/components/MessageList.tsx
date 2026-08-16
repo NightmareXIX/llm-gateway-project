@@ -35,6 +35,13 @@ import { Skeleton } from "./ui/Skeleton";
  * content, leaving unpainted space below the composer once the layout settled
  * back down. Setting `scrollTop` on the container this list is actually
  * rendered inside of cannot touch any ancestor's scroll position.
+ *
+ * The other half of the same bug: once a wheel/trackpad scroll runs the
+ * container to *its own* scroll limit, the browser chains the leftover delta
+ * to the next scrollable ancestor by default — `overflow-hidden` on the shell
+ * blocks that ancestor's own scrollbar but not the chaining itself, so the
+ * remainder still reached `<html>`. `overscroll-y-contain` on this container
+ * (see `ConversationView`/`NewConversation`) stops the chain at its boundary.
  */
 export function MessageList({
   messages,

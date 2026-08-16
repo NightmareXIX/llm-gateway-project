@@ -33,7 +33,7 @@ export function ConversationView({ conversationId }: { conversationId: string })
   if (isLoading && !conversation) {
     return (
       <div className="flex min-h-0 flex-1 flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
           <MessageListSkeleton />
         </div>
         <Composer
@@ -79,7 +79,7 @@ export function ConversationView({ conversationId }: { conversationId: string })
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
         {messages.length === 0 && pending === null ? (
           <div className="flex h-full items-center justify-center">
             <EmptyState

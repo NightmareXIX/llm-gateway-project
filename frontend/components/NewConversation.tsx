@@ -26,7 +26,7 @@ export function NewConversation() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
         {showTranscript ? (
           <MessageList
             messages={[]}
