@@ -281,8 +281,24 @@ class GroqAdapter(HttpProviderAdapter):
                     model=model,
                 ) from exc
 
-            if isinstance(event, dict):
-                yield _stream_chunk_from_event(event)
+            if not isinstance(event, dict):
+                continue
+
+            chunk = _stream_chunk_from_event(event)
+            if chunk.finish_reason == "content_filter":
+                # The streaming twin of `_read_choice`'s refusal branch, and it
+                # has to be here rather than above the adapter: a refusal that
+                # arrived as a finish_reason instead of an error body would
+                # otherwise look like a short answer, and the router — seeing a
+                # stream that stopped — would fail over and shop the same prompt
+                # around until some model agreed to answer it.
+                raise ContentFiltered(
+                    "the model declined to generate a response",
+                    provider=self.name,
+                    model=model,
+                    raw=event,
+                )
+            yield chunk
 
     # ----------------------------------------------------------------- #
     # Normalization

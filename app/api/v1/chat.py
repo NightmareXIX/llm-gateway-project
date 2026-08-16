@@ -28,10 +28,14 @@ model answered everything. Step 5 is where it starts telling the truth.
 from __future__ import annotations
 
 import time
-from uuid import UUID
+from collections.abc import AsyncIterator
+from functools import partial
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.dependency import PrincipalDep
 from app.auth.principal import Principal
@@ -42,13 +46,14 @@ from app.core.logging import get_logger, get_request_id
 from app.db.models import Conversation
 from app.db.repo import conversations as conversations_repo
 from app.db.repo import messages as messages_repo
-from app.deps import BreakerDep, LatencyDep, RegistryDep, SessionDep
+from app.deps import BreakerDep, LatencyDep, RedisDep, RegistryDep, SessionDep, SessionFactoryDep
 from app.memory.canonical import CanonicalMessage, MessageMeta, text_block
 from app.providers.errors import to_app_error
 from app.providers.registry import ProviderRegistry, UnknownSlot
 from app.providers.types import GenParams, ModelSpec
 from app.routing import router as routing
 from app.routing import selection
+from app.routing.circuit_breaker import CircuitBreaker
 from app.schemas.chat import (
     AssistantMessage,
     ChatCompletionRequest,
@@ -58,7 +63,11 @@ from app.schemas.chat import (
     UsageOut,
 )
 from app.schemas.errors import AUTHENTICATED_ERROR_RESPONSES, NOT_FOUND_RESPONSE, ErrorResponse
+from app.streaming import sse
+from app.streaming.collector import Collector
+from app.streaming.orchestrator import stream_completion
 from app.usage import logger as usage_logger
+from app.usage.metrics import LatencyTable
 
 logger = get_logger("app.api.chat")
 
@@ -76,22 +85,23 @@ router = APIRouter(prefix="/v1/chat", tags=["chat"], responses=AUTHENTICATED_ERR
 )
 async def create_chat_completion(
     body: ChatCompletionRequest,
+    request: Request,
     principal: PrincipalDep,
     session: SessionDep,
+    session_factory: SessionFactoryDep,
     registry: RegistryDep,
     breaker: BreakerDep,
     latency: LatencyDep,
-) -> ChatCompletionResponse:
-    """Answer one turn, persisting both halves of it."""
-    if body.stream:
-        # Refused, not downgraded. A client that asked for deltas and received one
-        # blob has no way to distinguish that from a very fast model, and would
-        # ship a streaming UI that silently never streams.
-        raise InvalidRequest(
-            "Streaming is not available yet. Send stream: false.",
-            code="streaming_not_supported",
-        )
+    redis: RedisDep,
+) -> ChatCompletionResponse | StreamingResponse:
+    """Answer one turn, persisting both halves of it.
 
+    ``stream: true`` diverges after the inbound turn is committed — the two
+    paths share everything up to there, which is D14's boundary as much as
+    D13's: the request-scoped ``session`` above persists the user's message and
+    is then let go, exactly as the non-streaming path already did, before either
+    branch calls out to a provider that can legitimately take sixty seconds.
+    """
     # Rejected here rather than inside the router, because only this layer knows
     # the name came off a request body and is therefore a 400. Before the
     # conversation is touched, so a typo'd slot does not open a thread it will
@@ -123,8 +133,24 @@ async def create_chat_completion(
         max_tokens=body.max_tokens,
         top_p=body.top_p,
         stop=list(body.stop),
-        stream=False,
+        stream=body.stream,
     )
+
+    if body.stream:
+        return await _stream_chat_completion(
+            request=request,
+            session=session,
+            body=body,
+            principal=principal,
+            conversation=conversation,
+            history=history,
+            params=params,
+            registry=registry,
+            breaker=breaker,
+            latency=latency,
+            redis=redis,
+            session_factory=session_factory,
+        )
 
     started = time.perf_counter()
     try:
@@ -225,6 +251,93 @@ async def create_chat_completion(
 
 
 # --------------------------------------------------------------------------- #
+# The streaming twin (D13/D14)
+# --------------------------------------------------------------------------- #
+async def _stream_chat_completion(
+    *,
+    request: Request,
+    session: AsyncSession,
+    body: ChatCompletionRequest,
+    principal: Principal,
+    conversation: Conversation,
+    history: list[CanonicalMessage],
+    params: GenParams,
+    registry: ProviderRegistry,
+    breaker: CircuitBreaker,
+    latency: LatencyTable,
+    redis: Redis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> StreamingResponse:
+    """Drive the router loop far enough to know whether anything will be sent,
+    *before* committing to a 200 (D13).
+
+    ``StreamingResponse.__call__`` sends the ASGI ``http.response.start`` — the
+    status line — the instant Starlette starts iterating its body, not when the
+    body first yields. So the only way to keep a fully-down provider pool
+    debuggable as an ordinary JSON error is to prime the generator by hand,
+    outside of Starlette's control, and only construct the ``StreamingResponse``
+    once that first frame — or a :class:`~app.routing.router.RoutingFailed` — is
+    already in hand.
+
+    A pre-first-byte failure is recorded right here, on the request-scoped
+    ``session`` that is still open at this point — the same session and the same
+    :func:`~app.usage.logger.record_failure` the non-streaming path uses, because
+    nothing about this failure is streaming-shaped yet: no candidate ever
+    produced a token. Once a first frame *has* gone out, persistence stops being
+    this function's job at all: the :class:`~app.streaming.collector.Collector`
+    below is the only thing that writes anything from that point on (Step 10),
+    working off a session it opens for itself well after this function has
+    already returned.
+    """
+    message_id = uuid4()
+    started = time.perf_counter()
+    frames = stream_completion(
+        registry=registry,
+        breaker=breaker,
+        history=history,
+        params=params,
+        requested=body.model,
+        conversation_id=conversation.id,
+        message_id=message_id,
+        # D3: a conversation that has made a tool call is locked to one model,
+        # and that outranks both `auto` and a named slot — same rule as the
+        # non-streaming path, just read one step earlier.
+        pinned=conversation.pinned_model,
+        metrics=latency,
+        rank_by_latency=get_settings().ROUTING_LATENCY_RANKING,
+        redis=redis,
+        persistence=Collector(session_factory, principal=principal),
+        is_disconnected=partial(sse.client_disconnected, request),
+    ).__aiter__()
+
+    try:
+        first = await frames.__anext__()
+    except routing.RoutingFailed as failure:
+        # Nothing was ever sent, so the error envelope — and the `requests` row
+        # that explains it — are still ours to give, exactly as the
+        # non-streaming path gives them.
+        await usage_logger.record_failure(
+            session,
+            principal=principal,
+            error=failure.error,
+            requested_slot=body.model,
+            spec=failure.spec,
+            latency_ms=_elapsed_ms(started),
+            conversation_id=conversation.id,
+            attempts=failure.trail,
+        )
+        await session.commit()
+        raise to_app_error(failure.error) from failure
+
+    async def rest() -> AsyncIterator[bytes]:
+        yield first
+        async for chunk in frames:
+            yield chunk
+
+    return StreamingResponse(rest(), media_type=sse.SSE_MEDIA_TYPE, headers=sse.SSE_HEADERS)
+
+
+# --------------------------------------------------------------------------- #
 # Steps, pulled out so the handler above reads as the sequence it is
 # --------------------------------------------------------------------------- #
 async def _resolve_conversation(
@@ -302,8 +415,12 @@ def _is_substitution(requested_slot: str, served_slot: str) -> bool:
     it was computed rather than hardcoded so that Step 5 would inherit the right
     rule instead of a constant someone had to remember to change, and D10's spill
     (ADR-011) is what finally makes it reachable.
+
+    Delegates since Step 9: the streaming orchestrator decides the same thing
+    about the same fields, and two copies of it would let one path disclose a
+    substitution the other hid.
     """
-    return requested_slot != selection.AUTO and requested_slot != served_slot
+    return selection.is_substitution(requested_slot, served_slot)
 
 
 def _elapsed_ms(started: float) -> int:

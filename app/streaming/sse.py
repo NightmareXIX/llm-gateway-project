@@ -129,6 +129,33 @@ class RestartEvent(BaseModel):
     attempt: int
     discarded_chars: int
 
+    @classmethod
+    def of(
+        cls,
+        *,
+        reason: str,
+        failed_provider: str,
+        failed_model: str,
+        next_slot: str,
+        next_provider: str,
+        next_model: str,
+        attempt: int,
+        discarded_chars: int,
+    ) -> RestartEvent:
+        """Build one without reaching for the two private nested shapes.
+
+        They are private because nothing outside this module should have an
+        opinion about how the event nests; the orchestrator has the six flat
+        facts and this turns them into the wire shape.
+        """
+        return cls(
+            reason=reason,
+            failed=_FailedCandidate(provider=failed_provider, model=failed_model),
+            next=_NextCandidate(slot=next_slot, provider=next_provider, model=next_model),
+            attempt=attempt,
+            discarded_chars=discarded_chars,
+        )
+
 
 class StreamUsage(UsageOut):
     """``UsageOut`` plus the one number only a discarded attempt produces.

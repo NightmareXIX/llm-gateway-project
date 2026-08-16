@@ -191,6 +191,47 @@ async def test_stream_events_raises_unavailable_on_an_idle_stall() -> None:
             await _collect_frames(adapter, idle_timeout_s=0.05)
 
 
+async def test_stream_events_keepalive_comments_do_not_reset_the_idle_timer() -> None:
+    """Trap 8. Each individual gap here is under the idle timeout, but nothing
+    but comments arrives, so the deadline — set once and never pushed forward
+    by a keepalive — must still expire.
+
+    OpenRouter's ``: OPENROUTER PROCESSING`` lines are indistinguishable from
+    genuine liveness by byte count alone; the property under test is that they
+    are indistinguishable from *silence* to the idle clock, because that is
+    what a stalled generation dressed up in keepalives actually is.
+
+    The margins are wide (150ms gaps against a 250ms budget, three of them)
+    rather than tight, because Windows' default event-loop timer resolution is
+    coarse enough that a `sleep(0.03)` can silently take closer to 0.05 — a
+    flaky assertion here would look like a regression in the fix it exists to
+    guard.
+    """
+    async with fx.client_streaming(
+        [b": keep\n\n", 0.15, b": keep\n\n", 0.15, b": keep\n\n", 0.15, b"data: [DONE]\n\n"]
+    ) as client:
+        adapter = _BareAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable, match="idle stall"):
+            await _collect_frames(adapter, idle_timeout_s=0.25)
+
+
+async def test_stream_events_a_data_line_does_reset_the_idle_timer() -> None:
+    """The mirror of the test above: real progress, not just a live socket,
+    is what should buy a stalled-looking gap more time. Two 150ms gaps sum to
+    more than the 250ms budget, so this only passes if each `data:` line
+    genuinely pushes the deadline forward rather than the deadline being fixed
+    at the first one."""
+    async with fx.client_streaming(
+        [b"data: a\n\n", 0.15, b"data: b\n\n", 0.15, b"data: [DONE]\n\n"]
+    ) as client:
+        adapter = _BareAdapter(client=client, base_url=BASE_URL)
+
+        frames = await _collect_frames(adapter, idle_timeout_s=0.25)
+
+    assert frames == ["a", "b"]
+
+
 async def test_stream_events_normalizes_a_mid_stream_protocol_error() -> None:
     """A truncated body raises `httpx.RemoteProtocolError` partway through
     iteration; it must come out normalized, not as a bare transport exception."""

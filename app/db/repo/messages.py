@@ -76,11 +76,18 @@ async def append(
     role: Role,
     content: list[ContentBlock],
     meta: MessageMeta | None = None,
+    message_id: UUID | None = None,
 ) -> CanonicalMessage:
     """Add a message to the end of a conversation the caller owns.
 
     Raises :class:`NotFound` when the conversation is not theirs, and
     :class:`InvariantViolation` when the message would break Contract B.
+
+    ``message_id`` lets the caller mint the id *before* the row exists, which the
+    streaming path needs: §1.1's ``meta`` event carries ``message_id`` and is sent
+    with the first token, long before anything is persisted. The alternative — a
+    provisional id corrected in ``done`` — is a client-side bug generator. Left
+    ``None`` everywhere else, so the database keeps assigning it.
 
     The sequence below is four statements inside the caller's transaction, and
     the order is the point:
@@ -112,6 +119,9 @@ async def append(
     validate_append(previous, role=role, seq=seq)
 
     row = Message(
+        # Omitted rather than passed as None when the caller has no id: the column
+        # has a server-side default, and an explicit NULL would defeat it.
+        **({"id": message_id} if message_id is not None else {}),
         conversation_id=conversation_id,
         seq=seq,
         role=role,

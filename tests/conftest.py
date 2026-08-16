@@ -26,6 +26,7 @@ import asyncio
 import base64
 import os
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -70,7 +71,7 @@ from app.cache.client import LuaScriptRegistry
 from app.config import REPO_ROOT, Settings, get_settings
 from app.core.clock import FixedClock
 from app.db.models import ApiKey, Conversation, User
-from app.deps import get_session
+from app.deps import get_session, get_session_factory
 from app.main import create_app
 from app.providers.registry import build_registry
 from app.usage.metrics import LatencyTable
@@ -430,7 +431,22 @@ async def app(
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield db_session
 
+    def _override_session_factory() -> Callable[[], AbstractAsyncContextManager[AsyncSession]]:
+        # The streaming collector (Step 10) opens its own session *after* the
+        # request that returned a `StreamingResponse` has already finished
+        # (D14), so it cannot go through `get_session`'s request-scoped
+        # dependency — it reads `app.state.db_session_factory` directly. This
+        # hands back the same transactional `db_session` every time, exactly
+        # like the override above, so a streamed turn's writes land inside the
+        # same savepoint the rest of the test can see and roll back.
+        @asynccontextmanager
+        async def factory() -> AsyncIterator[AsyncSession]:
+            yield db_session
+
+        return factory
+
     application.dependency_overrides[get_session] = _override_session
+    application.dependency_overrides[get_session_factory] = _override_session_factory
     try:
         yield application
     finally:

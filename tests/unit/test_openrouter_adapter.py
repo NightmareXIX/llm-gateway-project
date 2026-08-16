@@ -485,13 +485,116 @@ def test_the_reset_header_converts_to_seconds_from_now(
 
 
 # --------------------------------------------------------------------------- #
-# The Phase 2 seam
+# stream()
 # --------------------------------------------------------------------------- #
-def test_streaming_raises_on_call_not_on_first_chunk() -> None:
-    """Step 7's job. An `async def` with a `yield` would return a well-formed
-    generator and only fail on the first `__anext__` — deep inside an SSE
-    response, after the headers were already sent."""
-    adapter = _offline()
+async def test_stream_yields_one_chunk_per_frame_and_the_last_carries_usage() -> None:
+    async with fx.client_streaming(
+        [fx.read_sse("openrouter", "stream_success").encode("utf-8")]
+    ) as client:
+        adapter = _adapter(client)
 
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        chunks = [
+            chunk
+            async for chunk in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        ]
+
+    assert len(chunks) == 4
+    full_text = "A gateway sits between a client and several providers."
+    assert "".join(chunk.delta for chunk in chunks) == full_text
+    assert chunks[0].finish_reason is None
+    assert chunks[0].usage is None
+
+    last = chunks[-1]
+    assert last.delta == ""
+    assert last.finish_reason == "stop"
+    assert last.usage is not None
+    assert last.usage.tokens_in == 54
+    assert last.usage.tokens_out == 11
+    assert last.usage.estimated is False
+
+
+async def test_stream_request_carries_a_bearer_token_and_the_attribution_headers() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=fx.read_sse("openrouter", "stream_success"))
+
+    async with fx.client_from(handler) as client:
+        adapter = _adapter(client)
+        async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+            pass
+
+    assert requests[0].url.path.endswith("/chat/completions")
+    assert requests[0].headers["authorization"] == f"Bearer {KEY}"
+    for name, value in OPTIONS.items():
+        assert requests[0].headers[name] == value
+
+
+async def test_stream_keepalive_comments_are_skipped_not_yielded_as_empty_deltas() -> None:
+    """The fixture carries a real ``: OPENROUTER PROCESSING`` line between two
+    data frames — this is the integration-level twin of base.py's idle-timer
+    unit test, proving the comment never reaches the adapter as a chunk at all."""
+    async with fx.client_streaming(
+        [fx.read_sse("openrouter", "stream_success").encode("utf-8")]
+    ) as client:
+        adapter = _adapter(client)
+
+        deltas = [
+            chunk.delta
+            async for chunk in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        ]
+
+    # Four data frames in the fixture, one keepalive comment between the first
+    # two. A comment that leaked through as a chunk would make this five.
+    assert len(deltas) == 4
+    assert all("PROCESSING" not in delta for delta in deltas)
+
+
+async def test_a_200_bodied_error_mid_stream_is_classified_not_treated_as_a_delta() -> None:
+    """OpenRouter's 200-with-an-error-object quirk, on the streaming path — the
+    same ladder :meth:`_classify` runs for the non-streaming twin."""
+    frame = (
+        b'data: {"error":{"code":402,"message":"insufficient credits",'
+        b'"metadata":{}}}\n\n'
+    )
+    async with fx.client_streaming([frame]) as client:
+        adapter = _adapter(client)
+
+        with pytest.raises(RateLimited):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass
+
+
+async def test_a_moderation_refusal_mid_stream_raises_content_filtered() -> None:
+    frames = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"Let me"},"finish_reason":null}]}'
+        b"\n\n"
+        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}\n\n'
+    )
+    async with fx.client_streaming([frames]) as client:
+        adapter = _adapter(client)
+
+        with pytest.raises(ContentFiltered):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass
+
+
+async def test_a_malformed_frame_raises_unavailable_not_a_decode_error() -> None:
+    async with fx.client_streaming([b"data: {not valid json\n\n"]) as client:
+        adapter = _adapter(client)
+
+        with pytest.raises(Unavailable):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass
+
+
+async def test_a_truncated_stream_raises_unavailable() -> None:
+    async with fx.client_streaming(
+        [fx.read_sse("openrouter", "stream_truncated").encode("utf-8")]
+    ) as client:
+        adapter = _adapter(client)
+
+        with pytest.raises(Unavailable):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass

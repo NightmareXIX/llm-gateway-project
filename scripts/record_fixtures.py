@@ -308,6 +308,8 @@ GEMINI = Recipe(
         "finish_reason_safety",
         "success_no_usage",
         "server_error_html",
+        "stream_success.sse",
+        "stream_truncated.sse",
     ),
     extra_notes=(
         "auth_failed (403 PERMISSION_DENIED) needs a key from a project without the "
@@ -334,6 +336,8 @@ OPENROUTER = Recipe(
         "content_filtered",
         "error_body_200",
         "server_error_html",
+        "stream_success.sse",
+        "stream_truncated.sse",
     ),
     extra_notes=(
         "credits_exhausted (402) would mean spending an account down to zero, and "

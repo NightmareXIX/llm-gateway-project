@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Final, Literal
@@ -48,13 +48,17 @@ from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
 from app.memory.canonical import CanonicalMessage
 from app.memory.render import AttachmentResolver, RenderReport, render
-from app.providers.base import DEFAULT_IDLE_TIMEOUT_S, DEFAULT_READ_TIMEOUT_S
-from app.providers.errors import ContextTooLong, ProviderError, Unavailable
+from app.providers.base import (
+    DEFAULT_FIRST_TOKEN_TIMEOUT_S,
+    DEFAULT_IDLE_TIMEOUT_S,
+    DEFAULT_READ_TIMEOUT_S,
+)
+from app.providers.errors import ContextTooLong, EmptyResponse, ProviderError, Unavailable
 from app.providers.registry import ProviderRegistry
-from app.providers.types import Completion, GenParams, ModelSpec, StreamChunk
+from app.providers.types import Completion, GenParams, ModelSpec, Usage
 from app.routing import selection
 from app.routing.circuit_breaker import BreakerState, CircuitBreaker
-from app.usage.metrics import COMPLETE, LatencyTable
+from app.usage.metrics import COMPLETE, STREAM, LatencyTable
 
 logger = get_logger("app.routing.router")
 
@@ -79,6 +83,20 @@ hammering a 429 is how a free-tier key gets banned.
 
 RETRY_BASE_DELAY_S: Final = 0.25
 RETRY_MAX_DELAY_S: Final = 2.0
+
+DISCARDED_CHARS_PER_TOKEN: Final = 4
+"""Characters-over-four, for the tokens a *discarded* streamed attempt generated.
+
+Not ``adapter.estimate_tokens``, which measures a request payload rather than a
+response, and not the provider's own count, because providers almost never
+report usage on a stream they never finished. So this is the only number
+available — and it has to exist, because those tokens were really generated and
+really charged against the free tier's daily budget. Dropping them makes Phase
+3's tracker wrong in exactly the scenario it exists for, and the miscount is
+invisible until a key rate-limits earlier than predicted. Marked
+``estimated=True`` wherever it surfaces; ADR-014's reconciliation cannot recover
+it after the fact.
+"""
 
 type AttemptOutcome = Literal["ok", "error", "skipped_breaker"]
 
@@ -152,6 +170,82 @@ class RouterOutcome:
     candidates — what the user waited, not what the winning attempt took."""
 
 
+# --------------------------------------------------------------------------- #
+# What the streaming loop yields
+# --------------------------------------------------------------------------- #
+# Deltas alone would not do. `router.py`'s job on the streaming path is the same
+# bookkeeping as on the other one — which candidate, which attempt, what was
+# thrown away — and an orchestrator that had to infer attempt boundaries from a
+# gap in the deltas would end up keeping a second copy of it. These four events
+# are that bookkeeping made explicit, and they are deliberately *not* SSE: the
+# wire format is `streaming/sse.py`'s, and this module knows nothing about HTTP.
+@dataclass(frozen=True, slots=True)
+class AttemptStarted:
+    """A request is about to leave the process. Nothing has been received yet.
+
+    Not "something will be streamed" — this attempt may fail before its first
+    chunk, which is the ordinary case D13 keeps off the wire entirely. An
+    orchestrator must therefore treat this as bookkeeping, never as a cue to
+    emit anything to a client.
+    """
+
+    attempt: int
+    spec: ModelSpec
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptDelta:
+    """One piece of generated text, from the attempt most recently started."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptAborted:
+    """An attempt failed. Emitted whether or not it had produced any text.
+
+    ``discarded_chars`` is the difference that matters: zero means nothing ever
+    reached the client and the failover is invisible (D13), non-zero means a
+    partial answer is on screen and has to be explicitly withdrawn (D1).
+    """
+
+    attempt: int
+    spec: ModelSpec
+    error: ProviderError
+    discarded_chars: int
+    wasted_tokens_out: int
+
+
+@dataclass(frozen=True, slots=True)
+class StreamCompleted:
+    """The terminal event of a successful stream, and the loop's whole report.
+
+    An async generator cannot return a value, so everything :class:`RouterOutcome`
+    carries on the non-streaming path arrives here instead — including the trail,
+    which is the only surviving record of the attempts that were discarded.
+    """
+
+    spec: ModelSpec
+    usage: Usage
+    finish_reason: str
+    report: RenderReport
+
+    trail: tuple[AttemptRecord, ...]
+    attempts: int
+    latency_ms: int
+
+    ttft_ms: int
+    """Time to the *serving* attempt's first token. With streaming this is the
+    number that characterizes a provider; ``latency_ms`` keeps meaning total wall
+    time, which is dominated by how much the model chose to say."""
+
+    wasted_tokens_out: int
+    """Summed across every discarded attempt, not just the last one."""
+
+
+type RouteStreamEvent = AttemptStarted | AttemptDelta | AttemptAborted | StreamCompleted
+
+
 class RoutingFailed(Exception):
     """No candidate served the request. Carries the trail, not just the error.
 
@@ -180,6 +274,7 @@ class RoutingFailed(Exception):
         trail: tuple[AttemptRecord, ...],
         attempts: int,
         latency_ms: int,
+        wasted_tokens_out: int = 0,
     ) -> None:
         self.error = error
         self.spec = spec
@@ -189,6 +284,12 @@ class RoutingFailed(Exception):
         self.trail = trail
         self.attempts = attempts
         self.latency_ms = latency_ms
+
+        self.wasted_tokens_out = wasted_tokens_out
+        """Tokens the discarded streamed attempts really generated. Always 0 on
+        the non-streaming path — a failed ``complete`` produced nothing — and the
+        reason this failure still has a token cost worth recording."""
+
         super().__init__(str(error))
 
 
@@ -417,7 +518,7 @@ async def route(
     )
 
 
-def route_stream(
+async def route_stream(
     *,
     registry: ProviderRegistry,
     breaker: CircuitBreaker,
@@ -430,27 +531,325 @@ def route_stream(
     resolver: AttachmentResolver | None = None,
     timeout_s: float = DEFAULT_READ_TIMEOUT_S,
     idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
+    first_token_timeout_s: float = DEFAULT_FIRST_TOKEN_TIMEOUT_S,
     max_attempts: int = MAX_ATTEMPTS,
     clock: Clock = SYSTEM_CLOCK,
     rng: random.Random | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-) -> AsyncIterator[StreamChunk]:
-    """The streaming twin of :func:`route`. Step 9's orchestrator drives it.
+) -> AsyncGenerator[RouteStreamEvent, None]:
+    """The streaming twin of :func:`route`, and D1's restart machinery underneath.
 
-    Declared now, with the same parameters, so the restart state machine has one
-    obvious place to attach and cannot grow a second copy of the attempt
-    bookkeeping above. The element type is the part Step 9 settles: if the
-    orchestrator turns out to need attempt boundaries in-band rather than deltas
-    alone, it changes *here* rather than in a parallel loop.
+    Typed as an ``AsyncGenerator`` rather than the ``AsyncIterator`` the seam
+    declared, because the orchestrator needs ``aclose()``: a client that leaves
+    mid-generation has to close this loop deterministically rather than when the
+    garbage collector notices, and only the generator type promises that.
 
-    A plain ``def`` that raises, deliberately — an ``async def`` generator would
-    swallow this until the first ``__anext__``, which is a confusing place to
-    discover an unbuilt seam. It also records the TTFT series
-    (:data:`~app.usage.metrics.STREAM`), not the total-latency one.
+    Same candidate chain, same breaker questions, same flag-driven decisions,
+    same one budget of three. What differs is that a failure can now arrive
+    *after* text has already been generated, and three rules follow from that:
+
+    **A stream that yielded nothing is an** :class:`~app.providers.errors.EmptyResponse`.
+    A 200 that ends without a delta is the streaming form of the 200-with-nothing
+    free tiers produce all day, and it has to normalize to the same class or
+    invariant 4 ("an empty generation is an error, not a stored message") would
+    be enforced on one path and not the other.
+
+    **The first token gets its own, tighter budget** (D13,
+    :data:`~app.providers.base.DEFAULT_FIRST_TOKEN_TIMEOUT_S`). It is enforced
+    here rather than inside ``stream`` because only the loop knows the difference
+    between "the first gap" and "a gap", and only the loop can act on it.
+
+    **Once a delta has been delivered, the same candidate is never retried.** It
+    has demonstrated that it accepts a connection and then dies; a second go at
+    it spends an attempt from the same budget as a candidate that has not failed
+    at all. A restart is for a *new* provider (D1) — the same-provider retry
+    stays where it is genuinely a retry, before anything was streamed.
+
+    Records the TTFT series (:data:`~app.usage.metrics.STREAM`), not the total-
+    latency one, and only for an attempt that ran to completion: an attempt that
+    produced one token and then died is not evidence that the provider is fast.
+
+    Raises :class:`RoutingFailed` exactly as :func:`route` does. Whether that
+    reaches the client as a JSON envelope or as an in-band ``done`` is D13's
+    question and the orchestrator's to answer — this loop does not know that a
+    client exists.
     """
-    raise NotImplementedError(
-        "Phase 2 Step 9: the D1 restart state machine lands with streaming/orchestrator.py"
+    snapshot = metrics.snapshot(STREAM) if metrics is not None and rank_by_latency else None
+    chain = selection.candidates(registry, requested, pinned=pinned, latency=snapshot)
+
+    jitter = rng if rng is not None else random.Random()
+    started = clock.now()
+    trail: list[AttemptRecord] = []
+    attempts = 0
+    wasted_total = 0
+    last_error: ProviderError | None = None
+    last_spec: ModelSpec | None = None
+
+    for position, candidate in enumerate(chain):
+        if attempts >= max_attempts:
+            break
+
+        decision = await breaker.allows(candidate.provider, candidate.model)
+        if not decision.allowed:
+            trail.append(
+                AttemptRecord(
+                    n=len(trail) + 1,
+                    slot=candidate.slot,
+                    provider=candidate.provider,
+                    model=candidate.model,
+                    outcome="skipped_breaker",
+                    breaker=decision.state,
+                    retry_after_s=decision.retry_after_s,
+                )
+            )
+            logger.info(
+                "router.candidate_skipped",
+                provider=candidate.provider,
+                model=candidate.model,
+                slot=candidate.slot,
+                breaker=decision.state,
+                retry_after_s=decision.retry_after_s,
+            )
+            continue
+
+        spec = candidate
+        refit_used = False
+        retries_used = 0
+
+        while True:
+            attempts += 1
+            attempt_started = clock.now()
+            adapter = registry.adapter_for_spec(spec)
+            key = registry.system_key(spec.provider)
+
+            delivered_chars = 0
+            ttft_ms: int | None = None
+            usage: Usage | None = None
+            finish_reason = "stop"
+
+            try:
+                payload, report = await render(history, spec, params, adapter, resolver=resolver)
+                yield AttemptStarted(attempt=attempts, spec=spec)
+
+                chunks = adapter.stream(payload, key, timeout_s, idle_timeout_s).__aiter__()
+                try:
+                    while True:
+                        try:
+                            if ttft_ms is None:
+                                chunk = await asyncio.wait_for(
+                                    chunks.__anext__(), first_token_timeout_s
+                                )
+                            else:
+                                chunk = await chunks.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError as exc:
+                            # Indistinguishable, to everything above, from the
+                            # idle stall `_stream_events` raises — and it should
+                            # be: both mean "accepted the connection, said
+                            # nothing", and both are cheap to abandon here.
+                            raise Unavailable(
+                                "first-token stall: no chunk from provider within the budget",
+                                provider=spec.provider,
+                                model=spec.model,
+                            ) from exc
+
+                        if ttft_ms is None:
+                            ttft_ms = _elapsed_ms(clock, attempt_started)
+                        if chunk.usage is not None:
+                            usage = chunk.usage
+                        if chunk.finish_reason:
+                            finish_reason = chunk.finish_reason
+                        if chunk.delta:
+                            delivered_chars += len(chunk.delta)
+                            yield AttemptDelta(text=chunk.delta)
+                finally:
+                    # Reached on a fault, on a client-side close, and on the happy
+                    # path alike. Without it an abandoned upstream connection is
+                    # returned to the pool only when the generator is collected,
+                    # which on a free-tier pool is the difference between failing
+                    # over and running out of sockets doing it.
+                    #
+                    # Guarded because Contract A promises an ``AsyncIterator``, not
+                    # a generator: every adapter here happens to be one, and an
+                    # adapter that is not — a test double, a local model — must not
+                    # crash the loop for lacking a method it never advertised.
+                    aclose = getattr(chunks, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+
+                if delivered_chars == 0:
+                    raise EmptyResponse(
+                        "stream closed without producing any content",
+                        provider=spec.provider,
+                        model=spec.model,
+                    )
+            except ProviderError as exc:
+                latency_ms = _elapsed_ms(clock, attempt_started)
+                wasted = _estimate_discarded_tokens(delivered_chars)
+                wasted_total += wasted
+                last_error = exc
+                last_spec = spec
+                trail.append(
+                    AttemptRecord(
+                        n=len(trail) + 1,
+                        slot=spec.slot,
+                        provider=spec.provider,
+                        model=spec.model,
+                        outcome="error",
+                        error_code=exc.code,
+                        latency_ms=latency_ms,
+                        wasted_tokens_out=wasted,
+                        breaker=decision.state,
+                    )
+                )
+                logger.warning(
+                    "router.stream_attempt_failed",
+                    **exc.log_fields(),
+                    slot=spec.slot,
+                    attempt=attempts,
+                    latency_ms=latency_ms,
+                    discarded_chars=delivered_chars,
+                    wasted_tokens_out=wasted,
+                    detail=str(exc),
+                )
+                yield AttemptAborted(
+                    attempt=attempts,
+                    spec=spec,
+                    error=exc,
+                    discarded_chars=delivered_chars,
+                    wasted_tokens_out=wasted,
+                )
+
+                retryable = exc.retryable_same_provider
+                if isinstance(exc, ContextTooLong):
+                    # Only before the first delta: mid-generation the prompt has
+                    # already been accepted, so there is nothing left to re-fit
+                    # and the error means something else entirely.
+                    if (
+                        delivered_chars == 0
+                        and not refit_used
+                        and exc.limit_tokens is not None
+                        and attempts < max_attempts
+                    ):
+                        spec = replace(spec, context_window=exc.limit_tokens)
+                        refit_used = True
+                        logger.info(
+                            "router.refitting",
+                            provider=spec.provider,
+                            model=spec.model,
+                            limit_tokens=exc.limit_tokens,
+                        )
+                        continue
+                    retryable = False
+
+                if delivered_chars > 0:
+                    # See the docstring: a candidate that died mid-generation has
+                    # earned a restart, not a second chance.
+                    retryable = False
+
+                if retryable and retries_used < MAX_SAME_PROVIDER_RETRIES:
+                    if _retry_would_starve_failover(
+                        attempts=attempts,
+                        max_attempts=max_attempts,
+                        candidates_remaining=len(chain) - position - 1,
+                    ):
+                        logger.info(
+                            "router.retry_yielded",
+                            provider=spec.provider,
+                            model=spec.model,
+                            attempts=attempts,
+                        )
+                    else:
+                        retries_used += 1
+                        await sleep(_retry_delay_s(retries_used, jitter))
+                        continue
+
+                await breaker.record_failure(decision, exc)
+                if exc.failover_eligible:
+                    break
+
+                logger.info("router.aborted", error_code=exc.code, attempts=attempts)
+                raise RoutingFailed(
+                    exc,
+                    spec=spec,
+                    trail=tuple(trail),
+                    attempts=attempts,
+                    latency_ms=_elapsed_ms(clock, started),
+                    wasted_tokens_out=wasted_total,
+                ) from exc
+            else:
+                latency_ms = _elapsed_ms(clock, attempt_started)
+                # `ttft_ms is None` is unreachable here — a stream with no chunk
+                # at all raised EmptyResponse above — but mypy cannot see that and
+                # a silent 0 would be a wrong measurement rather than a missing one.
+                first_token_ms = ttft_ms if ttft_ms is not None else latency_ms
+                await breaker.record_success(decision)
+                if metrics is not None:
+                    metrics.record(spec.provider, spec.model, STREAM, first_token_ms)
+
+                trail.append(
+                    AttemptRecord(
+                        n=len(trail) + 1,
+                        slot=spec.slot,
+                        provider=spec.provider,
+                        model=spec.model,
+                        outcome="ok",
+                        latency_ms=latency_ms,
+                        breaker=decision.state,
+                    )
+                )
+                logger.info(
+                    "router.stream_served",
+                    provider=spec.provider,
+                    model=spec.model,
+                    slot=spec.slot,
+                    requested_slot=requested,
+                    attempts=attempts,
+                    latency_ms=latency_ms,
+                    ttft_ms=first_token_ms,
+                    wasted_tokens_out=wasted_total,
+                )
+                yield StreamCompleted(
+                    spec=spec,
+                    usage=usage
+                    if usage is not None
+                    else Usage(
+                        tokens_in=report.estimated_tokens,
+                        tokens_out=_estimate_discarded_tokens(delivered_chars),
+                        estimated=True,
+                    ),
+                    finish_reason=finish_reason,
+                    report=report,
+                    trail=tuple(trail),
+                    attempts=attempts,
+                    latency_ms=_elapsed_ms(clock, started),
+                    ttft_ms=first_token_ms,
+                    wasted_tokens_out=wasted_total,
+                )
+                return
+
+    logger.warning(
+        "router.stream_exhausted",
+        requested_slot=requested,
+        attempts=attempts,
+        candidates=len(chain),
+        error_code=last_error.code if last_error is not None else None,
+        wasted_tokens_out=wasted_total,
     )
+    raise RoutingFailed(
+        last_error if last_error is not None else _all_skipped(chain),
+        spec=last_spec,
+        trail=tuple(trail),
+        attempts=attempts,
+        latency_ms=_elapsed_ms(clock, started),
+        wasted_tokens_out=wasted_total,
+    )
+
+
+def _estimate_discarded_tokens(chars: int) -> int:
+    """Characters over four. See :data:`DISCARDED_CHARS_PER_TOKEN`."""
+    return chars // DISCARDED_CHARS_PER_TOKEN
 
 
 def _retry_would_starve_failover(
@@ -499,12 +898,18 @@ def _all_skipped(chain: tuple[ModelSpec, ...]) -> ProviderError:
 
 
 __all__ = [
+    "DISCARDED_CHARS_PER_TOKEN",
     "MAX_ATTEMPTS",
     "MAX_SAME_PROVIDER_RETRIES",
+    "AttemptAborted",
+    "AttemptDelta",
     "AttemptOutcome",
     "AttemptRecord",
+    "AttemptStarted",
+    "RouteStreamEvent",
     "RouterOutcome",
     "RoutingFailed",
+    "StreamCompleted",
     "route",
     "route_stream",
 ]

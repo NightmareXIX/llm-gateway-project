@@ -1,0 +1,12 @@
+data: {"id":"gen-01k2p9wz8q","object":"chat.completion.chunk","created":1786622410,"model":"nvidia/nemotron-3-super-120b-a12b:free","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-01k2p9wz8q","object":"chat.completion.chunk","created":1786622410,"model":"nvidia/nemotron-3-super-120b-a12b:free","choices":[{"index":0,"delta":{"content":"A gateway"},"finish_reason":null}]}
+
+data: {"id":"gen-01k2p9wz8q","object":"chat.completion.chunk","created":1786622410,"model":"nvidia/nemotron-3-super-120b-a12b:free","choices":[{"index":0,"delta":{"content":" sits between a client and several providers."},"finish_reason":null}]}
+
+data: {"id":"gen-01k2p9wz8q","object":"chat.completion.chunk","created":1786622410,"model":"nvidia/nemotron-3-super-120b-a12b:free","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":54,"completion_tokens":11,"total_tokens":65}}
+
+data: [DONE]
+

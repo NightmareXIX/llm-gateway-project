@@ -38,6 +38,21 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
+    """The factory itself, for the one caller that must not hold a session.
+
+    D14: a streamed turn's collector opens its own session *after* the
+    generation is over, deliberately outside FastAPI's ``yield``-dependency
+    lifecycle — a ``StreamingResponse`` body keeps running long after the
+    handler that returned it has itself finished, so a request-scoped session
+    would already be torn down (or pinned open for the whole generation,
+    which a free-tier connection pool cannot afford). ``get_session`` is wrong
+    for that one caller; this is what it uses instead.
+    """
+    factory: async_sessionmaker[AsyncSession] = request.app.state.db_session_factory
+    return factory
+
+
 def get_http_client(request: Request) -> httpx.AsyncClient:
     """The process-wide outbound client.
 
@@ -99,6 +114,7 @@ def get_latency(request: Request) -> LatencyTable:
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionFactoryDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)]
 RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 RedisDep = Annotated[Redis, Depends(get_redis)]

@@ -22,3 +22,5 @@ node_modules/
 
 # Next.js/TS build artifact
 tsconfig.tsbuildinfo
+
+prompt.md

@@ -1,0 +1,6 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"A gateway"}]},"index":0}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":" sits between"}]},"index":0}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":" a client and several providers."}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":52,"candidatesTokenCount":11,"totalTokenCount":63},"modelVersion":"gemini-3.6-flash"}
+

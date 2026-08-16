@@ -1,16 +1,21 @@
 """The one place a ``requests`` row is built, and the one place a turn is logged.
 
-Two functions, one per outcome. The endpoint hands over the objects it already
+Three functions, two outcomes. The caller hands over the objects it already
 has — a :class:`Principal`, a :class:`ModelSpec`, a :class:`Usage` or a
 :class:`ProviderError` — and never assembles a row itself.
 
-**Why a facade over a one-function repo.** Phase 1 has exactly one caller, so this
-looks like a wrapper. Phase 2 has three: the router records an attempt trail, the
-streaming collector records a message whose tokens were partly discarded (D1's
-``wasted_tokens_out``), and this endpoint records the non-streaming path. Three
-call sites each building a ``Request`` by hand is how ``status`` ends up spelled
-two ways and how the field Phase 7's dashboard needs turns out to be populated on
-two of the three. The repo owns the INSERT; this owns what goes in it.
+**Why a facade over a one-function repo.** Phase 1 had exactly one caller, so this
+looked like a wrapper. Phase 2 has three: the non-streaming endpoint records both
+outcomes with a full :class:`ProviderError` in hand, and the streaming collector
+(Step 10) records a message whose tokens were partly discarded (D1's
+``wasted_tokens_out``) — but only ever after the 200 was already committed (D13),
+by which point the orchestrator has already reduced a failure down to a wire-safe
+``error_code`` with no live error object behind it. That is what
+:func:`record_stream_failure` is for, rather than a third ``error`` shape bolted
+onto :func:`record_failure`. Three call sites each building a ``Request`` by hand
+is how ``status`` ends up spelled two ways and how the field Phase 7's dashboard
+needs turns out to be populated on two of the three. The repo owns the INSERT;
+this owns what goes in it.
 
 **The log line is not optional decoration.** ``requests`` answers "what happened
 across the fleet today"; the log line answers "what happened to *this* call", with
@@ -48,6 +53,7 @@ async def record_success(
     cache_hit: bool = False,
     attempts: Sequence[AttemptRecord] = (),
     substituted: bool = False,
+    wasted_tokens_out: int = 0,
 ) -> Request:
     """Record a turn that produced an answer.
 
@@ -56,6 +62,12 @@ async def record_success(
     with a three-entry trail is the most interesting row in the table, and it is
     the only place that story survives: one ``messages`` row per logical message
     means the discarded attempts leave no other trace.
+
+    ``wasted_tokens_out`` defaults to 0, which is exactly what every non-streaming
+    caller has to report: a failed ``complete`` produced no text, so there is
+    nothing to have wasted. The streaming collector is the first caller to pass a
+    non-zero value — tokens a *discarded* attempt generated on the way to this
+    successful one, really spent even though the client never saw them.
     """
     row = await requests_repo.create(
         session,
@@ -73,6 +85,7 @@ async def record_success(
         cache_hit=cache_hit,
         substituted=substituted,
         attempts=[record.to_json() for record in attempts],
+        wasted_tokens_out=wasted_tokens_out,
     )
 
     logger.info(
@@ -92,6 +105,7 @@ async def record_success(
         # The count of events, which is what a log reader scanning for "did this
         # one fail over?" wants. The trail itself is in the row.
         attempts=len(attempts),
+        wasted_tokens_out=wasted_tokens_out,
     )
     return row
 
@@ -160,4 +174,66 @@ async def record_failure(
     else:
         logger.warning("chat.failed", **fields)
 
+    return row
+
+
+async def record_stream_failure(
+    session: AsyncSession,
+    *,
+    principal: Principal,
+    requested_slot: str,
+    latency_ms: int,
+    error_code: str | None,
+    spec: ModelSpec | None = None,
+    conversation_id: UUID | None = None,
+    attempts: Sequence[AttemptRecord] = (),
+    substituted: bool = False,
+    wasted_tokens_out: int = 0,
+) -> Request:
+    """Record a streamed turn that failed *in-band*, after the 200 committed.
+
+    The streaming twin of :func:`record_failure`, and deliberately not the same
+    function. By the time the collector sees a failed :class:`StreamResult`, D13's
+    boundary has already been crossed — the orchestrator reduced the router's
+    :class:`~app.providers.errors.ProviderError` down to a wire-safe
+    ``error_code`` for the ``done`` event, and the object itself is gone. So this
+    takes the pieces that survive instead: ``spec`` names the last candidate
+    attempted (or ``None`` when every one was skipped on an open breaker), the
+    same way :func:`record_failure` falls back to it for ``served_slot``.
+
+    A pre-first-byte exhaustion never reaches here at all — it still raises
+    ``RoutingFailed`` out of the orchestrator, and the endpoint's own
+    request-scoped session calls :func:`record_failure` for it exactly as the
+    non-streaming path always has.
+    """
+    row = await requests_repo.create(
+        session,
+        user_id=principal.user_id,
+        api_key_id=principal.api_key_id,
+        conversation_id=conversation_id,
+        requested_slot=requested_slot,
+        served_slot=spec.slot if spec is not None else None,
+        provider=spec.provider if spec is not None else None,
+        model=spec.model if spec is not None else None,
+        latency_ms=latency_ms,
+        status=requests_repo.STATUS_ERROR,
+        error_code=error_code,
+        substituted=substituted,
+        attempts=[record.to_json() for record in attempts],
+        wasted_tokens_out=wasted_tokens_out,
+    )
+
+    logger.warning(
+        "chat.stream_failed",
+        request_row_id=str(row.id),
+        conversation_id=str(conversation_id) if conversation_id else None,
+        requested_slot=requested_slot,
+        served_slot=spec.slot if spec is not None else None,
+        provider=spec.provider if spec is not None else None,
+        model=spec.model if spec is not None else None,
+        error_code=error_code,
+        latency_ms=latency_ms,
+        attempts=len(attempts),
+        wasted_tokens_out=wasted_tokens_out,
+    )
     return row

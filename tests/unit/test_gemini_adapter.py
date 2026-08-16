@@ -17,6 +17,7 @@ look like something else:
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 
 import httpx
@@ -33,6 +34,7 @@ from app.providers.errors import (
     Unavailable,
 )
 from app.providers.gemini import (
+    API_KEY_HEADER,
     MODEL_FIELD,
     GeminiAdapter,
     _model_from_url,
@@ -570,13 +572,85 @@ def test_protobuf_durations_parse(raw: object, expected: float | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The Phase 2 seam
+# stream()
 # --------------------------------------------------------------------------- #
-def test_streaming_raises_on_call_not_on_first_chunk() -> None:
-    """Step 7's job. An `async def` with a `yield` would return a well-formed
-    generator and only fail on the first `__anext__` — deep inside an SSE
-    response, after the headers were already sent."""
-    adapter = GeminiAdapter(client=httpx.AsyncClient(), base_url=BASE_URL)
+async def test_stream_yields_one_chunk_per_event_and_the_last_carries_usage() -> None:
+    async with fx.client_streaming(
+        [fx.read_sse("gemini", "stream_success").encode("utf-8")]
+    ) as client:
+        adapter = GeminiAdapter(client=client, base_url=BASE_URL)
 
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        chunks = [
+            chunk
+            async for chunk in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0)
+        ]
+
+    assert len(chunks) == 3
+    full_text = "A gateway sits between a client and several providers."
+    assert "".join(chunk.delta for chunk in chunks) == full_text
+    assert chunks[0].finish_reason is None
+    assert chunks[0].usage is None
+
+    last = chunks[-1]
+    assert last.finish_reason == "stop"
+    assert last.usage is not None
+    assert last.usage.tokens_in == 52
+    assert last.usage.tokens_out == 11
+    assert last.usage.estimated is False
+
+
+async def test_stream_request_hits_the_streamgeneratecontent_endpoint_with_alt_sse() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=fx.read_sse("gemini", "stream_success"))
+
+    async with fx.client_from(handler) as client:
+        adapter = GeminiAdapter(client=client, base_url=BASE_URL)
+        async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+            pass
+
+    request = requests[0]
+    assert request.url.path.endswith(f"/models/{MODEL}:streamGenerateContent")
+    assert request.url.params["alt"] == "sse"
+    assert request.headers[API_KEY_HEADER] == KEY
+    # The model travels in the URL, never in the body — the same invariant
+    # `_split_model` enforces on the non-streaming path.
+    assert MODEL_FIELD not in json.loads(request.content)
+
+
+async def test_a_blocked_prompt_mid_stream_raises_content_filtered() -> None:
+    """A refusal arriving as a `finishReason` partway through a stream must not
+    look like a short answer — the streaming twin of the ordering test above."""
+    frames = (
+        b'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Sure, I can"}]},'
+        b'"index":0}]}\n\n'
+        b'data: {"candidates":[{"content":{},"finishReason":"SAFETY","index":0}]}\n\n'
+    )
+    async with fx.client_streaming([frames]) as client:
+        adapter = GeminiAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(ContentFiltered):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass
+
+
+async def test_a_malformed_frame_raises_unavailable_not_a_decode_error() -> None:
+    async with fx.client_streaming([b"data: {not valid json\n\n"]) as client:
+        adapter = GeminiAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass
+
+
+async def test_a_truncated_stream_raises_unavailable() -> None:
+    async with fx.client_streaming(
+        [fx.read_sse("gemini", "stream_truncated").encode("utf-8")]
+    ) as client:
+        adapter = GeminiAdapter(client=client, base_url=BASE_URL)
+
+        with pytest.raises(Unavailable):
+            async for _ in adapter.stream(_payload(), KEY, timeout=30.0, idle_timeout=30.0):
+                pass

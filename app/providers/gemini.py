@@ -37,7 +37,9 @@ Gemini key adds nothing and why D8's 50/50 lane split has to be enforced by us.
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any, ClassVar, TypeGuard
 
@@ -64,6 +66,7 @@ from app.providers.types import (
     KeyValidation,
     ModelSpec,
     ResolvedAttachment,
+    StreamChunk,
     Usage,
 )
 
@@ -342,6 +345,75 @@ class GeminiAdapter(HttpProviderAdapter):
             _FINISH_REASONS.get(raw_finish, "stop") if isinstance(raw_finish, str) else "stop"
         )
         return text, finish_reason
+
+    async def stream(
+        self,
+        payload: dict[str, Any],
+        key: str,
+        timeout: float,
+        idle_timeout: float,
+    ) -> AsyncIterator[StreamChunk]:
+        """``streamGenerateContent``, one full ``GenerateContentResponse`` per event.
+
+        ``?alt=sse`` is not optional — see :data:`STREAM_GENERATE_CONTENT_TEMPLATE`.
+        ``base.py``'s ``_stream_events`` owns framing, the idle timeout and every
+        transport-level fault; everything here is specific to Gemini's shape.
+
+        Unlike Groq's OpenAI-style delta fragments, every event on this stream is a
+        complete response object — the same shape :meth:`_read_candidate` reads at
+        the end of a non-streaming call, just one incremental candidate at a time.
+        That is why the block-reason check has to run again per chunk rather than
+        once at the end: a prompt Gemini decides to refuse can be blocked on the
+        *first* event, with no ``candidates`` key at all, and a later chunk can
+        carry ``finishReason: "SAFETY"`` on an answer that started streaming before
+        the refusal was noticed. Both are :class:`ContentFiltered`, not a plain
+        empty chunk — the same laundering :meth:`_read_candidate`'s docstring warns
+        about, on the streaming path.
+
+        Uses :func:`_split_model_lenient` rather than :func:`_split_model`: a
+        payload reaching this method always carries :data:`MODEL_FIELD` in real
+        traffic, since ``render()`` always goes through ``build_payload`` first,
+        but the URL has to be built before the first byte of a real request has
+        gone anywhere to raise a normalized error against — matching
+        :meth:`GroqAdapter.stream`'s own ``"unknown"`` fallback for the same
+        reason, rather than a bare :exc:`ValueError` escaping the call.
+        """
+        model, body = _split_model_lenient(payload)
+
+        async for frame in self._stream_events(
+            "POST",
+            f"{STREAM_GENERATE_CONTENT_TEMPLATE.format(model=model)}?alt=sse",
+            headers=self._auth_headers(key),
+            json=body,
+            timeout_s=timeout,
+            idle_timeout_s=idle_timeout,
+            model=model,
+        ):
+            try:
+                event = json.loads(frame)
+            except json.JSONDecodeError as exc:
+                # An event that arrived is not the same as an event that arrived
+                # whole — a connection cut mid-write leaves valid SSE framing
+                # wrapped around invalid JSON, and that must not escape as a
+                # decoding traceback deep inside a streaming response.
+                raise Unavailable(
+                    "gemini sent a malformed stream frame",
+                    provider=self.name,
+                    model=model,
+                ) from exc
+
+            if not isinstance(event, dict):
+                continue
+
+            chunk = _stream_chunk_from_event(event)
+            if chunk.finish_reason == "content_filter":
+                raise ContentFiltered(
+                    "the model declined to generate a response",
+                    provider=self.name,
+                    model=model,
+                    raw=event,
+                )
+            yield chunk
 
     # ----------------------------------------------------------------- #
     # Normalization
@@ -637,6 +709,70 @@ def _split_model(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             "build_payload, which is the only thing that knows which model the URL names"
         )
     return model, {key: value for key, value in payload.items() if key != MODEL_FIELD}
+
+
+def _split_model_lenient(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """As :func:`_split_model`, but for ``stream()``, which needs a model name
+    for the URL the instant it is called — before any frame has arrived to
+    raise a normalized error against. Falls back to ``"unknown"`` rather than
+    raising, the same posture :meth:`GroqAdapter.stream` takes for its own
+    (body-only) model field.
+    """
+    model = payload.get(MODEL_FIELD)
+    resolved = model if isinstance(model, str) and model else "unknown"
+    return resolved, {key: value for key, value in payload.items() if key != MODEL_FIELD}
+
+
+def _stream_chunk_from_event(event: dict[str, Any]) -> StreamChunk:
+    """One decoded ``GenerateContentResponse`` -> one :class:`StreamChunk`.
+
+    ``finish_reason="content_filter"`` is a signal back to :meth:`GeminiAdapter.stream`
+    to raise, not a value callers see — mirroring how :meth:`_read_candidate`'s
+    refusal branch works on the non-streaming path, so the same condition means
+    the same thing on both.
+
+    **The block-reason check runs before touching ``candidates``, exactly as in**
+    :meth:`_read_candidate`. A blocked prompt's event carries an empty or absent
+    ``candidates`` list, and checking emptiness first would report a plain empty
+    chunk — which is not failover-eligible in the same way a refusal is required
+    to be inert, but *is* the wrong signal, and would let the router treat a
+    deliberate refusal as an ordinary stream that produced nothing.
+    """
+    feedback = event.get("promptFeedback")
+    block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+    if block_reason:
+        return StreamChunk(delta="", finish_reason="content_filter")
+
+    delta_text = ""
+    finish_reason: str | None = None
+
+    candidates = event.get("candidates")
+    if isinstance(candidates, list) and candidates:
+        candidate = candidates[0]
+        if isinstance(candidate, dict):
+            delta_text = _candidate_text(candidate)
+            raw_finish = candidate.get("finishReason")
+            if isinstance(raw_finish, str):
+                finish_reason = (
+                    "content_filter"
+                    if raw_finish in _BLOCK_FINISH_REASONS
+                    else _FINISH_REASONS.get(raw_finish, raw_finish)
+                )
+
+    usage: Usage | None = None
+    raw_usage = event.get("usageMetadata")
+    if isinstance(raw_usage, dict):
+        tokens_in = raw_usage.get("promptTokenCount")
+        tokens_out = raw_usage.get("candidatesTokenCount")
+        if _is_int(tokens_in) and _is_int(tokens_out):
+            thoughts = raw_usage.get("thoughtsTokenCount")
+            usage = Usage(
+                tokens_in=tokens_in,
+                tokens_out=tokens_out + (thoughts if _is_int(thoughts) else 0),
+                estimated=False,
+            )
+
+    return StreamChunk(delta=delta_text, finish_reason=finish_reason, usage=usage)
 
 
 def _candidate_text(candidate: dict[str, Any]) -> str:

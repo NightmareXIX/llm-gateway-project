@@ -40,6 +40,7 @@ import random
 from collections.abc import Iterator
 from typing import Any
 
+import httpx
 import pytest
 from fakeredis.aioredis import FakeRedis
 
@@ -50,6 +51,7 @@ from app.providers.errors import (
     BadRequest,
     ContentFiltered,
     ContextTooLong,
+    EmptyResponse,
     ProviderError,
     RateLimited,
     Unavailable,
@@ -685,17 +687,40 @@ async def test_a_dead_redis_still_serves_the_request(
     assert outcome.attempts == 1
 
 
-def test_the_streaming_entry_point_is_a_declared_seam() -> None:
-    """A typed signature raising, not a stub that silently returns nothing — and a
-    plain `def`, so it fails at the call rather than at the first `__anext__`."""
-    with pytest.raises(NotImplementedError):
-        router.route_stream(
-            registry=ProviderRegistry(specs={}, adapters={}, keys={}),
-            breaker=None,  # type: ignore[arg-type]
-            history=[],
-            params=PARAMS,
-            requested="general",
+async def test_a_stream_that_never_produces_a_delta_is_an_empty_response(
+    breaker: CircuitBreaker, history: list[CanonicalMessage]
+) -> None:
+    """The streaming form of the 200-with-nothing free tiers produce all day.
+
+    It has to normalize to the same class the non-streaming path uses, or
+    invariant 4 — "an empty generation is an error, not a stored message" — would
+    be enforced on one path and quietly not on the other. Asserted here rather
+    than through the orchestrator because it is the *classification* under test.
+    """
+    handler = provider_fixtures.client_from(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=provider_fixtures.ScriptedByteStream([b"data: [DONE]\n\n"]),
         )
+    )
+    events = router.route_stream(
+        registry=build_registry(client=handler, config=FLEET_CONFIG),
+        breaker=breaker,
+        history=history,
+        params=PARAMS,
+        requested="general",
+        pinned=f"{PROVIDER}/model-a",
+        sleep=_no_sleep,
+    )
+
+    with pytest.raises(router.RoutingFailed) as failure:
+        async for _event in events:
+            pass
+
+    assert isinstance(failure.value.error, EmptyResponse)
+    # Retryable, so the one pinned candidate is tried twice and then given up on.
+    assert failure.value.attempts == 2
 
 
 # --------------------------------------------------------------------------- #

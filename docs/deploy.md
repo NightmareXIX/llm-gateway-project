@@ -430,6 +430,53 @@ select provider, model, tokens_in, tokens_out, latency_ms, status, created_at
 from requests order by created_at desc limit 5;
 ```
 
+### 7.1 Streaming, against the real proxy (Phase 2)
+
+`make dev` proves the SSE framing is correct. It cannot prove the response is not buffered, because
+nothing between `uvicorn` and a local browser can buffer it — the one place that trap (`phase2.md` §5
+Trap 1) actually shows up is a real proxy hop, and this deployment has two: Fly's edge in front of the
+gateway, and Vercel's rewrite in front of that. Test against the deployed URL, never against `make dev`,
+and watch the *timing* of the output, not just its content:
+
+```bash
+API=https://llm-gateway-sed.fly.dev
+
+curl -N -s "$API/v1/chat/completions" \
+  -H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"count to five"}]}'
+```
+
+`-N` disables curl's own output buffering — without it, a buffered response and a genuinely streamed
+one both print identically, which is exactly the false negative worth avoiding. A working stream prints
+`event: meta`, then each `event: delta` arriving perceptibly one at a time as the model generates; a
+buffered one prints nothing at all until the whole response is ready and then dumps every event at
+once. `X-Accel-Buffering: no` (`app/streaming/sse.py`) is what defeats an nginx-family proxy doing this;
+it does nothing for a proxy that buffers for a different reason, which is why the timing check matters
+more than the header's presence.
+
+**The Vercel leg needs the same test, through the rewrite** — `next.config.ts`'s `rewrites()` is a
+separate hop with its own buffering behavior, and Fly streaming correctly says nothing about whether
+Vercel's edge does:
+
+```bash
+curl -N -s "https://<your-app>.vercel.app/api/gw/v1/chat/completions" \
+  -H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"count to five"}]}'
+```
+
+If this one buffers while the direct Fly call above does not, the rewrite is the culprit, not the
+gateway — worth knowing before spending time re-reading `orchestrator.py`.
+
+**A pre-stream failure should still look like an ordinary error**, not a stalled connection — this is
+D13's payoff, checkable without a live provider outage:
+
+```bash
+curl -si "$API/v1/chat/completions" \
+  -H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"nonexistent-slot","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+# a 4xx JSON error envelope with a request_id, not a 200 that hangs or says "failed" inside itself
+```
+
 ---
 
 ## Operating notes
@@ -438,6 +485,15 @@ from requests order by created_at desc limit 5;
 after a quiet spell pays a wake-up. Accepted deliberately — it is in the risk register
 ([development-plan.md](../doc/reference/development-plan.md) §5). Before a demo:
 `curl https://llm-gateway-sed.fly.dev/healthz`.
+
+**A machine suspending mid-stream drops the connection, not the request.** `auto_stop_machines =
+"suspend"` does not know a `StreamingResponse` is open when it decides to reclaim an idle machine — a
+long streamed answer arriving just as the instance would otherwise have gone quiet can end with a dropped
+socket rather than a `done` event, and the client sees a connection error rather than an in-band
+failure ([docs/limitations.md](limitations.md)). It is a low-probability window in ordinary use — the
+provider call itself keeps the machine "active" — but worth ruling out first if a chaos demo shows an
+unexplained dropped stream with no matching provider-side fault in the logs. `min_machines_running = 1`
+removes the window entirely, at the cost of the idle-suspend savings this setting exists for.
 
 **Rolling back.** `fly releases` then `fly deploy --image <previous>`. Note that this does **not**
 roll back a migration; Alembic downgrades are separate and deliberate.

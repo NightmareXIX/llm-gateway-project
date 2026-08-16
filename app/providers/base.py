@@ -67,6 +67,23 @@ The "slow but not down" case. A provider that accepts the connection and then
 goes quiet never trips a total-request timeout, so without this it holds a
 request open indefinitely and looks like latency rather than failure."""
 
+DEFAULT_FIRST_TOKEN_TIMEOUT_S = 10.0
+"""Phase 2 (D13): the budget for a stream's *first* chunk, distinct from the gap
+between later ones.
+
+D13 holds the HTTP status open until an attempt has produced something, so a
+candidate that stalls before its first token leaves the client with no headers,
+no status and no way to tell this gateway apart from a dead socket. Ten seconds
+rather than thirty because a provider that has produced *nothing at all* is not
+warming up — it is not answering, and two others are standing by. Exceeding it
+is an ``Unavailable`` like any other stall, and it is cheap: nothing was
+streamed, so nothing has to be discarded.
+
+Enforced by ``routing.route_stream`` around the first ``__anext__`` rather than
+inside ``stream``. The adapter's own idle clock cannot express "this gap is the
+first one", and adding a parameter for it would change Contract A's frozen
+signature to move a decision that belongs to the loop that can act on it."""
+
 DEFAULT_WRITE_TIMEOUT_S = 10.0
 DEFAULT_POOL_TIMEOUT_S = 5.0
 
@@ -333,11 +350,18 @@ class HttpProviderAdapter:
         model is still generating, so they never reset the idle clock below),
         and stops — without yielding — at a ``[DONE]`` sentinel.
 
-        **Idle timeout** applies to the gap between raw lines arriving on the
-        wire, measured with ``asyncio.wait_for`` around each ``__anext__``. A
-        provider that accepts the connection and then goes quiet trips this
-        as :class:`~app.providers.errors.Unavailable` rather than hanging the
-        request open for the full read timeout.
+        **Idle timeout** applies to the gap since the last *non-comment* line,
+        measured against an absolute deadline rather than by resetting a fresh
+        ``asyncio.wait_for`` on every raw line. That distinction is the one
+        Trap 8 names: OpenRouter sends ``: OPENROUTER PROCESSING`` keepalives
+        every few seconds while an upstream is genuinely stalled, and a naive
+        per-line timeout would treat each comment as proof of progress,
+        stretching one idle timeout into an unbounded run of them. Only a line
+        that is not a comment — a ``data:`` fragment or the blank line that
+        terminates one — pushes the deadline forward. A provider that accepts
+        the connection and then goes quiet, keepalives included, still trips
+        this as :class:`~app.providers.errors.Unavailable` rather than hanging
+        the request open for the full read timeout.
 
         **Mid-stream faults** — a reset connection, a truncated body — surface
         from ``httpx`` as ``httpx.HTTPError`` subclasses partway through
@@ -361,9 +385,18 @@ class HttpProviderAdapter:
 
                 lines: AsyncIterator[str] = response.aiter_lines()
                 data_lines: list[str] = []
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + idle_timeout_s
                 while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise Unavailable(
+                            "idle stall: no data from provider within the timeout",
+                            provider=self.name,
+                            model=model,
+                        )
                     try:
-                        raw_line = await asyncio.wait_for(lines.__anext__(), idle_timeout_s)
+                        raw_line = await asyncio.wait_for(lines.__anext__(), remaining)
                     except StopAsyncIteration:
                         break
                     except TimeoutError as exc:
@@ -374,6 +407,18 @@ class HttpProviderAdapter:
                         ) from exc
 
                     line = raw_line.rstrip("\r\n")
+                    if line.startswith(":"):
+                        # A keepalive, not progress — see the docstring. The
+                        # deadline is deliberately left untouched, and so is the
+                        # blank line that terminates a comment-only SSE event:
+                        # resetting on *that* would launder the same keepalive
+                        # through a second field and reopen the trap.
+                        continue
+                    if line.startswith("data:"):
+                        # The one line that means a delta actually arrived.
+                        deadline = loop.time() + idle_timeout_s
+                        data_lines.append(line[len("data:") :].lstrip())
+                        continue
                     if line == "":
                         if data_lines:
                             payload = "\n".join(data_lines)
@@ -382,10 +427,6 @@ class HttpProviderAdapter:
                                 return
                             yield payload
                         continue
-                    if line.startswith(":"):
-                        continue
-                    if line.startswith("data:"):
-                        data_lines.append(line[len("data:") :].lstrip())
 
                 # A stream that ends without a trailing blank line still has a
                 # pending event worth surfacing — often the truncated one that

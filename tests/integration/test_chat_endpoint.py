@@ -74,6 +74,27 @@ async def groq(app: FastAPI) -> AsyncIterator[provider_fixtures.RecordingHandler
 
 
 @pytest.fixture
+async def groq_streaming(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """``groq``'s streaming sibling: every request gets the recorded
+    ``stream_success`` SSE body instead of a single JSON response.
+
+    Enough for the one thing worth proving at this layer — that ``stream: true``
+    reaches a real upstream and the answer comes back out the other end — since
+    the failover and restart behaviour this transport cannot express are already
+    covered end to end in ``tests/unit/test_orchestrator.py`` against the real
+    router and adapter.
+    """
+    client = provider_fixtures.client_streaming(
+        [provider_fixtures.read_sse("groq", "stream_success").encode("utf-8")]
+    )
+    app.state.provider_registry = build_registry(client=client, config=_groq_only())
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+@pytest.fixture
 async def groq_script(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHandler]]:
     """Install a handler that answers a *sequence* of fixtures, one per call.
 
@@ -770,23 +791,73 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
 
 
 # --------------------------------------------------------------------------- #
-# Requests we refuse
+# Streaming (Phase 2 Steps 9-10)
 # --------------------------------------------------------------------------- #
-async def test_streaming_is_refused_rather_than_downgraded(
+async def test_streaming_delivers_frames_and_persists_the_answer(
     client: httpx.AsyncClient,
     make_jwt: TokenFactory,
-    groq: provider_fixtures.RecordingHandler,
+    groq_streaming: httpx.AsyncClient,
     db_session: AsyncSession,
 ) -> None:
+    """The wiring Step 10 exists to complete: ``stream: true`` now reaches a
+    real upstream over real SSE, and refreshing afterwards finds the same two
+    rows the non-streaming path would have written — one ``messages`` row named
+    with the serving model, one ``requests`` row with the trail."""
     response = await client.post(
         COMPLETIONS,
         json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
         headers=_headers(make_jwt),
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "streaming_not_supported"
-    assert await _requests(db_session) == []
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    body = response.text
+    assert "event: meta" in body
+    assert "event: delta" in body
+    assert "event: done" in body
+
+    result = await db_session.execute(select(Message).where(Message.role == "assistant"))
+    (assistant,) = result.scalars().all()
+    assert assistant.meta["provider_used"] == "groq"
+    assert assistant.meta["attempts"] == 1
+
+    (row,) = await _requests(db_session)
+    assert row.status == "ok"
+    assert row.provider == "groq"
+
+
+async def test_a_pre_stream_failure_is_a_json_envelope_not_a_200(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """D13, on the wire the client actually asked for: a pool that fails before
+    a single token exists must stay a debuggable 502, never a 200 that only
+    says "failed" once you start reading the body. The `requests` row for it
+    is written by the endpoint itself — the collector never sees a turn that
+    never sent a byte."""
+    handler = groq_script("rate_limited", "rate_limited")
+
+    response = await client.post(
+        COMPLETIONS,
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        headers=_headers(make_jwt),
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "rate_limited"
+    assert handler.calls == 2
+
+    (row,) = await _requests(db_session)
+    assert row.status == "error"
+    assert row.error_code == "rate_limited"
+
+    # The user's message survives (committed before the router was ever called,
+    # D14) but no assistant row exists — nothing was ever generated to store.
+    assert row.conversation_id is not None
+    messages = await _messages(db_session, row.conversation_id)
+    assert [message.role for message in messages] == ["user"]
 
 
 async def test_an_unknown_slot_is_a_400_and_costs_nothing(

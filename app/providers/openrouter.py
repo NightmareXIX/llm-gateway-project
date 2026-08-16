@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import Any, ClassVar, TypeGuard
 
@@ -71,6 +71,7 @@ from app.providers.types import (
     ModelSpec,
     QuotaHint,
     ResolvedAttachment,
+    StreamChunk,
     Usage,
 )
 
@@ -292,6 +293,71 @@ class OpenRouterAdapter(HttpProviderAdapter):
 
         finish_reason = _FINISH_REASONS.get(raw_finish, "stop") if raw_finish else "stop"
         return content, finish_reason
+
+    async def stream(
+        self,
+        payload: dict[str, Any],
+        key: str,
+        timeout: float,
+        idle_timeout: float,
+    ) -> AsyncIterator[StreamChunk]:
+        """OpenRouter's OpenAI-shaped SSE stream, one delta per chunk.
+
+        ``base.py``'s ``_stream_events`` owns framing and the idle timeout —
+        including *not* resetting it on the ``: OPENROUTER PROCESSING`` keepalive
+        comments an upstream can send while genuinely stalled (Trap 8) — and every
+        transport-level fault. Everything here is specific to OpenRouter's JSON
+        shape, including the one quirk with no equivalent in Groq's stream: a chunk
+        whose body is a 200-shaped ``error`` object rather than a delta, exactly
+        like :meth:`_read_choice`'s non-streaming twin and classified through the
+        same :meth:`_classify` ladder so the two callers cannot drift.
+        """
+        model = str(payload.get("model", "unknown"))
+
+        async for frame in self._stream_events(
+            "POST",
+            CHAT_COMPLETIONS_PATH,
+            headers=self._auth_headers(key),
+            json=payload,
+            timeout_s=timeout,
+            idle_timeout_s=idle_timeout,
+            model=model,
+        ):
+            try:
+                event = json.loads(frame)
+            except json.JSONDecodeError as exc:
+                # An event that arrived is not the same as an event that arrived
+                # whole — a connection cut mid-write leaves valid SSE framing
+                # wrapped around invalid JSON, and that must not escape as a
+                # decoding traceback deep inside a streaming response.
+                raise Unavailable(
+                    "openrouter sent a malformed stream frame",
+                    provider=self.name,
+                    model=model,
+                ) from exc
+
+            if not isinstance(event, dict):
+                continue
+
+            if isinstance(event.get("error"), dict):
+                error = self._classify(status=200, body=event, model=model, response=None)
+                logger.warning("provider.error_in_success_body", **error.log_fields())
+                raise error
+
+            chunk = _stream_chunk_from_event(event)
+            if chunk.finish_reason == "content_filter":
+                # The streaming twin of `_read_choice`'s refusal branch — has to be
+                # here rather than above the adapter, or a refusal that arrived as
+                # a `finish_reason` instead of an `error` body would look like a
+                # short answer, and the router would fail over and shop the same
+                # prompt around until some upstream agreed to answer it.
+                raise ContentFiltered(
+                    "the model declined to generate a response",
+                    provider=self.name,
+                    model=model,
+                    raw=event,
+                )
+            yield chunk
 
     # ----------------------------------------------------------------- #
     # Normalization
@@ -622,6 +688,43 @@ def _render_attachment(attachment: ResolvedAttachment) -> str:
         )
 
     return document_envelope(attachment)
+
+
+def _stream_chunk_from_event(event: dict[str, Any]) -> StreamChunk:
+    """One decoded ``chat.completion.chunk`` -> one :class:`StreamChunk`.
+
+    Tolerant of whichever fields a given chunk carries, same as Groq's twin. The
+    one difference is where usage lives: OpenRouter reports it under the plain
+    ``usage`` key on the final chunk rather than Groq's ``x_groq`` wrapper, because
+    the two providers only agree on the payload shape, not on every response
+    field.
+    """
+    delta_text = ""
+    finish_reason: str | None = None
+
+    choices = event.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str):
+                    delta_text = content
+
+            raw_finish = choice.get("finish_reason")
+            if isinstance(raw_finish, str):
+                finish_reason = _FINISH_REASONS.get(raw_finish, raw_finish)
+
+    usage: Usage | None = None
+    raw_usage = event.get("usage")
+    if isinstance(raw_usage, dict):
+        tokens_in = raw_usage.get("prompt_tokens")
+        tokens_out = raw_usage.get("completion_tokens")
+        if _is_int(tokens_in) and _is_int(tokens_out):
+            usage = Usage(tokens_in=tokens_in, tokens_out=tokens_out, estimated=False)
+
+    return StreamChunk(delta=delta_text, finish_reason=finish_reason, usage=usage)
 
 
 def _json_object(response: httpx.Response) -> dict[str, Any] | None:

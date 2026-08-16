@@ -33,6 +33,21 @@ row that outlives the config that produced it.
 """
 
 
+def is_substitution(requested_slot: str, served_slot: str) -> bool:
+    """Whether the client's explicit choice was overridden.
+
+    Resolving ``auto`` is not substitution — nothing was overridden, the client
+    asked the gateway to choose. Only a *named* slot that ended up served by a
+    different one is, which D10's spill (ADR-011) is what makes reachable.
+
+    Here rather than in a caller because there are now two: the non-streaming
+    endpoint and the streaming orchestrator, and this rule decides whether the
+    provenance block tells the user their model was swapped. A second copy that
+    drifted would make one of the two paths quietly dishonest.
+    """
+    return requested_slot != AUTO and requested_slot != served_slot
+
+
 def resolve_slot(registry: ProviderRegistry, requested: str) -> ModelSpec:
     """The one model Phase 1 will attempt.
 
