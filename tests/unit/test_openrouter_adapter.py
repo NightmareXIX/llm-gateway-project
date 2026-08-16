@@ -554,10 +554,7 @@ async def test_stream_keepalive_comments_are_skipped_not_yielded_as_empty_deltas
 async def test_a_200_bodied_error_mid_stream_is_classified_not_treated_as_a_delta() -> None:
     """OpenRouter's 200-with-an-error-object quirk, on the streaming path — the
     same ladder :meth:`_classify` runs for the non-streaming twin."""
-    frame = (
-        b'data: {"error":{"code":402,"message":"insufficient credits",'
-        b'"metadata":{}}}\n\n'
-    )
+    frame = b'data: {"error":{"code":402,"message":"insufficient credits","metadata":{}}}\n\n'
     async with fx.client_streaming([frame]) as client:
         adapter = _adapter(client)
 

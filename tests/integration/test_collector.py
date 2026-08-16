@@ -148,9 +148,7 @@ async def test_a_successful_stream_writes_one_message_and_one_request(
     user = await user_factory()
     conversation: Conversation = await conversation_factory(user=user)
     message_id = uuid4()
-    trail = (
-        AttemptRecord(n=1, slot="general", provider=PROVIDER, model=MODEL, outcome="ok"),
-    )
+    trail = (AttemptRecord(n=1, slot="general", provider=PROVIDER, model=MODEL, outcome="ok"),)
 
     await collector_for(_principal(user)).persist(
         result(
