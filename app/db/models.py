@@ -302,4 +302,16 @@ class Request(Base):
 
     error_code: Mapped[str | None] = mapped_column(default=None)
     cache_hit: Mapped[bool] = mapped_column(Boolean, server_default=text("false"), nullable=False)
+
+    ttft_ms: Mapped[int | None] = mapped_column(Integer, default=None)
+    """Time to first token, streamed turns only. Phase 2's ``StreamCompleted`` and
+    ``StreamResult`` have carried this number end to end since Step 9; this is
+    the first column that keeps it instead of discarding it at the end of the
+    request."""
+
+    quota_scope: Mapped[str] = mapped_column(Text, server_default=text("'system'"), nullable=False)
+    """What paid for this request — ``"system"`` or a ``user_id`` (Contract C's
+    ``Scope``). Constant by construction until Phase 6's BYOK resolver exists;
+    written now so every row is unambiguous rather than assumed system-scoped."""
+
     created_at: Mapped[datetime] = _created_at()

@@ -118,6 +118,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # D11's kill switch. Printed at boot because "the router reordered my
         # candidates" and "the router did not" are the same log line otherwise.
         latency_ranking=settings.ROUTING_LATENCY_RANKING,
+        # Phase 3 Step 1's four switches — printed for the same reason: each one
+        # changes request behaviour invisibly unless its state is in the first
+        # line of the startup log.
+        quota_enforcement=settings.QUOTA_ENFORCEMENT,
+        quota_headroom_fraction=settings.QUOTA_HEADROOM_FRACTION,
+        cache_exact_enabled=settings.CACHE_EXACT_ENABLED,
+        rate_limit_enabled=settings.RATE_LIMIT_ENABLED,
     )
     try:
         yield

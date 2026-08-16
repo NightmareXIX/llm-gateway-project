@@ -75,9 +75,10 @@ slots:
         capabilities: [text, vision, pdf]
         supports_streaming: true
         max_file_bytes: 20000000
-        # D8's 50/50 answer/perception split becomes 0.5 in Phase 3, when
-        # quota/lanes.py is the thing that reads it. Zero until something does.
-        reserved_fraction: 0.0
+        # D8's 50/50 answer/perception split. quota/lanes.py (Phase 3 Step 4) is
+        # the thing that reads it; the number was 0.0 until Phase 3 existed to
+        # act on it.
+        reserved_fraction: 0.5
 
       - provider: openrouter
         model: nvidia/nemotron-3-super-120b-a12b:free
@@ -107,7 +108,7 @@ slots:
         capabilities: [text, vision, pdf]
         supports_streaming: true
         max_file_bytes: 20000000
-        reserved_fraction: 0.0
+        reserved_fraction: 0.5
 
       - provider: openrouter
         model: openai/gpt-oss-20b:free

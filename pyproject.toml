@@ -20,6 +20,11 @@ dependencies = [
     "python-jose[cryptography]>=3.3",
     "redis>=5.2",
     "pyyaml>=6.0",
+    # Phase 3 Step 1. `ZoneInfo("America/Los_Angeles")` needs a timezone database,
+    # and neither Windows nor a `python:*-slim` container is guaranteed to ship
+    # one — a runtime dependency, not a dev one, because `quota/windows.py`'s
+    # `fixed_daily_pt` resolves it on every request, not just in tests.
+    "tzdata>=2025.1",
 ]
 
 [project.optional-dependencies]

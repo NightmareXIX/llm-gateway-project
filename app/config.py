@@ -118,6 +118,44 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: SecretStr
     """Fernet key for BYOK provider-credential encryption (``app/core/crypto.py``)."""
 
+    QUOTA_ENFORCEMENT: bool = True
+    """Phase 3 D15: reserve budget before every attempt and fail closed when Redis
+    cannot confirm one is available.
+
+    On by default — this *is* the phase's behaviour, not an opt-in. Off, the
+    tracker is never constructed, no reservation is made, and the gateway goes
+    back to Phase 2's reactive failover on a real 429. It exists for the same
+    reason ``ROUTING_LATENCY_RANKING`` does: when the router itself is what is
+    being debugged, a flag is cheaper than a revert — and because quota fails
+    closed, this is also the escape hatch from a self-inflicted total outage if
+    Redis is down and enforcement would otherwise refuse every request.
+    ``/readyz`` reads this same flag, so an instance with enforcement off does not
+    fail readiness on a dependency it is not using."""
+
+    QUOTA_HEADROOM_FRACTION: float = Field(default=0.1, ge=0.0, lt=1.0)
+    """Fraction of every published limit held back before the tracker ever sees
+    it (D16). A fixed-window counter permits up to 2x the limit across a reset
+    boundary; this is what keeps the effective ceiling under the real one by more
+    than that jitter costs. A gateway whose entire premise is free-tier
+    aggregation should be under-spending its budgets on purpose."""
+
+    CACHE_EXACT_ENABLED: bool = True
+    """D5/D19: serve identical, deterministic requests from
+    ``cache:exact:{sha256}`` instead of calling a provider.
+
+    On by default. Off, every request is a cache ``BYPASS`` and the gateway
+    behaves as if the cache did not exist — useful when the thing under debug is
+    whether a *response* is correct, and a stale or wrongly-scoped cache hit
+    would be indistinguishable from a real answer."""
+
+    RATE_LIMIT_ENABLED: bool = True
+    """D20: enforce the gateway's own per-user sliding-window limit on
+    ``POST /v1/chat/completions``, independent of every upstream provider limit.
+
+    On by default. Off removes the gateway's only protection against one
+    enthusiastic caller draining a shared free-tier pool for everyone else — this
+    switch exists for load-testing the gateway itself, not for production use."""
+
     @property
     def is_production(self) -> bool:
         return self.ENV == "prod"
@@ -306,11 +344,29 @@ class ModelLimits(BaseModel):
     reset: ResetPolicy = Field(default_factory=ResetPolicy)
 
 
+class GatewayLimits(BaseModel):
+    """D20: the gateway's own per-user limit for one ``users.tier`` value.
+
+    Unrelated to the provider table above it — this protects the gateway's own
+    capacity from its own callers, not a provider's key from getting banned.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rpm: int = Field(gt=0)
+    rpd: int = Field(gt=0)
+
+
 class LimitsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: int
     limits: dict[str, dict[str, ModelLimits]]
+    gateway: dict[str, GatewayLimits]
+    """Keyed by ``users.tier`` (``free``, ``plus``). Required rather than
+    defaulted: ``extra="forbid"`` already fails startup if the YAML carries a key
+    this model does not know, and the absence of a default makes the reverse true
+    too — the YAML block and this field can only ever land in the same commit."""
 
     def for_model(self, provider: str, model: str) -> ModelLimits | None:
         return self.limits.get(provider, {}).get(model)

@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
@@ -38,6 +39,7 @@ from pydantic import ValidationError
 from app.config import (
     KNOWN_CAPABILITIES,
     ConfigError,
+    GatewayLimits,
     LimitsConfig,
     ProvidersConfig,
     Settings,
@@ -66,7 +68,15 @@ REQUIRED_VARS = (
     "ENCRYPTION_KEY",
 )
 
-OPTIONAL_VARS = ("ENV", "REQUIRE_VERIFIED_EMAIL", "ROUTING_LATENCY_RANKING")
+OPTIONAL_VARS = (
+    "ENV",
+    "REQUIRE_VERIFIED_EMAIL",
+    "ROUTING_LATENCY_RANKING",
+    "QUOTA_ENFORCEMENT",
+    "QUOTA_HEADROOM_FRACTION",
+    "CACHE_EXACT_ENABLED",
+    "RATE_LIMIT_ENABLED",
+)
 
 BASELINE = {
     "ENV": "test",
@@ -215,6 +225,45 @@ def test_latency_ranking_defaults_on() -> None:
     it reproduces the config order a cold process already serves."""
     assert _settings().ROUTING_LATENCY_RANKING is True
     assert _settings(ROUTING_LATENCY_RANKING=False).ROUTING_LATENCY_RANKING is False
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 Step 1's four switches
+# --------------------------------------------------------------------------- #
+def test_quota_enforcement_defaults_on() -> None:
+    """D15's behaviour, not its opt-in — same shape as D11's flag above."""
+    assert _settings().QUOTA_ENFORCEMENT is True
+    assert _settings(QUOTA_ENFORCEMENT=False).QUOTA_ENFORCEMENT is False
+
+
+def test_cache_exact_enabled_defaults_on() -> None:
+    assert _settings().CACHE_EXACT_ENABLED is True
+    assert _settings(CACHE_EXACT_ENABLED=False).CACHE_EXACT_ENABLED is False
+
+
+def test_rate_limit_enabled_defaults_on() -> None:
+    assert _settings().RATE_LIMIT_ENABLED is True
+    assert _settings(RATE_LIMIT_ENABLED=False).RATE_LIMIT_ENABLED is False
+
+
+def test_quota_headroom_fraction_defaults_and_bounds() -> None:
+    """D16: ten percent held back by default; the bound is half-open at 1.0
+    because reserving the *entire* limit would leave nothing to reserve."""
+    assert _settings().QUOTA_HEADROOM_FRACTION == 0.1
+
+    with pytest.raises(ValidationError):
+        _settings(QUOTA_HEADROOM_FRACTION=1.0)
+    with pytest.raises(ValidationError):
+        _settings(QUOTA_HEADROOM_FRACTION=-0.01)
+
+
+def test_zoneinfo_resolves_on_this_machine() -> None:
+    """D16's ``fixed_daily_pt``: Windows ships no zoneinfo database at all, and a
+    slim container image is not guaranteed to either. ``tzdata`` is a runtime
+    dependency precisely so this does not become a 500 the first time
+    ``quota/windows.py`` computes a Gemini reset."""
+    zone = ZoneInfo("America/Los_Angeles")
+    assert zone.key == "America/Los_Angeles"
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +498,10 @@ LIMITS_DOCUMENT: dict[str, Any] = {
         },
         "gemini": {},
     },
+    "gateway": {
+        "free": {"rpm": 20, "rpd": 500},
+        "plus": {"rpm": 60, "rpd": 5000},
+    },
 }
 
 
@@ -484,7 +537,27 @@ def test_an_unknown_reset_kind_is_rejected(tmp_path: Path) -> None:
     document = {
         "version": 1,
         "limits": {"groq": {"m": {"rpm": 30, "reset": {"rpm": "every_other_tuesday"}}}},
+        "gateway": {"free": {"rpm": 20, "rpd": 500}},
     }
+
+    with pytest.raises(ConfigError):
+        _load_yaml_model(LimitsConfig, _write(tmp_path, document, "limits.yaml"))
+
+
+def test_gateway_limits_are_keyed_by_tier(tmp_path: Path) -> None:
+    """D20: the gateway's own per-user limits, unrelated to the provider table
+    above them — asserted separately so the two blocks cannot be conflated."""
+    config = _load_yaml_model(LimitsConfig, _write(tmp_path, LIMITS_DOCUMENT, "limits.yaml"))
+
+    assert config.gateway["free"] == GatewayLimits(rpm=20, rpd=500)
+    assert config.gateway["plus"] == GatewayLimits(rpm=60, rpd=5000)
+
+
+def test_limits_config_without_a_gateway_block_fails_to_load(tmp_path: Path) -> None:
+    """The YAML block and the model must land in the same commit. A limits file
+    written before this step's edit — missing ``gateway`` entirely — is a boot
+    failure now, not a silently-absent block."""
+    document = {"version": 1, "limits": LIMITS_DOCUMENT["limits"]}
 
     with pytest.raises(ConfigError):
         _load_yaml_model(LimitsConfig, _write(tmp_path, document, "limits.yaml"))
@@ -606,6 +679,33 @@ def test_every_routable_candidate_has_a_limits_entry() -> None:
             assert limits.for_model(candidate.provider, candidate.model) is not None, (
                 f"{candidate.provider}/{candidate.model} is routable but has no limits entry"
             )
+
+
+def test_gemini_candidates_reserve_half_their_budget_for_perception() -> None:
+    """D8/trap 15: ``reserved_fraction`` must halve the *answer* lane, and it is
+    only Gemini that declares it non-zero — the two vision-capable candidates in
+    ``config/providers.yaml``, and nothing else in the table."""
+    config = get_providers_config()
+
+    reserved = {
+        (slot_name, candidate.provider, candidate.model): candidate.reserved_fraction
+        for slot_name, slot in config.slots.items()
+        for candidate in slot.candidates
+    }
+
+    for (_, provider, _), fraction in reserved.items():
+        if provider == "gemini":
+            assert fraction == 0.5
+        else:
+            assert fraction == 0.0
+
+
+def test_the_committed_limits_declare_gateway_tiers() -> None:
+    limits = get_limits_config()
+
+    assert set(limits.gateway) == {"free", "plus"}
+    assert limits.gateway["free"].rpm < limits.gateway["plus"].rpm
+    assert limits.gateway["free"].rpd < limits.gateway["plus"].rpd
 
 
 def test_geminis_daily_window_resets_on_pacific_time() -> None:

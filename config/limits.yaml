@@ -102,3 +102,16 @@ limits:
       reset:
         rpm: rolling_60s
         rpd: fixed_daily_utc
+
+# D20: the gateway's own per-user limits, enforced independently of every
+# provider table above. These have nothing to do with any provider's free
+# tier — they protect the gateway's own capacity from one caller draining a
+# shared pool for everyone else. Keyed by `users.tier`, whose CHECK constraint
+# permits exactly `free` and `plus` (app/db/models.py).
+gateway:
+  free:
+    rpm: 20
+    rpd: 500
+  plus:
+    rpm: 60
+    rpd: 5000

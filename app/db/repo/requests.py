@@ -4,11 +4,13 @@ One function, one INSERT. This table is append-only by design: a ``requests`` ro
 records what happened on one inbound call, and something that happened does not
 later become something else. There is no ``update`` here and there should not be.
 
-**Every column is nullable except ``status``**, which is the shape a failure needs.
-A request that died before a slot was resolved has no provider and no model, and
-writing ``"unknown"`` into those columns would poison exactly the query the table
-exists to serve — "how often does Groq fail". ``NULL`` means "never got that far";
-a string means we know.
+**Every column is nullable except ``status`` and ``quota_scope``**, which is the
+shape a failure needs. A request that died before a slot was resolved has no
+provider and no model, and writing ``"unknown"`` into those columns would poison
+exactly the query the table exists to serve — "how often does Groq fail".
+``NULL`` means "never got that far"; a string means we know. ``quota_scope`` is
+the one exception because it names what pays, not what happened — always known,
+even for a request that got nowhere.
 
 ``substituted``, ``attempts`` and ``wasted_tokens_out`` were added to the schema in
 Phase 1 and left off this signature until there was something to put in them.
@@ -17,6 +19,12 @@ and D2's disclosure lands in ``substituted``. ``wasted_tokens_out`` is still a
 parameter nobody passes a non-zero value to — the streaming collector (Step 10) is
 its first real writer, and it is here now so that step is a call-site change rather
 than a signature change.
+
+``ttft_ms`` and ``quota_scope`` are Phase 3 Step 1's pair, added to this signature
+for the same reason: Step 5's router integration and Step 9's streaming collector
+are call-site changes rather than signature changes when the time comes.
+``quota_scope`` defaults to ``"system"`` because every call site is, until Phase 6
+replaces the constant with a resolved value.
 
 Takes a session, never commits. The caller owns the transaction boundary.
 """
@@ -58,6 +66,8 @@ async def create(
     substituted: bool = False,
     attempts: list[dict[str, Any]] | None = None,
     wasted_tokens_out: int = 0,
+    ttft_ms: int | None = None,
+    quota_scope: str = "system",
 ) -> Request:
     """Record one inbound request.
 
@@ -88,6 +98,8 @@ async def create(
         substituted=substituted,
         attempts=attempts if attempts is not None else [],
         wasted_tokens_out=wasted_tokens_out,
+        ttft_ms=ttft_ms,
+        quota_scope=quota_scope,
     )
     session.add(row)
     # Assigns id and created_at now, so the caller can log the row it just wrote
