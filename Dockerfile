@@ -34,9 +34,11 @@ RUN groupadd --system --gid 1001 app \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /srv/app
-# alembic.ini travels with the image: migrations run as a release command, not at
-# app start, so the container must be able to run `alembic upgrade head` itself.
+# alembic.ini travels with the image because the container runs its own
+# migration: Render's free plan has no pre-deploy hook, so `alembic upgrade head`
+# happens in the start command (start.sh, invoked by render.yaml's dockerCommand).
 COPY --chown=app:app alembic.ini ./alembic.ini
+COPY --chown=app:app start.sh ./start.sh
 COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app config ./config
 COPY --chown=app:app app ./app

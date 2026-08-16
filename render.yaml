@@ -73,23 +73,21 @@ services:
     # Single instance on the free plan, so nothing can race this. That stops
     # being true the moment this service scales past one.
     #
-    # No `/bin/sh -c` wrapper and no quotes anywhere, both learned the hard way.
-    # Render runs this through a shell already — it expands $PORT — but it hands
-    # the string on with quote characters intact rather than consumed as syntax,
-    # so wrapping it ourselves produced an inner shell whose entire argument was
-    # one quoted word: `/bin/sh: 1: alembic upgrade head && exec uvicorn ...:
-    # not found`, exit 127. The `&&` still works because Render's own shell is
-    # what parses it.
+    # A script, not a command line, because **Render does not run this through a
+    # shell**. It interpolates environment variables into the string, splits the
+    # result into argv, and execs it — so there is no way to express a chain
+    # here. Both of the obvious spellings failed as real deploys:
     #
-    # $PORT is Render's to choose (10000 by default, and its value wins over an
-    # envVar of the same name), so this binds whatever arrives rather than
-    # naming a number. --workers and --forwarded-allow-ips are gone from the
-    # line because uvicorn reads $WEB_CONCURRENCY and $FORWARDED_ALLOW_IPS
-    # itself when the flags are absent (uvicorn/main.py), which keeps the one
-    # value that needs quoting — the `*` — out of a shell entirely.
-    dockerCommand: >-
-      alembic upgrade head && exec uvicorn app.main:app
-      --host 0.0.0.0 --port $PORT --proxy-headers
+    #   alembic upgrade head && exec uvicorn ...  -> alembic: error: unrecognized
+    #                                                arguments: && exec uvicorn
+    #   /bin/sh -c "alembic upgrade head && ..."  -> /bin/sh: 1: alembic upgrade
+    #                                                head && ...: not found
+    #
+    # Two bare tokens, no quotes, no variables: nothing for that tokenizer to
+    # get wrong. `sh` rather than executing start.sh directly so the file does
+    # not need its executable bit to survive a Windows checkout. Everything the
+    # start sequence actually does, and why, is documented in start.sh itself.
+    dockerCommand: sh /srv/app/start.sh
 
     envVars:
       # Not secrets, and they belong in version control. Everything else — the
