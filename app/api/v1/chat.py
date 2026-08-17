@@ -30,9 +30,10 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from functools import partial
+from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -52,6 +53,7 @@ from app.deps import (
     ExactCacheDep,
     LatencyDep,
     QuotaDep,
+    RateLimiterDep,
     RedisDep,
     RegistryDep,
     SessionDep,
@@ -85,12 +87,36 @@ logger = get_logger("app.api.chat")
 router = APIRouter(prefix="/v1/chat", tags=["chat"], responses=AUTHENTICATED_ERROR_RESPONSES)
 
 
+async def _enforce_rate_limit(principal: PrincipalDep, limiter: RateLimiterDep) -> None:
+    """D20's limit, applied to this endpoint and no other.
+
+    Composed here rather than in ``app/deps.py`` because the limiter needs the
+    principal and ``app.auth.dependency`` already imports ``app.deps`` — the
+    dependency that knows about both can only live downstream of both.
+
+    Reads are deliberately not limited. Rate-limiting the conversation list makes
+    the UI feel broken and protects nothing: generation is what spends a free
+    tier, and generation happens here.
+    """
+    if limiter is not None:
+        await limiter.enforce(principal)
+
+
+RateLimitDep = Annotated[None, Depends(_enforce_rate_limit)]
+"""Declared by the endpoint purely for its side effect: a 429 before any work.
+
+``get_principal`` is resolved once per request and cached by FastAPI, so
+depending on it from both here and the endpoint costs one authentication, not
+two."""
+
+
 @router.post(
     "/completions",
     response_model=ChatCompletionResponse,
     responses={
         **NOT_FOUND_RESPONSE,
         400: {"model": ErrorResponse, "description": "The request cannot be served as asked."},
+        429: {"model": ErrorResponse, "description": "You are over your own tier's limit."},
         502: {"model": ErrorResponse, "description": "The model provider failed."},
     },
 )
@@ -107,6 +133,7 @@ async def create_chat_completion(
     redis: RedisDep,
     quota: QuotaDep,
     cache: ExactCacheDep,
+    _rate_limit: RateLimitDep = None,
 ) -> ChatCompletionResponse | StreamingResponse:
     """Answer one turn, persisting both halves of it.
 

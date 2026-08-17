@@ -50,6 +50,12 @@ QuotaWindow = Literal["rpm", "rpd", "tpm", "tpd"]
 """The four windows a provider may publish. Hitting any one of them is a 429,
 independently of the others — which is why they are four counters and not one."""
 
+GatewayWindow = Literal["rpm", "rpd"]
+"""The two windows *we* limit *our own* users on (D20). A deliberately separate
+type from :data:`QuotaWindow`: the gateway counts requests per user and never
+tokens, and conflating the two would let a ``tpm`` reach a key that has no
+meaning for it."""
+
 
 # --------------------------------------------------------------------------- #
 # TTLs
@@ -214,15 +220,26 @@ def idempotency(user_id: str | UUID, idem_key: str) -> str:
     return f"idem:{_segment(user_id, name='user_id')}:{_segment(idem_key, name='idempotency_key')}"
 
 
-def rate_limit(user_id: str | UUID, window_start: int) -> str:
-    """``rl:{user_id}:{window_start}`` — our own limits, not a provider's.
+def rate_limit(user_id: str | UUID, window: GatewayWindow, window_start: int) -> str:
+    """``rl:{user_id}:{rpm|rpd}:{window_start}`` — our own limits, not a provider's.
 
-    ``window_start`` is the epoch second the window opened, which is what makes
-    the previous window addressable while the current one fills.
+    ``window_start`` is the epoch second the bucket opened, which is what makes
+    the previous bucket addressable while the current one fills — the two-bucket
+    interpolation D20 uses, and the one key in Contract C that carries a window
+    boundary at all.
+
+    **The ``{window}`` segment is a Phase 3 Step 10 amendment to Contract C**,
+    made with sign-off rather than silently. §2.3 froze this key as
+    ``rl:{user_id}:{window_start}``, which can only address one window — and
+    D20 enforces two. A daily bucket always starts on a multiple of 86,400,
+    which is also a valid minute boundary, so under the original format the
+    ``rpm`` and ``rpd`` buckets are the same key at every midnight UTC and one
+    request increments it twice. ADR-022 records the change; nothing had ever
+    written the old format, so there was nothing to migrate.
     """
     if window_start < 0:
         raise ValueError(f"window_start must be a non-negative epoch second, got {window_start}")
-    return f"rl:{_segment(user_id, name='user_id')}:{window_start}"
+    return f"rl:{_segment(user_id, name='user_id')}:{window}:{window_start}"
 
 
 # --------------------------------------------------------------------------- #

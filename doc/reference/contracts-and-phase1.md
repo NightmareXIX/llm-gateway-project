@@ -383,11 +383,13 @@ Every key is produced by a builder in `app/cache/keys.py`. No f-strings anywhere
 | `extract:{file_hash}` | string | 24h | perception | extracted text (Postgres is source of truth) |
 | `lock:extract:{file_hash}` | string (NX) | 60s | perception | stampede guard on concurrent identical uploads |
 | `idem:{user_id}:{idem_key}` | string | 24h | api | → `request_id` |
-| `rl:{user_id}:{window_start}` | int | 2× window | api | your own rate limiting |
+| `rl:{user_id}:{rpm\|rpd}:{window_start}` | int | 2× window | api | your own rate limiting |
 | `jwks:supabase` | string | 12h | auth | cached signing keys |
 | `stream:{message_id}:attempts` | int | 300s | streaming | restart counter (D1 cap) |
 
 **Scope** is `system` or a `user_id` — the mechanism that keeps shared-pool and BYOK usage from cross-contaminating (§9.4 of the overview).
+
+**Amended in Phase 3, Step 10 with sign-off:** the rate-limit key gained a `{window}` segment. It was frozen as `rl:{user_id}:{window_start}`, which can only address one window, and D20 enforces two — a daily bucket always starts on a multiple of 86,400, which is also a valid minute boundary, so the `rpm` and `rpd` buckets were the same key at every midnight UTC. Nothing had written the old format. [ADR-022](../../docs/decisions/ADR-022-our-own-rate-limiting.md) has the reasoning.
 
 **Atomicity.** Reservation must be a single Lua script that checks all limits and increments all counters, or returns which limit blocked. Check-then-increment across separate round trips will overshoot under concurrency, and "why Redis and not in-memory" plus "why Lua and not a pipeline" are two of the better questions this project sets you up to answer.
 

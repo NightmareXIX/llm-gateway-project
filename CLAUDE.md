@@ -64,7 +64,9 @@ fit (D4) → adapt via `build_payload` → `RenderReport`. Every provider payloa
 ### C — Redis key schema (`app/cache/keys.py`)
 `q:{scope}:{provider}:{model}:{rpm|rpd|tpm|tpd}`, `:res:{req_id}`, `:lane:perception`, `cb:{provider}:{model}`,
 `cache:exact:{sha256}`, `extract:{file_hash}`, `lock:extract:{file_hash}`, `idem:{user_id}:{idem_key}`,
-`rl:{user_id}:{window_start}`, `jwks:supabase`, `stream:{message_id}:attempts`. `scope` is `system` or a
+`rl:{user_id}:{rpm|rpd}:{window_start}` (the `{window}` segment amended in with sign-off in Phase 3
+Step 10 — one key cannot address two windows; [ADR-022](docs/decisions/ADR-022-our-own-rate-limiting.md)),
+`jwks:supabase`, `stream:{message_id}:attempts`. `scope` is `system` or a
 `user_id`, keeping shared-pool and BYOK usage from cross-contaminating. Reservation is a single Lua script
 (atomic check-and-increment; a pipeline overshoots under concurrency). Redis down → fail **closed** on quota,
 **open** on caching and our own rate limiting.
@@ -124,8 +126,14 @@ artificial delay. `streaming/collector.py::Collector` writes the cache after a l
 gained `persist_cache_hit` for the replay's own write; `usage/logger.py::record_cache_hit` is the fourth
 facade function alongside `record_success`/`record_failure`/`record_stream_failure`, since a hit never
 routed and has no `ModelSpec` to log one off. `X-Cache: HIT|MISS|BYPASS` on every response, both paths.
-Step 10 (our own rate limiting) and Step 11 (tests/ADRs/docs/deploy — the rest of **Milestone C**) have not
-started. Full step breakdown: [phase3.md](doc/reference/phase3.md).
+Step 10 (D20, our own rate limiting) is in: `core/errors.py::TooManyRequests` (429, `code="rate_limited"`,
+`Retry-After` in delta-seconds), `deps.py::RateLimiter` — a two-bucket sliding window over
+`rl:{user_id}:{window}:{window_start}` built on `windows.sliding_count`, keyed on `user_id`, limits from
+`limits.yaml`'s `gateway:` block by tier, failing **open** (the opposite of quota's D15 rule, and ADR-022
+says why), refunding a rejected request's own increment — composed with the principal into `RateLimitDep`
+in `api/v1/chat.py`, which applies it to `POST /v1/chat/completions` and nothing else. Step 11
+(remaining ADRs/docs/deploy — the rest of **Milestone C**) has not started. Full step breakdown:
+[phase3.md](doc/reference/phase3.md).
 
 **Scope:** the router stops guessing and starts knowing. A candidate that cannot be served is skipped before
 the round trip rather than after the 429, `GET /v1/models` reports live status a client can render, identical

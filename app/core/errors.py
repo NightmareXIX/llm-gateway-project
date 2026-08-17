@@ -127,6 +127,41 @@ class Conflict(AppError):
     message = "The request conflicts with the current state of the resource."
 
 
+class TooManyRequests(AppError):
+    """D20: *our* limit on *our* user, not a provider's limit on us.
+
+    Named ``TooManyRequests`` rather than ``RateLimited`` precisely because
+    :class:`app.providers.errors.RateLimited` exists and means the opposite
+    direction — a provider refusing the gateway. Two identically-named classes in
+    one traceback is a debugging tax with no upside.
+
+    ``code`` is ``rate_limited``, which is what :data:`_CODE_BY_STATUS` already
+    reserves for a 429, and the frontend already reads as a wait rather than a
+    failure. ``Retry-After`` is delta-seconds — never an HTTP-date, which
+    ``frontend/lib/api.ts`` says out loud and parses on that assumption.
+    """
+
+    status_code = 429
+    code = "rate_limited"
+    message = "You are sending requests faster than your tier allows. Try again shortly."
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        retry_after_s: int | None = None,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        merged_headers = dict(headers or {})
+        merged_details = dict(details or {})
+        if retry_after_s is not None:
+            merged_headers.setdefault("Retry-After", str(retry_after_s))
+            merged_details.setdefault("retry_after_s", retry_after_s)
+        super().__init__(message, code=code, details=merged_details, headers=merged_headers)
+
+
 class UpstreamUnavailable(AppError):
     """An upstream provider failed in a way we could not route around.
 

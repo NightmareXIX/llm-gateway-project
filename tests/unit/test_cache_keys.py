@@ -94,7 +94,7 @@ def test_the_remaining_builders_match_the_contract() -> None:
     assert keys.extraction("deadbeef") == "extract:deadbeef"
     assert keys.extraction_lock("deadbeef") == "lock:extract:deadbeef"
     assert keys.idempotency(USER_ID, "client-key-1") == f"idem:{USER_ID}:client-key-1"
-    assert keys.rate_limit(USER_ID, 1_760_000_000) == f"rl:{USER_ID}:1760000000"
+    assert keys.rate_limit(USER_ID, "rpm", 1_760_000_000) == f"rl:{USER_ID}:rpm:1760000000"
     assert keys.jwks_supabase() == "jwks:supabase"
     assert keys.stream_attempts(USER_ID) == f"stream:{USER_ID}:attempts"
 
@@ -109,7 +109,7 @@ def test_a_negative_rate_limit_window_is_refused() -> None:
     """A negative epoch second means the caller computed the window wrong, and the
     resulting key sorts and expires like nothing else in the space."""
     with pytest.raises(ValueError, match="non-negative"):
-        keys.rate_limit(USER_ID, -1)
+        keys.rate_limit(USER_ID, "rpm", -1)
 
 
 # --------------------------------------------------------------------------- #
@@ -129,7 +129,7 @@ def test_an_empty_segment_raises_rather_than_collapsing_two_keys_into_one() -> N
     """The failure this prevents is silent: an empty user id would give every
     caller the same rate-limit counter, and nothing would error."""
     with pytest.raises(ValueError, match="user_id"):
-        keys.rate_limit("", 0)
+        keys.rate_limit("", "rpm", 0)
 
 
 def test_a_whitespace_segment_raises() -> None:
