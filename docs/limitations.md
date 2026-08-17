@@ -54,12 +54,15 @@ fixes. Render has no Tokyo region, so that co-location is gone: Singapore is the
 each of the several Postgres round trips per request costs roughly 60–90ms instead of single digits.
 Nothing about the gateway's logic changed; its floor latency did.
 
-**`auto`'s latency ranking leans toward the provider nearest its own limit, until Phase 3.** `ADR-014`
-names this as the standing caveat it inherited from D11: ranking by measured speed with no quota
-awareness preferentially selects whichever provider is fastest *because* it has the least contention —
-which on a free tier is often the one closest to a 429. `ROUTING_LATENCY_RANKING` exists specifically so
-this can be switched off in one deploy without a revert, and Phase 3's quota filter is the actual fix,
-not a workaround.
+**`auto`'s latency ranking leaned toward the provider nearest its own limit, before Phase 3 — now
+fixed, not merely mitigated.** `ADR-014` named this as the standing caveat it inherited from D11:
+ranking by measured speed with no quota awareness preferentially selects whichever provider is
+fastest *because* it has the least contention, which on a free tier is often the one closest to a
+429. Phase 3's reservation happens *inside* the failover loop, before D11's latency sort ever runs
+([ADR-020](decisions/ADR-020-quota-reservation-placement.md), trap 10) — the sort now always runs on
+a list quota has already thinned, so a candidate near its ceiling is removed from contention rather
+than merely deprioritized. `ROUTING_LATENCY_RANKING` still exists as the kill switch for the ranking
+itself, independent of this fix.
 
 **Restarting a stream is not free even when it never fires.** The first-token budget (`D13`,
 `DEFAULT_FIRST_TOKEN_TIMEOUT_S = 10.0`) means a client's very first byte of *any* streamed response can
@@ -67,6 +70,53 @@ legitimately take up to 10 seconds if the first candidate is slow to start, befo
 decided whether a restart will be necessary. That is a deliberate trade against a worse alternative
 (silence with no way to distinguish a slow provider from a dead gateway), not a cost that disappears
 once a fast provider is picked.
+
+---
+
+## Quota, caching, and rate limiting
+
+**A fixed window permits up to 2× its limit across a boundary it straddles.** Contract C's quota
+key (`q:{scope}:{provider}:{model}:{window}`) has no `window_start` segment to interpolate a true
+rolling window from, so RPM/TPM are fixed counters aligned to their first increment
+([ADR-019](decisions/ADR-019-quota-window-model.md), D16). Thirty requests at `:59` and thirty more
+at `:01` is sixty inside a sixty-two-second span against a limit of thirty. `QUOTA_HEADROOM_FRACTION
+= 0.1` holds the effective ceiling under the real one by more than that jitter costs, and the
+provider's own 429 plus the breaker is the same backstop Phase 2 already had — this is a bounded,
+brief overshoot rather than a way to blow through a key's real limit.
+
+**The exact-match cache is global, deliberately, and the residual disclosure is a real one.**
+`cache:exact:{sha256}` carries no per-user segment ([ADR-023](decisions/ADR-023-exact-cache-identity-and-scope.md),
+D19) — the content of a byte-identical request *is* its identity, and scoping by user would destroy
+the hit rate that makes exact-match caching worth having on a free-tier budget. The trade: a cache
+hit tells you someone else asked this exact question recently, at `temperature: 0`, with no way to
+know who. Not recoverable from a hit in any more specific way, and not a new class of leak beyond
+what a shared, unscoped cache always implies.
+
+**Gemini's quota is metered per Google Cloud project, not per Redis deployment.** Two environments
+(a local dev box and the deployed instance, say) pointed at the same Gemini API key share one real
+budget at Google, while each keeps its own independent Redis counters — both believe they have the
+full published limit, or D8's half of it, when together they are drawing down one pool. `limits.yaml`
+already documents this; nothing in `quota/tracker.py` can detect or correct for it, because the
+tracker has no way to observe another process's Redis. Worth checking deliberately before running a
+local dev session and the deployed instance against the same Gemini key at the same time.
+
+**Upstash's free tier has a command-per-day ceiling, and Phase 3 roughly quadruples the Redis
+commands per request.** Breaker checks, quota reserve/commit/release, the exact-cache lookup, and
+our own rate limiter's two-bucket read all land on the same Redis instance
+([ADR-018](decisions/ADR-018-quota-fails-closed.md), [ADR-022](decisions/ADR-022-our-own-rate-limiting.md)).
+Check the Upstash dashboard after a day of real traffic and note the actual headroom rather than
+assuming the free tier absorbs it — this is a real ceiling a demo can hit that has nothing to do
+with any LLM provider's own limits.
+
+**A Redis outage now takes an instance out of rotation by design, not by accident.** With
+`QUOTA_ENFORCEMENT=True` (the default), `/readyz` fails closed the moment Redis is unreachable
+([ADR-018](decisions/ADR-018-quota-fails-closed.md), D15) — the opposite of the breaker's fail-open
+rule (ADR-010) for the same dependency, because quota's absence risks a banned provider key rather
+than one wasted round trip. On Render (ADR-017) that means a sustained Upstash blip cycles the
+instance through repeated restarts rather than leaving it up and quietly refusing every chat
+request. The escape hatch is `QUOTA_ENFORCEMENT=false`, which reproduces Phase 2's reactive-failover
+behavior exactly and lets `/readyz` stay green through a Redis outage — at the cost of the fail-closed
+guarantee this whole section is about.
 
 ---
 
@@ -109,11 +159,11 @@ inserts a visible omission marker. Summarizing older turns into a compact system
 designed as a seam (`app/memory/summarize.py`) but deliberately not built — it costs quota on every
 switch to a smaller-context model and adds a failure mode (a bad summary) that truncation does not have.
 
-**No quota tracking or enforcement yet.** Phase 2's router fails over *reactively*, on a 429 it did not
-predict, rather than *proactively* filtering candidates by remaining budget. This is the single largest
-scoping line in the phase, stated in `phase2.md` §1 and repeated here because it is also the reason
-`auto`'s latency-ranking caveat above exists at all: a quota-blind ranking and a quota-blind failover
-loop are the same gap, seen from two directions.
+**No perception lane yet.** Phase 3 reserves the half of Gemini's daily budget the perception lane
+will spend (`reserved_fraction: 0.5`, D8) and builds the accounting seam
+(`quota/lanes.py::reserve_perception`, a typed signature raising `NotImplementedError` rather than a
+silently-passing stub) — but nothing increments it, because `POST /v1/files` does not exist until
+Phase 4. `render()`'s attachment-resolution step still returns `NoAttachments` unconditionally.
 
 **Not a production system.** Built entirely on free tiers for a portfolio/learning purpose, which means
 lower throughput, higher latency variance, and lower consistency than a paid setup would have — stated

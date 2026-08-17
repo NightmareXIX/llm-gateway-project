@@ -3,8 +3,10 @@
 **Status:** accepted · Phase 3, Step 10 · 2026-08-17
 **Implements:** `phase3.md` §3 D20
 **Relates to:** Contract C (`app/cache/keys.py`), [ADR-007](ADR-007-auth-model.md) (one user, one
-budget), [ADR-017](ADR-017-render-as-deploy-target.md) and D15 (quota fails *closed*, this fails open),
-D16 (why the provider counters cannot have the window this one gets)
+budget), [ADR-018](ADR-018-quota-fails-closed.md) (quota fails *closed*, this fails open — the
+number this cross-reference originally pointed at before the plan's D15 slot went to
+[ADR-017](ADR-017-render-as-deploy-target.md) instead), [ADR-019](ADR-019-quota-window-model.md)
+(why the provider counters cannot have the window this one gets)
 
 ## Context
 

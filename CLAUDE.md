@@ -96,16 +96,24 @@ frontend/            # Next.js App Router + Tailwind; lib/sse.ts, components/Mod
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
 docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ holds the source specs
-Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
+README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 3 — Quota-Aware Routing (§4)
+## Current phase: Phase 4 — Perception Lane, not yet started
 
-Phase 1 (single-provider proxy) and Phase 2 (multi-provider core, failover, streaming) are done and merged.
+Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
+(quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
+perception lane, per `project-overview.md` §4.5 and `development-plan.md` §3) is next per the
+phased build plan but has no step-by-step plan doc yet (`doc/reference/phase4.md` does not exist) and
+no code has landed for it — `quota/lanes.py::reserve_perception` is the typed seam Phase 3 left for
+it to fill (see below).
 
-**Status:** Steps 1-9 are committed — **Milestone A** (the router knows: a candidate that cannot be served
-is skipped before the round trip), **Milestone B** (the client can see: live status, a working picker), and
-the first half of **Milestone C**. Config surface, `quota/windows.py`, `quota/tracker.py` +
+## Phase 3 — Quota-Aware Routing (§4) — complete
+
+**Status: all 11 steps committed, all three milestones done.** **Milestone A** (the router knows: a
+candidate that cannot be served is skipped before the round trip), **Milestone B** (the client can
+see: live status, a working picker), and **Milestone C** (caching, the gateway's own rate limiting,
+and Step 11's tests/ADRs/docs). Config surface, `quota/windows.py`, `quota/tracker.py` +
 `quota/scripts/{reserve,commit,release}.lua`, `quota/lanes.py`, both router paths (`route`/`route_stream`)
 reserving before each attempt and committing/releasing after, and a `ContextVar` sink in `providers/base.py`
 (`publish_hint`/`take_hint`) published by `HttpProviderAdapter._request`/`_stream_events` and drained by the
@@ -132,8 +140,15 @@ Step 10 (D20, our own rate limiting) is in: `core/errors.py::TooManyRequests` (4
 `limits.yaml`'s `gateway:` block by tier, failing **open** (the opposite of quota's D15 rule, and ADR-022
 says why), refunding a rejected request's own increment — composed with the principal into `RateLimitDep`
 in `api/v1/chat.py`, which applies it to `POST /v1/chat/completions` and nothing else. Step 11
-(remaining ADRs/docs/deploy — the rest of **Milestone C**) has not started. Full step breakdown:
-[phase3.md](doc/reference/phase3.md).
+(tests, ADRs, docs, deploy) is in: seven ADRs (`docs/decisions/ADR-018` through `ADR-024`, covering
+D15–D19 and D21 — D20's `ADR-022` landed with Step 10), the reserve/commit/release lifecycle
+diagram in `docs/architecture.md`, a new quota/caching/rate-limiting section in
+`docs/limitations.md`, and a root `README.md` (new this step) carrying the "why a Lua script and
+not a pipeline" answer. Writing `ADR-018` (D15) surfaced a real gap: `/readyz` had never been wired
+to fail closed on Redis, so `main.py`'s handler now returns 503 (`code="redis_unavailable"`) when
+Redis is unreachable and `QUOTA_ENFORCEMENT` is true — see `ADR-018` for why that is the correct
+reading of D15's "closed at the candidate is closed at the request" rule, not scope creep. Full
+step breakdown: [phase3.md](doc/reference/phase3.md).
 
 **Scope:** the router stops guessing and starts knowing. A candidate that cannot be served is skipped before
 the round trip rather than after the 429, `GET /v1/models` reports live status a client can render, identical

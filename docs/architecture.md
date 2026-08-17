@@ -115,10 +115,57 @@ raised — there is no response left to turn it into.
 
 ---
 
-## Where this leaves Phase 3
+## Phase 3: quota joins the loop
 
-The failover loop's candidate chain is exactly where a quota filter attaches next: `selection.py`
-documents a single insertion point, run *before* D11's latency sort, that removes an exhausted
-candidate from the chain entirely rather than merely losing the race to it. Nothing on either diagram
-above needs to change shape for that — quota becomes one more reason a candidate is skipped, alongside
-an open breaker, in the same box.
+The insertion point the section above predicted is exactly where it landed: `render` → `quota.reserve`
+→ `attempts += 1` → attempt, inside the same box the breaker check already occupied. Quota becomes a
+second reason a candidate is skipped for free — `skipped_quota` alongside `skipped_breaker` — and
+neither costs the three-attempt budget (ADR-015, [ADR-020](decisions/ADR-020-quota-reservation-placement.md)).
+
+```mermaid
+flowchart TD
+    Render["render() -> build_payload()\n(estimated_tokens from RenderReport)"] --> Reserve{"quota.reserve(spec, scope,\nestimated_tokens)"}
+    Reserve -- "Redis unreachable\n(D15, fail closed)" --> SkipQuota["trail += skipped_quota\ndegraded=true\n(no attempt spent)"]
+    Reserve -- "window exhausted" --> SkipQuota2["trail += skipped_quota\nblocked_window, retry_after_s\n(no attempt spent)"]
+    Reserve -- allowed --> Spend["attempts += 1\n(the only place this counter moves)"]
+    SkipQuota --> NextCandidate(["next candidate"])
+    SkipQuota2 --> NextCandidate
+
+    Spend --> Call["adapter.complete() / adapter.stream()"]
+    Call -- "never reached the provider\n(render/reserve-adjacent failure)" --> Release["quota.release(reservation)\ngives back every window,\nrequest windows included"]
+    Call -- "reached the provider,\nsucceeded or failed" --> Commit["quota.commit(reservation,\ntokens_in=actual, tokens_out=actual)\nrequest windows NEVER refunded (trap 6)"]
+
+    Call --> Hint{"take_hint() -- QuotaHint\npublished by _request (D18)"}
+    Hint -- present --> ApplyHint["quota.apply_hint()\nmoves a counter UP only,\nnever grants (never authorizes)"]
+    Hint -- none --> Done(["attempt outcome returned\nto the failover loop above"])
+    ApplyHint --> Done
+    Release --> Done
+    Commit --> Done
+
+    classDef skip fill:#8a3a3a,color:#fff,stroke:none;
+    classDef terminal fill:#2f6f4f,color:#fff,stroke:none;
+    class SkipQuota,SkipQuota2 skip;
+    class Done terminal;
+```
+
+**Reserve is a filter that spends its own answer**, not a read followed by a write — the whole reason
+Contract C mandates one Lua script rather than a pipelined check-then-increment (trap 2,
+[ADR-020](decisions/ADR-020-quota-reservation-placement.md)). `reserve.lua` checks every declared
+window before incrementing any of them, so a chain that blocks on window three never leaves windows
+one and two overstated (trap 3).
+
+**A reservation that expires mid-flight commits nothing rather than guessing.** `RESERVATION_TTL_S` is
+120s; a stream that outlives it finds `commit.lua`'s reservation hash already gone and no-ops, logging
+`quota.reservation_expired` — over-counting the original estimate rather than risking a blind delta
+that double-counts a stream a `release` already refunded on another path.
+
+**`apply_hint` runs after every attempt, success or failure**, draining whatever
+`HttpProviderAdapter._request`/`_stream_events` published to the `QuotaHint` contextvar
+([ADR-021](decisions/ADR-021-quotahint-transport.md)) — Groq and OpenRouter's own rate-limit headers
+correcting the gateway's estimate toward ground truth, one direction only.
+
+## Where this leaves Phase 4
+
+Nothing on either of the two diagrams above needs to change shape for the perception lane —
+`quota/lanes.py::reserve_perception` is the typed seam Phase 4 fills in, spending the half of Gemini's
+budget D8's `reserved_fraction` has already fenced off from the answer lane the whole time.

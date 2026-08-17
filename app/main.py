@@ -180,16 +180,22 @@ def create_app() -> FastAPI:
     async def readyz(request: Request) -> JSONResponse:
         """Readiness: can this instance actually serve a request?
 
-        **Postgres decides; Redis is only reported** (ADR-010). Postgres is on
-        the critical path of every authenticated request, so an instance that
-        cannot reach it genuinely cannot serve. Redis is fail-open — a dead one
-        costs the breaker's memory and nothing else — and taking a machine out of
-        rotation for a dependency it can serve without is a self-inflicted
-        outage. The general rule: a readiness probe fails only on dependencies
-        whose absence makes the instance unable to serve.
+        **Postgres always decides. Redis decides too, but only while quota
+        enforcement means the gateway actually depends on it** (D15,
+        [ADR-018](../docs/decisions/ADR-018-quota-fails-closed.md)) — the general
+        rule ADR-010 states still holds, it just has a second dependency read
+        against it now: *a readiness probe fails only on dependencies whose
+        absence makes the instance unable to serve.* With
+        ``QUOTA_ENFORCEMENT=True``, `quota.tracker.QuotaTracker.reserve` fails
+        every candidate closed the instant Redis is unreachable (D15), so an
+        instance in that state will refuse every chat request while reporting
+        itself healthy unless this probe says otherwise. With enforcement off, the
+        tracker is never constructed and the old ADR-010 verdict applies exactly
+        as written — Redis is reported, not decided by.
 
-        Reported anyway, because "every instance says redis: unavailable" is how
-        a broken cache is noticed at all when nothing it does is user-visible.
+        The breaker's fail-*open* reasoning (ADR-010) is untouched: a missing
+        breaker costs one predictable wasted round trip, which is not what this
+        branch is about.
         """
         try:
             # Bounded: an unreachable database refuses fast, but a hung one would
@@ -209,9 +215,22 @@ def create_app() -> FastAPI:
             )
 
         # Outside the block above, on its own shorter bound: this check cannot
-        # turn the probe red, so it must not be able to spend the budget of the
-        # one that can.
+        # turn the probe red on its own, so it must not be able to spend the
+        # budget of the one that always can.
         redis_ok = await probe(app.state.redis, timeout_s=READYZ_REDIS_TIMEOUT_S)
+
+        if not redis_ok and get_settings().QUOTA_ENFORCEMENT:
+            # D15: quota fails closed, so an instance that cannot reach Redis
+            # cannot serve a chat request either — leaving it in rotation would
+            # convert a Redis outage into a fleet of instances that all answer
+            # 502 while reporting themselves ready.
+            logger.warning("readyz.redis_unreachable_quota_enforced")
+            return error_response(
+                request,
+                status_code=503,
+                code="redis_unavailable",
+                message="Redis is not reachable and quota enforcement requires it.",
+            )
 
         return JSONResponse(
             status_code=200,
