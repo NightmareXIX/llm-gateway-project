@@ -167,14 +167,18 @@ jobs:
       # deployed nothing.
       #
       # The two guards in front of the curl exist because curl's own failure for
-      # a bad secret is unreadable: an unset secret expands to an empty string
-      # and exits 2 ("blank argument"), and a value with a stray newline or space
-      # — the usual result of pasting a URL into the secret field — exits 3
-      # ("URL rejected: Malformed input to a URL function"). Neither names the
-      # secret, and run #18 of this workflow was exactly the second one. So the
-      # value is whitespace-stripped before use, and anything that is then not
-      # recognisably a Render deploy hook fails with a message that says which
-      # secret to go and fix. Nothing ever echoes the value itself.
+      # a bad secret is unreadable, and worse, ambiguous. A missing secret
+      # expands to an empty string, and the runner's curl (8.5 on ubuntu-24.04)
+      # hands that to the URL parser and exits 3, "URL rejected: Malformed input
+      # to a URL function" — the same exit a genuinely malformed URL gets, and
+      # the error names no secret because a secret stays masked inside the error
+      # that quotes it. Run #18 of this workflow was the missing-secret case and
+      # read as the malformed-URL one. (curl >= 8.6 splits them, rejecting the
+      # blank argument with exit 2 before it reaches the parser — so debugging
+      # this against a local curl gives the wrong answer; docs/deploy.md 6.3 has
+      # the table.) Hence: check the value here rather than inferring it from an
+      # exit code, strip whitespace so a URL pasted with a trailing newline still
+      # works, and name the secret in the failure. Nothing echoes the value.
       #
       # This returns as soon as Render *queues* the deploy. A green job here means
       # "Render accepted it", not "it shipped" — the build, the `alembic upgrade

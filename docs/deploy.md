@@ -401,20 +401,26 @@ The name must match exactly — [`ci.yml`](../.github/workflows/ci.yml) reads
 `${{ secrets.RENDER_DEPLOY_HOOK_URL }}`, and a missing secret becomes an empty string rather than an
 error.
 
-**Paste the URL and nothing else.** GitHub's secret field preserves whatever is in the clipboard,
-and a URL copied with a trailing newline or a leading space is stored with it. That is the failure
-that took down run #18: `curl` exits **3** with `URL rejected: Malformed input to a URL function`,
-the job dies in two seconds, and nothing in the log names the secret — because a secret is masked
-even in the error that quotes it. The workflow now strips whitespace from the value and rejects
-anything that is not a `https://api.render.com/deploy/srv-…` URL with a message that says which
-secret to fix, so the next occurrence is self-diagnosing. Two related exits are worth recognising on
-sight if you ever hit them behind that guard:
+**If this secret is missing, the job fails in a way that does not mention it.** That is what took
+down run #18 — the secret had never been created, `${{ secrets.RENDER_DEPLOY_HOOK_URL }}` expanded to
+an empty string, and `curl` died in two seconds with exit **3**, `URL rejected: Malformed input to a
+URL function`. Nothing in the log named the secret, because a secret is masked even inside the error
+that quotes it.
 
-| `curl` exit | Means |
-|---|---|
-| 2 | The secret is unset or empty — the URL argument was a blank string |
-| 3 | The secret is set but malformed — almost always stray whitespace from the paste |
-| 22 | The URL is well-formed but Render rejected it — usually a stale `key` after a hook regeneration |
+**Do not diagnose that exit code against your local `curl`.** The runner's is older than a developer
+machine's and the two disagree about the empty-URL case specifically:
+
+| `curl` exit | On the runner (8.5, Ubuntu 24.04) | On a current local curl (≥ 8.6) |
+|---|---|---|
+| 2 | — | Secret unset or empty (`blank argument where content is expected`) |
+| 3 | **Secret unset or empty**, *or* set but malformed | Set but malformed — usually stray whitespace from the paste |
+| 22 | URL well-formed, Render rejected it — usually a stale `key` after a hook regeneration | same |
+
+curl 8.6.0 started rejecting blank option arguments before they reach the URL parser; 8.5 hands the
+empty string to the parser, which calls it malformed. So on the runner, exit 3 alone cannot tell
+"never set" from "set wrong" — which is the entire reason the workflow no longer relies on it. The
+step checks the value itself and fails with a message naming this secret and this section, and it
+strips surrounding whitespace first so a URL pasted with a trailing newline still works.
 
 Use a **repository** secret, not an environment or organization one, unless you have a reason —
 environment secrets need a matching `environment:` key in the job, which this workflow does not set.
