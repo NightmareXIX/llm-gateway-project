@@ -399,7 +399,22 @@ GitHub → the repo → **Settings → Secrets and variables → Actions → New
 
 The name must match exactly — [`ci.yml`](../.github/workflows/ci.yml) reads
 `${{ secrets.RENDER_DEPLOY_HOOK_URL }}`, and a missing secret becomes an empty string rather than an
-error. `curl -f` against an empty URL fails the job, which is the point of the `-f`.
+error.
+
+**Paste the URL and nothing else.** GitHub's secret field preserves whatever is in the clipboard,
+and a URL copied with a trailing newline or a leading space is stored with it. That is the failure
+that took down run #18: `curl` exits **3** with `URL rejected: Malformed input to a URL function`,
+the job dies in two seconds, and nothing in the log names the secret — because a secret is masked
+even in the error that quotes it. The workflow now strips whitespace from the value and rejects
+anything that is not a `https://api.render.com/deploy/srv-…` URL with a message that says which
+secret to fix, so the next occurrence is self-diagnosing. Two related exits are worth recognising on
+sight if you ever hit them behind that guard:
+
+| `curl` exit | Means |
+|---|---|
+| 2 | The secret is unset or empty — the URL argument was a blank string |
+| 3 | The secret is set but malformed — almost always stray whitespace from the paste |
+| 22 | The URL is well-formed but Render rejected it — usually a stale `key` after a hook regeneration |
 
 Use a **repository** secret, not an environment or organization one, unless you have a reason —
 environment secrets need a matching `environment:` key in the job, which this workflow does not set.

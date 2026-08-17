@@ -155,19 +155,57 @@ jobs:
       #
       # `ref` pins the build to the commit this run actually tested, rather than
       # whatever `main` happens to point at by the time Render picks the job up.
+      # It is a **query parameter** on the hook URL, which is the only place
+      # Render reads it from — the first spelling of this step sent it as a form
+      # body (`-d "ref=..."`), which Render ignores entirely, so every deploy
+      # silently built the branch head while this comment claimed otherwise.
+      # The hook URL already carries `?key=`, but the separator is computed
+      # rather than assumed so a hook without a query string still composes.
       #
       # `-f` is load-bearing: without it a 401 from a wrong or missing hook URL
       # prints an error body and exits 0, and the deploy job goes green having
       # deployed nothing.
+      #
+      # The two guards in front of the curl exist because curl's own failure for
+      # a bad secret is unreadable: an unset secret expands to an empty string
+      # and exits 2 ("blank argument"), and a value with a stray newline or space
+      # — the usual result of pasting a URL into the secret field — exits 3
+      # ("URL rejected: Malformed input to a URL function"). Neither names the
+      # secret, and run #18 of this workflow was exactly the second one. So the
+      # value is whitespace-stripped before use, and anything that is then not
+      # recognisably a Render deploy hook fails with a message that says which
+      # secret to go and fix. Nothing ever echoes the value itself.
       #
       # This returns as soon as Render *queues* the deploy. A green job here means
       # "Render accepted it", not "it shipped" — the build, the `alembic upgrade
       # head` in render.yaml's dockerCommand, and the health check all happen
       # afterwards, and the Render dashboard is where they report.
       - name: trigger render deploy
-        run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL" -d "ref=${{ github.sha }}"
         env:
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          hook="$(printf '%s' "$RENDER_DEPLOY_HOOK_URL" | tr -d '[:space:]')"
+
+          if [ -z "$hook" ]; then
+            echo "::error::The RENDER_DEPLOY_HOOK_URL repository secret is empty or not set. Settings -> Secrets and variables -> Actions; the value is the whole https://api.render.com/deploy/srv-<id>?key=<secret> URL from the Render service's Settings -> Deploy Hook. See docs/deploy.md section 6.3."
+            exit 1
+          fi
+
+          case "$hook" in
+            https://api.render.com/deploy/srv-*) ;;
+            *)
+              echo "::error::The RENDER_DEPLOY_HOOK_URL secret is set but is not a Render deploy hook URL (it must start with https://api.render.com/deploy/srv-). Re-copy it from the Render service's Settings -> Deploy Hook. See docs/deploy.md section 6.3."
+              exit 1
+              ;;
+          esac
+
+          case "$hook" in
+            *\?*) separator='&' ;;
+            *)    separator='?' ;;
+          esac
+
+          curl -fsS -X POST "${hook}${separator}ref=${COMMIT_SHA}"
 
     # The frontend is not deployed from here. Vercel's Git integration builds and
     # ships it on push, which is one fewer long-lived token for this repo to hold.
