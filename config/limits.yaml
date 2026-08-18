@@ -14,23 +14,30 @@
 version: 1
 
 limits:
+  # These two replaced the retired Llama models in Aug 2026 — see the note in
+  # config/providers.yaml for what that outage looked like. The numbers are read
+  # off Groq's own `x-ratelimit-limit-*` headers on a live request rather than a
+  # published table (`limit-requests: 1000`, `limit-tokens: 8000` for both), which
+  # is the same source `QuotaTracker.apply_hint` corrects against at runtime. TPD
+  # is the one window Groq publishes nowhere and does not header, so it stays a
+  # conservative estimate that only ever errs toward failing over early.
   groq:
-    llama-3.3-70b-versatile:
+    openai/gpt-oss-120b:
       rpm: 30
       rpd: 1000
-      tpm: 12000
-      tpd: 100000
+      tpm: 8000
+      tpd: 200000
       reset:
         rpm: rolling_60s
         rpd: fixed_daily_utc
         tpm: rolling_60s
         tpd: fixed_daily_utc
 
-    llama-3.1-8b-instant:
+    openai/gpt-oss-20b:
       rpm: 30
-      rpd: 14400
-      tpm: 6000
-      tpd: 500000
+      rpd: 1000
+      tpm: 8000
+      tpd: 200000
       reset:
         rpm: rolling_60s
         rpd: fixed_daily_utc

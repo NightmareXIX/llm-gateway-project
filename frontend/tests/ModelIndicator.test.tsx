@@ -26,7 +26,7 @@ import type { DoneEvent, MetaEvent, RestartEvent } from "@/lib/sse";
 import type { ChatCompletionResponse, MessageMeta } from "@/lib/types";
 
 const BASE: Provenance = {
-  servedBy: { slot: "general", provider: "groq", model: "llama-3.3-70b-versatile" },
+  servedBy: { slot: "general", provider: "groq", model: "openai/gpt-oss-120b" },
   requestedSlot: "auto",
   substituted: false,
   attempts: 1,
@@ -40,7 +40,7 @@ describe("rule 1 — served_by is always rendered", () => {
   it("names the model, the provider and the slot", () => {
     render(<ModelIndicator provenance={BASE} />);
 
-    expect(screen.getByText("Llama 3.3 70B")).toBeInTheDocument();
+    expect(screen.getByText("GPT-OSS 120B")).toBeInTheDocument();
     expect(screen.getByText("Groq")).toBeInTheDocument();
     expect(screen.getByText("general")).toBeInTheDocument();
   });
@@ -105,7 +105,7 @@ describe("rule 3 — attempts > 1 carries the trail", () => {
             {
               attempt: 1,
               provider: "groq",
-              model: "llama-3.3-70b-versatile",
+              model: "openai/gpt-oss-120b",
               slot: "general",
               outcome: "failed",
               reason: "provider unavailable",
@@ -139,7 +139,7 @@ describe("rule 4 — degraded says so", () => {
 describe("provenance adapters", () => {
   const meta: MessageMeta = {
     provider_used: "groq",
-    model_used: "llama-3.3-70b-versatile",
+    model_used: "openai/gpt-oss-120b",
     slot_used: "general",
     requested_slot: "auto",
     substituted: false,
@@ -168,10 +168,10 @@ describe("provenance adapters", () => {
       id: "01JABCDEF",
       object: "chat.completion",
       created: 1_760_000_000,
-      model: "llama-3.3-70b-versatile",
+      model: "openai/gpt-oss-120b",
       choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 812, completion_tokens: 340, total_tokens: 1152, estimated: false },
-      served_by: { slot: "general", provider: "groq", model: "llama-3.3-70b-versatile" },
+      served_by: { slot: "general", provider: "groq", model: "openai/gpt-oss-120b" },
       requested_slot: "auto",
       substituted: false,
       attempts: 1,
@@ -196,7 +196,7 @@ describe("a restarted stream, end to end", () => {
     attempt: 1,
     slot: "fast",
     provider: "groq",
-    model: "llama-3.1-8b-instant",
+    model: "openai/gpt-oss-20b",
     requested_slot: "fast",
     conversation_id: "8b0d1f6e-0000-4000-8000-000000000000",
     message_id: "8b0d1f6e-0000-4000-8000-000000000001",
@@ -204,7 +204,7 @@ describe("a restarted stream, end to end", () => {
 
   const restart: RestartEvent = {
     reason: "provider_unavailable",
-    failed: { provider: "groq", model: "llama-3.1-8b-instant" },
+    failed: { provider: "groq", model: "openai/gpt-oss-20b" },
     next: { slot: "general", provider: "gemini", model: "gemini-3.6-flash" },
     attempt: 2,
     discarded_chars: 412,

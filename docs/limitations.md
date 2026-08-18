@@ -128,6 +128,21 @@ is available rather than guaranteeing a specific one answers. `provider_used`/`m
 per message specifically so this stays visible and debuggable rather than a silent, unexplained quality
 swing.
 
+**A retired model ID takes the whole gateway down, not just its own candidate.** Free-tier catalogues
+rotate, and a model that disappears answers with HTTP 404 `model_not_found`. Every adapter's
+`parse_error` maps a 404 to `BadRequest` — failover-ineligible by the Contract A table — on the
+reasoning that our config is wrong and the next provider would only be asked the same wrong question.
+That reasoning does not survive contact with the failover chain: the next candidate is a *different*
+provider and a *different* wire name, and it would have answered fine. In August 2026 Groq retired
+`llama-3.3-70b-versatile` and `llama-3.1-8b-instant`, which were candidate 0 of `general` and `fast`
+respectively; because a `BadRequest` stops the loop, every request the deployed gateway served failed
+with `bad_request` while Gemini and OpenRouter sat healthy behind them. The fix was a two-line config
+edit (`config/providers.yaml`), but the blast radius is the point: **`GET /v1/models` cannot warn about
+this**, because it reports breaker and quota state and makes no upstream call, so a wire name that no
+longer exists looks `available` right up until it is asked. Re-check the checked-in model IDs against
+each provider's live catalogue whenever a request starts failing with `bad_request` and nothing in the
+gateway changed.
+
 **Rate limits are organization-level for Groq and project-level for Gemini, not per-key.** A second key
 on either provider adds nothing — `keys_resolution` (Phase 6) has to treat a user's private key on these
 providers as a billing change, not a capacity one, and the gateway does not attempt to work around this

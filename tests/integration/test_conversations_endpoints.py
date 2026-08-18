@@ -108,7 +108,7 @@ async def test_reading_returns_the_canonical_history(
     assert assistant["seq"] == 1
     assert assistant["role"] == "assistant"
     assert assistant["meta"]["provider_used"] == "groq"
-    assert assistant["meta"]["model_used"] == "llama-3.3-70b-versatile"
+    assert assistant["meta"]["model_used"] == "openai/gpt-oss-120b"
     assert assistant["meta"]["slot_used"] == "general"
     assert assistant["meta"]["substituted"] is False
     assert assistant["meta"]["tokens_out"] == 27

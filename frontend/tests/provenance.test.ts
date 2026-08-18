@@ -18,7 +18,7 @@ const META: MetaEvent = {
   attempt: 1,
   slot: "general",
   provider: "groq",
-  model: "llama-3.3-70b-versatile",
+  model: "openai/gpt-oss-120b",
   requested_slot: "auto",
   conversation_id: "8b0d1f6e-0000-4000-8000-000000000000",
   message_id: "8b0d1f6e-0000-4000-8000-000000000001",
@@ -26,7 +26,7 @@ const META: MetaEvent = {
 
 const RESTART: RestartEvent = {
   reason: "provider_unavailable",
-  failed: { provider: "groq", model: "llama-3.3-70b-versatile" },
+  failed: { provider: "groq", model: "openai/gpt-oss-120b" },
   next: { slot: "general", provider: "gemini", model: "gemini-3.6-flash" },
   attempt: 2,
   discarded_chars: 412,
@@ -35,7 +35,7 @@ const RESTART: RestartEvent = {
 describe("fromDoneEvent", () => {
   it("agrees field-for-field with the non-streaming adapter", () => {
     const facts = {
-      served_by: { slot: "general", provider: "groq", model: "llama-3.3-70b-versatile" },
+      served_by: { slot: "general", provider: "groq", model: "openai/gpt-oss-120b" },
       requested_slot: "auto",
       substituted: false,
       attempts: 1,
@@ -53,7 +53,7 @@ describe("fromDoneEvent", () => {
       id: "01JABCDEF",
       object: "chat.completion",
       created: 1_760_000_000,
-      model: "llama-3.3-70b-versatile",
+      model: "openai/gpt-oss-120b",
       choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 812, completion_tokens: 340, total_tokens: 1152, estimated: false },
       conversation_id: META.conversation_id,
@@ -93,7 +93,7 @@ describe("buildAttemptTrail", () => {
       {
         attempt: 1,
         provider: "groq",
-        model: "llama-3.3-70b-versatile",
+        model: "openai/gpt-oss-120b",
         slot: "general",
         outcome: "served",
       },

@@ -36,7 +36,7 @@ def spec() -> ModelSpec:
     return ModelSpec(
         slot="general",
         provider="groq",
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         context_window=131072,
         max_output_tokens=32768,
         supports_streaming=True,
@@ -142,10 +142,10 @@ def test_the_model_on_the_wire_comes_from_the_spec_not_the_slot(
     adapter: GroqAdapter, spec: ModelSpec
 ) -> None:
     """The whole point of the slot indirection: clients say `general`, the wire
-    says `llama-3.3-70b-versatile`, and changing the second breaks nothing."""
+    says `openai/gpt-oss-120b`, and changing the second breaks nothing."""
     payload = adapter.build_payload(fx.canonical_history(), spec, GenParams(), [])
 
-    assert payload["model"] == "llama-3.3-70b-versatile"
+    assert payload["model"] == "openai/gpt-oss-120b"
     assert "general" not in str(payload)
 
 
@@ -236,7 +236,7 @@ def _bless() -> None:
         ModelSpec(
             slot="general",
             provider="groq",
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             context_window=131072,
             max_output_tokens=32768,
             supports_streaming=True,

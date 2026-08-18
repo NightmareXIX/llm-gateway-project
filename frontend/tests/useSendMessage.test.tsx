@@ -40,7 +40,7 @@ const META: MetaEvent = {
   attempt: 1,
   slot: "general",
   provider: "groq",
-  model: "llama-3.3-70b-versatile",
+  model: "openai/gpt-oss-120b",
   requested_slot: "auto",
   conversation_id: "8b0d1f6e-0000-4000-8000-000000000000",
   message_id: "8b0d1f6e-0000-4000-8000-000000000001",
@@ -48,7 +48,7 @@ const META: MetaEvent = {
 
 const RESTART: RestartEvent = {
   reason: "provider_unavailable",
-  failed: { provider: "groq", model: "llama-3.3-70b-versatile" },
+  failed: { provider: "groq", model: "openai/gpt-oss-120b" },
   next: { slot: "general", provider: "gemini", model: "gemini-3.6-flash" },
   attempt: 2,
   discarded_chars: 24,

@@ -103,7 +103,7 @@ async def groq_script(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHandl
     single behaviour Step 5 exists to deliver.
 
     Pinned to a Groq-only fleet of two models: ``general``'s
-    ``llama-3.3-70b-versatile`` and ``fast``'s ``llama-3.1-8b-instant``. D10's
+    ``openai/gpt-oss-120b`` and ``fast``'s ``openai/gpt-oss-20b``. D10's
     spill means either slot's chain reaches both, so these tests exercise the
     failover loop against a chain short enough to script exactly.
     """
@@ -202,7 +202,7 @@ async def test_a_turn_answers_and_persists_both_halves(
     # Invariant 5: provenance on the assistant turn, absent on the user's.
     assert stored[0].meta["provider_used"] is None
     assert stored[1].meta["provider_used"] == "groq"
-    assert stored[1].meta["model_used"] == "llama-3.3-70b-versatile"
+    assert stored[1].meta["model_used"] == "openai/gpt-oss-120b"
     assert stored[1].meta["slot_used"] == "general"
     assert stored[1].meta["requested_slot"] == "auto"
     assert stored[1].meta["substituted"] is False
@@ -226,7 +226,7 @@ async def test_served_by_is_on_the_very_first_response(
     assert body["served_by"] == {
         "slot": "general",
         "provider": "groq",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
     }
     assert body["requested_slot"] == "auto"
     assert body["substituted"] is False
@@ -249,10 +249,10 @@ async def test_a_named_slot_is_honoured(
 
     body = response.json()
     assert body["served_by"]["slot"] == "fast"
-    assert body["served_by"]["model"] == "llama-3.1-8b-instant"
+    assert body["served_by"]["model"] == "openai/gpt-oss-20b"
     assert body["requested_slot"] == "fast"
     assert body["substituted"] is False
-    assert groq.last_json()["model"] == "llama-3.1-8b-instant"
+    assert groq.last_json()["model"] == "openai/gpt-oss-20b"
 
 
 async def test_the_requests_row_records_the_turn(
@@ -272,7 +272,7 @@ async def test_the_requests_row_records_the_turn(
     assert row.status == "ok"
     assert row.error_code is None
     assert row.provider == "groq"
-    assert row.model == "llama-3.3-70b-versatile"
+    assert row.model == "openai/gpt-oss-120b"
     assert row.requested_slot == "auto"
     assert row.served_slot == "general"
     assert row.tokens_in == 48
@@ -551,16 +551,16 @@ async def test_a_rate_limited_slot_is_substituted_and_says_so(
     body = response.json()
     assert body["requested_slot"] == "fast"
     assert body["served_by"]["slot"] == "general"
-    assert body["served_by"]["model"] == "llama-3.3-70b-versatile"
+    assert body["served_by"]["model"] == "openai/gpt-oss-120b"
     assert body["substituted"] is True
     assert body["attempts"] == 2
     # The chain as the wire saw it: the named slot first, then the spill.
-    assert handler.models() == ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
+    assert handler.models() == ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
     stored = await _messages(db_session, body["conversation_id"])
     assert stored[1].meta["substituted"] is True
     assert stored[1].meta["attempts"] == 2
-    assert stored[1].meta["model_used"] == "llama-3.3-70b-versatile"
+    assert stored[1].meta["model_used"] == "openai/gpt-oss-120b"
 
 
 async def test_auto_failing_over_is_not_a_substitution(
@@ -626,15 +626,15 @@ async def test_the_attempt_trail_reaches_the_requests_row(
     assert row.status == "ok"
     assert row.substituted is True
     assert row.served_slot == "general"
-    assert row.model == "llama-3.3-70b-versatile"
+    assert row.model == "openai/gpt-oss-120b"
 
     first, second = row.attempts
     assert first["n"] == 1
     assert first["outcome"] == "error"
     assert first["error_code"] == "rate_limited"
-    assert first["model"] == "llama-3.1-8b-instant"
+    assert first["model"] == "openai/gpt-oss-20b"
     assert second["outcome"] == "ok"
-    assert second["model"] == "llama-3.3-70b-versatile"
+    assert second["model"] == "openai/gpt-oss-120b"
     assert row.wasted_tokens_out == 0
 
 
@@ -662,8 +662,8 @@ async def test_a_failed_request_still_records_what_it_tried(
     assert row.status == "error"
     assert [attempt["outcome"] for attempt in row.attempts] == ["error", "error"]
     assert [attempt["model"] for attempt in row.attempts] == [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
     ]
     # The last candidate attempted, so "which slot was it on?" stays answerable.
     assert row.served_slot == "fast"
@@ -709,7 +709,7 @@ async def test_failover_crosses_providers(
 
     # The chain as the wire saw it. The second entry comes out of the URL, because
     # Gemini has no `model` field in its body at all.
-    assert handler.models() == ["llama-3.3-70b-versatile", "gemini-3.6-flash"]
+    assert handler.models() == ["openai/gpt-oss-120b", "gemini-3.6-flash"]
 
     (row,) = await _requests(db_session)
     assert row.provider == "gemini"
@@ -769,11 +769,11 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
         COMPLETIONS, json={"messages": [{"role": "user", "content": "hi"}]}, headers=headers
     )
     conversation_id = UUID(first.json()["conversation_id"])
-    assert first.json()["served_by"]["model"] == "llama-3.3-70b-versatile"
+    assert first.json()["served_by"]["model"] == "openai/gpt-oss-120b"
 
     conversation = await db_session.get(Conversation, conversation_id)
     assert conversation is not None
-    conversation.pinned_model = "groq/llama-3.1-8b-instant"
+    conversation.pinned_model = "groq/openai/gpt-oss-20b"
     await db_session.flush()
 
     second = await client.post(
@@ -786,8 +786,8 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
         headers=headers,
     )
 
-    assert second.json()["served_by"]["model"] == "llama-3.1-8b-instant"
-    assert handler.models()[-1] == "llama-3.1-8b-instant"
+    assert second.json()["served_by"]["model"] == "openai/gpt-oss-20b"
+    assert handler.models()[-1] == "openai/gpt-oss-20b"
 
 
 # --------------------------------------------------------------------------- #

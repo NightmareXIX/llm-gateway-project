@@ -56,7 +56,7 @@ def _spec(*, context_window: int = 131072, max_output_tokens: int = 32768) -> Mo
     return ModelSpec(
         slot="general",
         provider="groq",
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         supports_streaming=True,
@@ -229,7 +229,7 @@ async def test_the_resolver_sees_every_reference_and_the_target_model(
 
     payload, report = await render(history, spec, _params(), adapter, resolver=resolver)
 
-    assert resolver.calls == [(1, "llama-3.3-70b-versatile")]
+    assert resolver.calls == [(1, "openai/gpt-oss-120b")]
     assert report.attachments_injected == 1
     assert report.attachments_native == 0
     assert report.degraded is True, "low-confidence extraction is the local-OCR path"

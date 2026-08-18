@@ -20,8 +20,8 @@ const MODEL_LABELS: Record<string, string> = {
   // config/providers.yaml, slots `general` and `fast` — three candidates each
   // since Phase 2 Step 6, which is when substitution became something a user can
   // actually see under a message.
-  "llama-3.3-70b-versatile": "Llama 3.3 70B",
-  "llama-3.1-8b-instant": "Llama 3.1 8B",
+  "openai/gpt-oss-120b": "GPT-OSS 120B",
+  "openai/gpt-oss-20b": "GPT-OSS 20B",
   "gemini-3.6-flash": "Gemini 3.6 Flash",
   "gemini-3.5-flash-lite": "Gemini 3.5 Flash Lite",
   // The `:free` suffix is load-bearing on the wire (dropping it routes to the

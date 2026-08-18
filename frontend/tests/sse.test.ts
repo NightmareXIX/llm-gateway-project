@@ -26,14 +26,14 @@ const META = {
   attempt: 1,
   slot: "general",
   provider: "groq",
-  model: "llama-3.3-70b-versatile",
+  model: "openai/gpt-oss-120b",
   requested_slot: "auto",
   conversation_id: "8b0d1f6e-0000-4000-8000-000000000000",
   message_id: "8b0d1f6e-0000-4000-8000-000000000001",
 };
 
 const DONE = {
-  served_by: { slot: "general", provider: "groq", model: "llama-3.3-70b-versatile" },
+  served_by: { slot: "general", provider: "groq", model: "openai/gpt-oss-120b" },
   requested_slot: "auto",
   substituted: false,
   attempts: 1,
@@ -59,7 +59,7 @@ describe("SseParser", () => {
 
     expect(events.map((event) => event.event)).toEqual(["meta", "delta", "done"]);
     expect((events[0] as Extract<StreamEvent, { event: "meta" }>).data.model).toBe(
-      "llama-3.3-70b-versatile",
+      "openai/gpt-oss-120b",
     );
   });
 
@@ -198,7 +198,7 @@ describe("openCompletionStream", () => {
         frame("delta", { choices: [{ delta: { content: "half an ans" } }] }),
         frame("restart", {
           reason: "provider_unavailable",
-          failed: { provider: "groq", model: "llama-3.3-70b-versatile" },
+          failed: { provider: "groq", model: "openai/gpt-oss-120b" },
           next: { slot: "general", provider: "gemini", model: "gemini-3.6-flash" },
           attempt: 2,
           discarded_chars: 11,

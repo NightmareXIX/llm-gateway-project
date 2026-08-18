@@ -98,10 +98,10 @@ async def test_a_healthy_fleet_is_all_available(
     auto = _entry(body, "auto")
     assert auto["owned_by"] is None
     assert {(c["provider"], c["model"]) for c in auto["candidates"]} == {
-        ("groq", "llama-3.3-70b-versatile"),
+        ("groq", "openai/gpt-oss-120b"),
         ("gemini", "gemini-3.6-flash"),
         ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
-        ("groq", "llama-3.1-8b-instant"),
+        ("groq", "openai/gpt-oss-20b"),
         ("gemini", "gemini-3.5-flash-lite"),
         ("openrouter", "openai/gpt-oss-20b:free"),
     }
@@ -125,7 +125,7 @@ async def test_an_open_breaker_marks_only_its_own_candidate_unavailable(
     no_upstream: Any,
 ) -> None:
     breaker = CircuitBreaker(redis_client, clock=frozen_clock)
-    await _open_breaker(breaker, "groq", "llama-3.1-8b-instant")
+    await _open_breaker(breaker, "groq", "openai/gpt-oss-20b")
 
     response = await client.get(MODELS, headers=_headers(make_jwt))
 
@@ -185,7 +185,7 @@ async def test_every_candidate_blocked_makes_the_slot_unavailable(
 ) -> None:
     breaker = CircuitBreaker(redis_client, clock=frozen_clock)
     for provider, model in [
-        ("groq", "llama-3.1-8b-instant"),
+        ("groq", "openai/gpt-oss-20b"),
         ("gemini", "gemini-3.5-flash-lite"),
         ("openrouter", "openai/gpt-oss-20b:free"),
     ]:

@@ -53,14 +53,27 @@ providers:
 # about the provider, not a bug in the router. The `:free` suffix on every OpenRouter
 # model is load-bearing and asserted by a test: dropping it routes to the paid variant
 # silently.
+#
+# Groq's turn came next: it retired `llama-3.3-70b-versatile` and `llama-3.1-8b-instant`
+# from its catalogue, and because Groq is candidate 0 in *both* slots, every request the
+# deployed gateway served died on the 404 those two names now return. `parse_error` maps
+# a 404 to `BadRequest` — failover-ineligible — so the router never reached Gemini or
+# OpenRouter, both of which were healthy the whole time. Replaced with the two models
+# Groq actually serves; `GET /v1/models` on the live service is the way to re-check this
+# list after any free-tier reshuffle.
+#
+# `fast` now names `openai/gpt-oss-20b` twice, once on Groq and once as OpenRouter's
+# `:free` variant. That is deliberate and not a redundancy: failover here is about a
+# provider's quota running out, not the weights being different, and the two are separate
+# free-tier budgets that exhaust independently.
 slots:
   general:
     description: Default answering slot — balanced quality and free-tier headroom.
     candidates:
       - provider: groq
-        model: llama-3.3-70b-versatile
+        model: openai/gpt-oss-120b
         context_tokens: 131072
-        max_output_tokens: 32768
+        max_output_tokens: 65536
         capabilities: [text]
         supports_streaming: true
         max_file_bytes: null
@@ -93,9 +106,9 @@ slots:
     description: Latency-first slot for short turns.
     candidates:
       - provider: groq
-        model: llama-3.1-8b-instant
+        model: openai/gpt-oss-20b
         context_tokens: 131072
-        max_output_tokens: 8192
+        max_output_tokens: 65536
         capabilities: [text]
         supports_streaming: true
         max_file_bytes: null
