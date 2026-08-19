@@ -43,6 +43,11 @@ os.environ.setdefault("GROQ_API_KEY", "gsk_test_key_not_real")
 os.environ.setdefault("GEMINI_API_KEY", "gemini_test_key_not_real")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-v1-test-key-not-real")
 os.environ.setdefault("ENCRYPTION_KEY", "dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=")
+# Phase 4 Step 1: FILES_STORAGE_BACKEND defaults to "supabase", which a
+# boot-time model validator refuses to accept without this — and `app.main`
+# calls `create_app()` (which validates config) at *module import time*, so a
+# missing value here fails `conftest.py`'s own import, not a single test.
+os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "service_role_test_key_not_real")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://gateway:gateway@127.0.0.1:5432/gateway")
 

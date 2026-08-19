@@ -287,14 +287,26 @@ def _baseline_without_service_role_key() -> dict[str, Any]:
     }
 
 
-def test_supabase_backend_requires_the_service_role_key() -> None:
+def test_supabase_backend_requires_the_service_role_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """D23's boot-time pairing check — the failure has to name the missing var
-    rather than surface as a 500 on the first upload."""
+    rather than surface as a 500 on the first upload.
+
+    `conftest.py` sets a process-wide placeholder so importing the app doesn't
+    require every developer/CI env to configure this — `_env_file=None` alone
+    is not enough to make it "unset" here, since env vars outrank the dotenv
+    file. This test has to remove it from the process environment too.
+    """
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
     with pytest.raises(ValidationError, match="SUPABASE_SERVICE_ROLE_KEY"):
         Settings(**_baseline_without_service_role_key())
 
 
-def test_local_and_memory_backends_do_not_need_the_service_role_key() -> None:
+def test_local_and_memory_backends_do_not_need_the_service_role_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
     local = Settings(**_baseline_without_service_role_key(), FILES_STORAGE_BACKEND="local")
     memory = Settings(**_baseline_without_service_role_key(), FILES_STORAGE_BACKEND="memory")
 
