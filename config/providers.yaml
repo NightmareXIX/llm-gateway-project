@@ -132,6 +132,37 @@ slots:
         max_file_bytes: null
         reserved_fraction: 0.0
 
-  # Perception lane (D8) and long-context slots land here in Phase 4/5.
-  # Left undeclared rather than guessed — an empty candidate list is rejected at
-  # load time, so no slot can exist without somewhere to actually route.
+  # Phase 4 Step 1. The perception lane's own slot (D26) — candidates are the
+  # same two Gemini models `general` and `fast` already declare, in the same
+  # capability order, so the extraction call is a normal `build_payload` +
+  # `complete` through the existing adapter, breaker and quota machinery,
+  # pointed at a slot no client can name. `internal: true` is what keeps
+  # `GET /v1/models` from listing it and turns `"model": "perception"` in a
+  # chat request into the same 400 a typo gets (`registry.py`,
+  # `api/v1/chat.py::_validate_slot`).
+  #
+  # `reserved_fraction: 0.5` on both candidates has to match what `general` and
+  # `fast` declare for the same models, or D8's answer/perception split stops
+  # summing to one — `registry.build_model_specs` fails startup if it ever
+  # doesn't (trap 19).
+  perception:
+    description: Internal extraction lane for the perception lane (Phase 4). Never client-facing.
+    internal: true
+    candidates:
+      - provider: gemini
+        model: gemini-3.6-flash
+        context_tokens: 1048576
+        max_output_tokens: 65536
+        capabilities: [text, vision, pdf]
+        supports_streaming: true
+        max_file_bytes: 20000000
+        reserved_fraction: 0.5
+
+      - provider: gemini
+        model: gemini-3.5-flash-lite
+        context_tokens: 1048576
+        max_output_tokens: 65536
+        capabilities: [text, vision, pdf]
+        supports_streaming: true
+        max_file_bytes: 20000000
+        reserved_fraction: 0.5

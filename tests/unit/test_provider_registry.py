@@ -139,7 +139,11 @@ def test_the_checked_in_config_produces_the_slots_phase_one_expects() -> None:
     """Guards the real `config/providers.yaml`, not a synthetic one."""
     specs = build_model_specs(get_providers_config())
 
-    assert set(specs) == {"general", "fast"}
+    # `build_model_specs` is the pure, slot-level view — it carries `perception`
+    # too, because the perception lane (Phase 4) resolves it by name. Filtering
+    # it out of what a client can see is `ProviderRegistry.slots()`'s job, not
+    # this function's.
+    assert set(specs) == {"general", "fast", "perception"}
     assert specs["general"][0].provider == "groq"
     assert specs["general"][0].slot == "general"
 
@@ -168,6 +172,90 @@ def test_a_provider_with_no_adapter_fails_loudly() -> None:
 
     with pytest.raises(ConfigError, match="no adapter"):
         build_model_specs(config)
+
+
+def test_a_model_disagreeing_on_reserved_fraction_across_slots_fails_loudly() -> None:
+    """D26/trap 19: the same (provider, model) pair in two slots must agree on
+    how much of its budget the perception lane fences off, or D8's two halves
+    stop summing to the published limit and nothing downstream would notice."""
+    config = _config(
+        slots={
+            "general": Slot(
+                description="reserves half for perception",
+                candidates=(
+                    SlotCandidate(
+                        provider="gemini",
+                        model="gemini-flash",
+                        context_tokens=1_000_000,
+                        max_output_tokens=8192,
+                        reserved_fraction=0.5,
+                    ),
+                ),
+            ),
+            "perception": Slot(
+                description="reserves nothing — a drift from `general`'s 0.5",
+                internal=True,
+                candidates=(
+                    SlotCandidate(
+                        provider="gemini",
+                        model="gemini-flash",
+                        context_tokens=1_000_000,
+                        max_output_tokens=8192,
+                        reserved_fraction=0.0,
+                    ),
+                ),
+            ),
+        },
+        providers={
+            "gemini": ProviderEntry(
+                enabled=True, base_url="https://example.invalid", api_key_env="GEMINI_API_KEY"
+            ),
+        },
+    )
+
+    with pytest.raises(ConfigError, match="reserved_fraction"):
+        build_model_specs(config)
+
+
+def test_a_model_agreeing_on_reserved_fraction_across_slots_is_fine() -> None:
+    config = _config(
+        slots={
+            "general": Slot(
+                description="reserves half for perception",
+                candidates=(
+                    SlotCandidate(
+                        provider="gemini",
+                        model="gemini-flash",
+                        context_tokens=1_000_000,
+                        max_output_tokens=8192,
+                        reserved_fraction=0.5,
+                    ),
+                ),
+            ),
+            "perception": Slot(
+                description="agrees with `general`",
+                internal=True,
+                candidates=(
+                    SlotCandidate(
+                        provider="gemini",
+                        model="gemini-flash",
+                        context_tokens=1_000_000,
+                        max_output_tokens=8192,
+                        reserved_fraction=0.5,
+                    ),
+                ),
+            ),
+        },
+        providers={
+            "gemini": ProviderEntry(
+                enabled=True, base_url="https://example.invalid", api_key_env="GEMINI_API_KEY"
+            ),
+        },
+    )
+
+    specs = build_model_specs(config)
+    assert specs["general"][0].reserved_fraction == 0.5
+    assert specs["perception"][0].reserved_fraction == 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -277,6 +365,56 @@ def test_the_checked_in_config_builds_a_registry_for_all_three_providers(
     # branch that turns a config typo into a loud failure stays covered.
     with pytest.raises(UnknownSlot):
         registry.adapter_for("anthropic")
+
+
+def test_an_internal_slot_is_routable_but_invisible_to_slots(
+    client: httpx.AsyncClient,
+) -> None:
+    """D26: `perception` resolves by name (the extraction lane needs that) but
+    is filtered out of `slots()`, which is what `GET /v1/models` and
+    `_validate_slot`'s happy path both walk."""
+    config = _config(
+        slots={
+            "general": Slot(
+                description="client-facing",
+                candidates=(
+                    SlotCandidate(
+                        provider="groq",
+                        model="llama-3.3-70b-versatile",
+                        context_tokens=131072,
+                        max_output_tokens=32768,
+                    ),
+                ),
+            ),
+            "perception": Slot(
+                description="internal only",
+                internal=True,
+                candidates=(
+                    SlotCandidate(
+                        provider="groq",
+                        model="llama-3.3-70b-versatile",
+                        context_tokens=131072,
+                        max_output_tokens=32768,
+                    ),
+                ),
+            ),
+        },
+    )
+    registry = build_registry(client=client, config=config, settings=get_settings())
+
+    assert registry.slots() == ("general",)
+    assert registry.is_internal("perception") is True
+    assert registry.is_internal("general") is False
+    # Still resolvable directly — the perception lane calls this by name.
+    assert len(registry.candidates("perception")) == 1
+
+
+def test_the_checked_in_config_does_not_expose_perception(client: httpx.AsyncClient) -> None:
+    registry = build_registry(client=client, settings=get_settings())
+
+    assert "perception" not in registry.slots()
+    assert registry.is_internal("perception") is True
+    assert len(registry.candidates("perception")) == 2
 
 
 def test_an_enabled_provider_with_an_empty_key_kills_startup(

@@ -156,6 +156,70 @@ class Settings(BaseSettings):
     enthusiastic caller draining a shared free-tier pool for everyone else — this
     switch exists for load-testing the gateway itself, not for production use."""
 
+    FILES_STORAGE_BACKEND: Literal["supabase", "local", "memory"] = "supabase"
+    """D23: which :class:`~app.perception.storage.ObjectStore` implementation
+    backs ``POST /v1/files``. ``supabase`` in every deployed environment;
+    ``local`` for a developer without Supabase Storage configured; ``memory``
+    is what the test suite uses so a byte never touches a disk or a network in
+    CI. Printed in ``startup.complete`` beside the other four switches, because
+    which backend is live is otherwise invisible until an upload fails."""
+
+    FILES_LOCAL_DIR: str = ".files"
+    """Root directory for ``FILES_STORAGE_BACKEND=local``. Ignored otherwise."""
+
+    FILES_BUCKET: str = "uploads"
+    """The Supabase Storage bucket ``SupabaseStore`` writes to and reads from.
+    Private, and stays private (D23) — there is no signed-URL or download path
+    in Phase 4, so a public bucket would only be a wider attack surface for no
+    feature."""
+
+    SUPABASE_SERVICE_ROLE_KEY: SecretStr | None = None
+    """Bypasses row-level security on the whole Supabase project — more
+    authority than any credential the gateway otherwise holds (trap 17). Used
+    for exactly one thing: object read/write on ``FILES_BUCKET`` through
+    ``SupabaseStore``. Required when ``FILES_STORAGE_BACKEND == "supabase"``,
+    checked below rather than left to surface as a 500 on the first upload."""
+
+    FILE_MAX_BYTES: int = Field(default=10_000_000, gt=0)
+    """Hard cap enforced while streaming the upload in 64KB chunks (trap 3) —
+    a ``Content-Length`` header is a claim, not a guarantee, so the cap has to
+    be checked as bytes arrive, not after they have all been buffered."""
+
+    PERCEPTION_ENABLED: bool = True
+    """Master switch for the whole perception lane. Off, a ``file_ref`` on a
+    turn reaches render step 1's default ``NoAttachments`` resolver and raises,
+    exactly as it does before this phase exists — the same escape hatch shape
+    as ``QUOTA_ENFORCEMENT`` and ``CACHE_EXACT_ENABLED``, for when the lane
+    itself is what is being debugged."""
+
+    PERCEPTION_LOCAL_ONLY: bool = False
+    """Skip tier 2 (the Gemini extraction call) entirely; every extraction goes
+    local. Exists for the demo D25 and D30 describe — "disable Gemini
+    entirely, the answer still arrives, degraded and labelled" — without
+    revoking a key."""
+
+    PERCEPTION_LOCAL_OCR_ENABLED: bool = True
+    """Gate on the local tier's Tesseract path. Detected at startup rather than
+    assumed present (D30): the binary is a system dependency, not a wheel, and
+    is routinely absent on a developer's machine. Off, or if the probe finds no
+    binary, tier 3 still reads a PDF's text layer but an image falls straight
+    to ``FileUnreadable`` instead of a stack trace."""
+
+    PERCEPTION_OCR_MAX_PAGES: int = Field(default=10, gt=0)
+    """Cap on pages rasterized and OCR'd per document (trap 15). An unbounded
+    OCR of a long scan is minutes of CPU on a request that has to return; pages
+    beyond the cap are noted in the extracted text rather than silently
+    dropped."""
+
+    @model_validator(mode="after")
+    def _supabase_backend_needs_its_key(self) -> Settings:
+        if self.FILES_STORAGE_BACKEND == "supabase" and self.SUPABASE_SERVICE_ROLE_KEY is None:
+            raise ValueError(
+                "FILES_STORAGE_BACKEND is 'supabase' but SUPABASE_SERVICE_ROLE_KEY is unset; "
+                "set it, or set FILES_STORAGE_BACKEND to 'local' or 'memory'."
+            )
+        return self
+
     @property
     def is_production(self) -> bool:
         return self.ENV == "prod"
@@ -289,6 +353,14 @@ class Slot(BaseModel):
 
     description: str
     candidates: tuple[SlotCandidate, ...] = Field(min_length=1)
+
+    internal: bool = False
+    """True for a slot that exists to be called by the gateway itself —
+    Phase 4's ``perception`` slot — never by a client. ``registry.slots()``
+    and ``GET /v1/models`` skip internal slots, and a client naming one
+    explicitly gets the same 400 a typo would (D26); ``registry.candidates()``
+    still resolves them, because the perception lane has to be able to call
+    one by name."""
 
 
 class ProvidersConfig(BaseModel):

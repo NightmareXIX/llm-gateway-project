@@ -134,7 +134,37 @@ def build_model_specs(config: ProvidersConfig | None = None) -> dict[str, tuple[
             for priority, candidate in enumerate(routable)
         )
 
+    _check_reserved_fraction_agrees_across_slots(specs)
     return specs
+
+
+def _check_reserved_fraction_agrees_across_slots(specs: dict[str, tuple[ModelSpec, ...]]) -> None:
+    """D26/trap 19: a model declared in more than one slot must reserve the same
+    fraction of its budget everywhere it appears.
+
+    Phase 4's ``perception`` slot repeats the same two Gemini models ``general``
+    and ``fast`` already declare. ``reserved_fraction`` is read by
+    ``quota/lanes.py`` per *model*, not per slot — if two slots disagreed, D8's
+    answer and perception halves would stop summing to the published limit, and
+    nothing downstream would notice. A boot failure here is the whole defence.
+    """
+    declared: dict[tuple[str, str], tuple[str, float]] = {}
+
+    for slot_name, slot_specs in specs.items():
+        for spec in slot_specs:
+            prior = declared.get(spec.key)
+            if prior is None:
+                declared[spec.key] = (slot_name, spec.reserved_fraction)
+                continue
+
+            prior_slot, prior_fraction = prior
+            if prior_fraction != spec.reserved_fraction:
+                raise ConfigError(
+                    f"{spec.provider}/{spec.model} declares reserved_fraction="
+                    f"{spec.reserved_fraction} in slot {slot_name!r} but "
+                    f"{prior_fraction} in slot {prior_slot!r}; every slot that shares a "
+                    f"model must agree, or D8's answer/perception split stops summing to one."
+                )
 
 
 def _traits(provider: str) -> ProviderTraits:
@@ -161,14 +191,32 @@ class ProviderRegistry:
         specs: dict[str, tuple[ModelSpec, ...]],
         adapters: dict[str, ProviderAdapter],
         keys: dict[str, SecretStr],
+        internal_slots: frozenset[str] = frozenset(),
     ) -> None:
         self._specs = specs
         self._adapters = adapters
         self._keys = keys
+        self._internal_slots = internal_slots
 
     def slots(self) -> tuple[str, ...]:
-        """Every routable slot name, in config order."""
-        return tuple(self._specs)
+        """Every routable, client-facing slot name, in config order.
+
+        An internal slot (Phase 4's ``perception``) is routable — ``candidates()``
+        resolves it — but is not something a client should ever see in
+        ``GET /v1/models`` or ask for by name, so it is filtered out here rather
+        than dropped from ``_specs`` entirely.
+        """
+        return tuple(name for name in self._specs if name not in self._internal_slots)
+
+    def is_internal(self, slot: str) -> bool:
+        """Whether ``slot`` exists only for the gateway to call on itself.
+
+        ``api/v1/chat.py::_validate_slot`` uses this to give a client naming
+        ``perception`` explicitly the same 400 a typo gets (D26) — ``candidates()``
+        itself does not raise, because the perception lane has to be able to
+        resolve the slot by name.
+        """
+        return slot in self._internal_slots
 
     def candidates(self, slot: str) -> tuple[ModelSpec, ...]:
         """The slot's candidates in failover order. Phase 2's router walks this."""
@@ -251,7 +299,13 @@ def build_registry(
             "no routable slots: every slot in providers.yaml points only at disabled providers"
         )
 
-    registry = ProviderRegistry(specs=specs, adapters=adapters, keys=keys)
+    internal_slots = frozenset(
+        name for name, slot in config.slots.items() if slot.internal and name in specs
+    )
+
+    registry = ProviderRegistry(
+        specs=specs, adapters=adapters, keys=keys, internal_slots=internal_slots
+    )
     logger.info(
         "providers.registry_built",
         providers=sorted(adapters),

@@ -31,6 +31,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN groupadd --system --gid 1001 app \
     && useradd --system --uid 1001 --gid app --create-home app
 
+# Phase 4 Step 1 (D30): the local perception tier's OCR path shells out to the
+# `tesseract` binary — a system dependency, not a wheel. `tesseract-ocr-eng` is
+# the English language data; roughly 100MB combined, which is why the image
+# roughly doubles in size and Render's free build has to be watched for a
+# timeout on the next deploy (Step 12). Detected at startup rather than
+# assumed present (`PERCEPTION_LOCAL_OCR_ENABLED`) so a build without this
+# layer still boots — but the deployed image always carries it.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y tesseract-ocr tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /srv/app

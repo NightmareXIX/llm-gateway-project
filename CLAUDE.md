@@ -6,7 +6,7 @@ when a free tier runs out, tracks heterogeneous quota (RPM/RPD/TPM) in Redis, an
 through a separate "perception lane" even when the answering model can't. Portfolio/learning project, runs
 entirely on free tiers. Full specs: [contracts-and-phase1.md](doc/reference/contracts-and-phase1.md),
 [project-overview.md](doc/reference/project-overview.md), [development-plan.md](doc/reference/development-plan.md),
-[phase2.md](doc/reference/phase2.md), [phase3.md](doc/reference/phase3.md).
+[phase2.md](doc/reference/phase2.md), [phase3.md](doc/reference/phase3.md), [phase4.md](doc/reference/phase4.md).
 Where the overview and the contracts doc disagree, the contracts doc wins.
 
 ## Locked decisions (§1) — do not relitigate
@@ -99,14 +99,33 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, not yet started
+## Current phase: Phase 4 — Perception Lane, Step 1 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
-perception lane, per `project-overview.md` §4.5 and `development-plan.md` §3) is next per the
-phased build plan but has no step-by-step plan doc yet (`doc/reference/phase4.md` does not exist) and
-no code has landed for it — `quota/lanes.py::reserve_perception` is the typed seam Phase 3 left for
-it to fill (see below).
+perception lane, per `project-overview.md` §4.5 and `development-plan.md` §3) is next per the phased
+build plan; its step-by-step plan is [phase4.md](doc/reference/phase4.md) (D22–D30). Milestone A
+(Steps 1–4, the bytes land) is in progress.
+
+**Step 1 (config surface, settings, migration) is in.** Nothing behaves differently yet — this step is
+paperwork before mechanism, exactly as Phase 3 Step 1 — but `perception` is now a declared slot, the
+tables exist, and every later step can be switched off in one deploy. `pyproject.toml` gained
+`python-multipart`, `pymupdf`, `pytesseract`, `pillow`. `app/config.py`'s `Settings` gained
+`FILES_STORAGE_BACKEND`/`FILES_LOCAL_DIR`/`FILES_BUCKET`/`SUPABASE_SERVICE_ROLE_KEY` (D23 — paired by a
+boot-time model validator, so a `supabase` backend without the key fails at startup rather than on the
+first upload), `FILE_MAX_BYTES`, and the three `PERCEPTION_*` switches (`ENABLED`, `LOCAL_ONLY`,
+`LOCAL_OCR_ENABLED`) plus `PERCEPTION_OCR_MAX_PAGES`, all printed in `startup.complete`. `Slot` gained
+`internal: bool = False`, and `config/providers.yaml` declares the `perception` slot (D26) — the same
+two Gemini models `general` and `fast` already route to, `reserved_fraction: 0.5` matching both,
+`internal: true`. `registry.build_model_specs` gained a startup check that fails boot if a model's
+`reserved_fraction` disagrees across the slots that share it (trap 19), and `ProviderRegistry.slots()` /
+`GET /v1/models` now skip internal slots while `.candidates()` still resolves them by name —
+`api/v1/chat.py::_validate_slot` gives a client naming `perception` explicitly the same 400 a typo gets.
+Migration `0004` adds `files` (per-user ownership, unique on `(user_id, file_hash)`, D24) and
+`file_extractions` (content-addressed and global, keyed on `file_hash` alone, D22) — mirrored in
+`app/db/models.py` as `File`/`FileExtraction`. The `Dockerfile`'s runtime stage installs
+`tesseract-ocr`/`tesseract-ocr-eng` ahead of Step 7's local tier (D30). Step 2
+(`app/perception/storage.py`, the `ObjectStore` behind `POST /v1/files`) is next.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

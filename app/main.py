@@ -126,6 +126,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         quota_headroom_fraction=settings.QUOTA_HEADROOM_FRACTION,
         cache_exact_enabled=settings.CACHE_EXACT_ENABLED,
         rate_limit_enabled=settings.RATE_LIMIT_ENABLED,
+        # Phase 4 Step 1's file/perception switches — same reasoning as the four
+        # above: each one changes upload or extraction behaviour invisibly
+        # unless its state is in the first line of the startup log.
+        files_storage_backend=settings.FILES_STORAGE_BACKEND,
+        file_max_bytes=settings.FILE_MAX_BYTES,
+        perception_enabled=settings.PERCEPTION_ENABLED,
+        perception_local_only=settings.PERCEPTION_LOCAL_ONLY,
+        perception_local_ocr_enabled=settings.PERCEPTION_LOCAL_OCR_ENABLED,
     )
     try:
         yield

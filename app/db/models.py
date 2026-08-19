@@ -315,3 +315,101 @@ class Request(Base):
     written now so every row is unambiguous rather than assumed system-scoped."""
 
     created_at: Mapped[datetime] = _created_at()
+
+
+# --------------------------------------------------------------------------- #
+# files
+# --------------------------------------------------------------------------- #
+class File(Base):
+    """One user's right to reference an uploaded object. Phase 4, D23/D24.
+
+    The bytes and the object are content-addressed and global — two users
+    uploading identical bytes write the same ``storage_path`` once. The *right
+    to reference* a hash is per user, which is what this row is: ownership
+    lives here, not on the object store, and every ``file_ref`` that enters a
+    message is validated against it with ``WHERE file_hash = ANY(:hashes) AND
+    user_id = :uid`` before a single message row is written (D24) — a hash the
+    caller does not own is a 404, the same rule ``conversations`` follows.
+    """
+
+    __tablename__ = "files"
+    __table_args__ = (
+        UniqueConstraint("user_id", "file_hash", name="uq_files_user_id_file_hash"),
+        Index("ix_files_file_hash", "file_hash"),
+    )
+
+    id: Mapped[UUID] = _pk()
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    file_hash: Mapped[str] = mapped_column(nullable=False)
+    """SHA-256 of the bytes, computed while streaming the upload (trap 3). The
+    identity everything else in the perception lane keys on — never the object
+    store path, which is derived from this rather than the other way around."""
+
+    filename: Mapped[str] = mapped_column(nullable=False)
+    mime: Mapped[str] = mapped_column(nullable=False)
+    """The *sniffed* type, not the client's declared ``Content-Type`` (trap 2) —
+    ``POST /v1/files`` stores what the leading bytes actually are."""
+
+    bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_path: Mapped[str] = mapped_column(nullable=False)
+    """Content-addressed: ``{hash[:2]}/{hash}`` in ``FILES_BUCKET``. Never a
+    signed or public URL — the bucket stays private, and the only reader of the
+    bytes is the gateway itself, resolving an attachment for a model (D23)."""
+
+    created_at: Mapped[datetime] = _created_at()
+
+
+# --------------------------------------------------------------------------- #
+# file_extractions
+# --------------------------------------------------------------------------- #
+class FileExtraction(Base):
+    """The perception lane's extraction cache. Phase 4, D22/D25.
+
+    Keyed on ``file_hash`` alone, unlike :class:`File` — content-addressed *and*
+    global, because the extracted text of a byte sequence is a property of
+    those bytes, not of who uploaded them. Re-extracting it per user would
+    spend the scarcest budget in the fleet to compute the same string twice.
+
+    A row here exists only for tier 2 (``llm``) or tier 3 (``local``) — tier 0
+    (``cache``) reads this table rather than writing it, and tier 1
+    (``native``) never produces one at all, which is exactly what the ``tier``
+    CHECK below encodes.
+    """
+
+    __tablename__ = "file_extractions"
+    __table_args__ = (
+        CheckConstraint(
+            "extraction_confidence in ('high', 'medium', 'low')",
+            name="extraction_confidence_known",
+        ),
+        CheckConstraint("tier in ('llm', 'local')", name="tier_known"),
+    )
+
+    file_hash: Mapped[str] = mapped_column(primary_key=True)
+
+    text: Mapped[str] = mapped_column(nullable=False)
+    """D28's four labelled sections (summary first), never raw concatenation —
+    the envelope that lets a model tell document content from instruction."""
+
+    extracted_by_provider: Mapped[str] = mapped_column(nullable=False)
+    """``"local"`` for a tier-3 row — there is no upstream provider to name,
+    and the alternative (``NULL``) would make every query that groups by
+    provider carry a null-handling special case for exactly one tier."""
+
+    extracted_by_model: Mapped[str] = mapped_column(nullable=False)
+    extraction_confidence: Mapped[str] = mapped_column(nullable=False)
+    """``high``/``medium`` from tier 2, always ``low`` from tier 3 — never
+    absent, since ``low`` is what sets ``RenderReport.degraded``."""
+
+    tier: Mapped[str] = mapped_column(nullable=False)
+    """``llm`` or ``local`` — which tier actually produced this row. Never
+    ``cache`` or ``native``; see the class docstring."""
+
+    pages: Mapped[int | None] = mapped_column(Integer, default=None)
+    """Known before the payload is built for a native attachment too (D27) —
+    an image has none, so this stays nullable rather than defaulting to zero
+    and reading as "zero pages"."""
+
+    created_at: Mapped[datetime] = _created_at()

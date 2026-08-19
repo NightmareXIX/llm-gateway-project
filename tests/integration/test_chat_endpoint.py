@@ -881,6 +881,27 @@ async def test_an_unknown_slot_is_a_400_and_costs_nothing(
     assert groq.requests == []
 
 
+async def test_asking_for_the_internal_perception_slot_is_a_400(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    db_session: AsyncSession,
+) -> None:
+    """Phase 4 Step 1 (D26): `perception` is routable — `registry.candidates()`
+    resolves it, since the extraction lane calls it by name — but a client
+    naming it explicitly gets the same 400 a typo gets, never a real request."""
+    response = await client.post(
+        COMPLETIONS,
+        json={"model": "perception", "messages": [{"role": "user", "content": "hi"}]},
+        headers=_headers(make_jwt),
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "unknown_slot"
+    assert "perception" not in error["details"]["available"]
+    assert await _requests(db_session) == []
+
+
 async def test_a_client_cannot_author_an_assistant_turn(
     client: httpx.AsyncClient, make_jwt: TokenFactory
 ) -> None:

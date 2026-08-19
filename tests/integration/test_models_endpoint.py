@@ -85,6 +85,9 @@ async def test_a_healthy_fleet_is_all_available(
     body = response.json()
     assert body["object"] == "list"
     assert [entry["id"] for entry in body["data"]] == ["auto", "general", "fast"]
+    # Phase 4 Step 1 (D26): the perception lane's internal slot is routable —
+    # the extraction lane resolves it by name — but never client-facing.
+    assert "perception" not in [entry["id"] for entry in body["data"]]
 
     for entry in body["data"]:
         assert entry["status"] == "available"

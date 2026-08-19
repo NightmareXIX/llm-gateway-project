@@ -25,6 +25,22 @@ dependencies = [
     # one — a runtime dependency, not a dev one, because `quota/windows.py`'s
     # `fixed_daily_pt` resolves it on every request, not just in tests.
     "tzdata>=2025.1",
+    # Phase 4 Step 1. FastAPI cannot parse a multipart body without this — the
+    # failure is an assertion at *route definition* time, not request time
+    # (trap 1), so it has to be installed before `POST /v1/files` is even
+    # importable.
+    "python-multipart>=0.0.18",
+    # PDF text layer + rasterization for the local tier (D30). AGPL-3.0 — fine
+    # for a project that is not distributed as a closed-source product; see
+    # docs/limitations.md. `pypdfium2` (BSD) is the documented swap.
+    "pymupdf>=1.24",
+    # Tesseract OCR bindings for the local tier's image/scanned-PDF path.
+    # Shells out to the `tesseract` binary (Dockerfile), which is absent on a
+    # developer's machine unless installed separately — detected at startup,
+    # never assumed (D30).
+    "pytesseract>=0.3.13",
+    # pytesseract's image handle.
+    "pillow>=11",
 ]
 
 [project.optional-dependencies]

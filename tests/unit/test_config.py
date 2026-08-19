@@ -76,6 +76,14 @@ OPTIONAL_VARS = (
     "QUOTA_HEADROOM_FRACTION",
     "CACHE_EXACT_ENABLED",
     "RATE_LIMIT_ENABLED",
+    "FILES_STORAGE_BACKEND",
+    "FILES_LOCAL_DIR",
+    "FILES_BUCKET",
+    "FILE_MAX_BYTES",
+    "PERCEPTION_ENABLED",
+    "PERCEPTION_LOCAL_ONLY",
+    "PERCEPTION_LOCAL_OCR_ENABLED",
+    "PERCEPTION_OCR_MAX_PAGES",
 )
 
 BASELINE = {
@@ -88,6 +96,10 @@ BASELINE = {
     "GEMINI_API_KEY": "not_a_real_gemini_key",
     "OPENROUTER_API_KEY": "sk-or-v1-not-a-real-key",
     "ENCRYPTION_KEY": "dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=",
+    # Not in REQUIRED_VARS: it is only conditionally required (a model
+    # validator, not a bare pydantic field), tied to FILES_STORAGE_BACKEND's
+    # default of "supabase" rather than unconditionally to boot.
+    "SUPABASE_SERVICE_ROLE_KEY": "service_role_not_a_real_key",
 }
 
 
@@ -255,6 +267,51 @@ def test_quota_headroom_fraction_defaults_and_bounds() -> None:
         _settings(QUOTA_HEADROOM_FRACTION=1.0)
     with pytest.raises(ValidationError):
         _settings(QUOTA_HEADROOM_FRACTION=-0.01)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4 Step 1's file/perception switches
+# --------------------------------------------------------------------------- #
+def test_files_storage_backend_defaults_to_supabase() -> None:
+    assert _settings().FILES_STORAGE_BACKEND == "supabase"
+
+
+def _baseline_without_service_role_key() -> dict[str, Any]:
+    # `_env_file=None` so a real developer `.env` supplying its own placeholder
+    # cannot quietly satisfy the very thing this omission is testing for — the
+    # same hazard `isolated_env`'s docstring describes, worked around here per
+    # construction rather than by leaving the working directory.
+    return {
+        "_env_file": None,
+        **{k: v for k, v in BASELINE.items() if k != "SUPABASE_SERVICE_ROLE_KEY"},
+    }
+
+
+def test_supabase_backend_requires_the_service_role_key() -> None:
+    """D23's boot-time pairing check — the failure has to name the missing var
+    rather than surface as a 500 on the first upload."""
+    with pytest.raises(ValidationError, match="SUPABASE_SERVICE_ROLE_KEY"):
+        Settings(**_baseline_without_service_role_key())
+
+
+def test_local_and_memory_backends_do_not_need_the_service_role_key() -> None:
+    local = Settings(**_baseline_without_service_role_key(), FILES_STORAGE_BACKEND="local")
+    memory = Settings(**_baseline_without_service_role_key(), FILES_STORAGE_BACKEND="memory")
+
+    assert local.SUPABASE_SERVICE_ROLE_KEY is None
+    assert memory.SUPABASE_SERVICE_ROLE_KEY is None
+
+
+def test_perception_switches_default_on_except_local_only() -> None:
+    settings = _settings()
+    assert settings.PERCEPTION_ENABLED is True
+    assert settings.PERCEPTION_LOCAL_ONLY is False
+    assert settings.PERCEPTION_LOCAL_OCR_ENABLED is True
+    assert settings.PERCEPTION_OCR_MAX_PAGES == 10
+
+
+def test_file_max_bytes_defaults_to_ten_megabytes() -> None:
+    assert _settings().FILE_MAX_BYTES == 10_000_000
 
 
 def test_zoneinfo_resolves_on_this_machine() -> None:
@@ -476,6 +533,41 @@ def test_a_slot_survives_if_any_one_candidate_is_live(tmp_path: Path) -> None:
     assert len(config.enabled_slots()["general"].candidates) == 2
 
 
+def test_slot_internal_defaults_false(tmp_path: Path) -> None:
+    """Phase 4's ``perception`` slot is the first to set this true; every slot
+    written before it must keep behaving as a client-facing one."""
+    config = _load_yaml_model(ProvidersConfig, _write(tmp_path, _providers_document()))
+
+    assert config.slots["general"].internal is False
+
+
+def test_a_slot_can_declare_itself_internal(tmp_path: Path) -> None:
+    document = _providers_document()
+    document["slots"]["perception"] = {
+        "description": "Internal extraction lane.",
+        "internal": True,
+        "candidates": [
+            {
+                "provider": "gemini",
+                "model": "gemini-flash",
+                "context_tokens": 1048576,
+                "max_output_tokens": 8192,
+                "capabilities": ["text", "vision", "pdf"],
+                "reserved_fraction": 0.5,
+            }
+        ],
+    }
+    document["providers"]["gemini"]["enabled"] = True
+
+    config = _load_yaml_model(ProvidersConfig, _write(tmp_path, document))
+
+    assert config.slots["perception"].internal is True
+    # An internal slot is still routable — enabled_slots() is about whether a
+    # provider is live, not about client visibility, which is a registry
+    # concern (Phase 4 Step 1).
+    assert "perception" in config.enabled_slots()
+
+
 # --------------------------------------------------------------------------- #
 # config/limits.yaml
 # --------------------------------------------------------------------------- #
@@ -653,7 +745,33 @@ def test_the_committed_table_declares_three_providers_all_enabled() -> None:
     assert config.providers["gemini"].enabled is True
     assert config.providers["openrouter"].enabled is True
 
-    assert set(config.enabled_slots()) == {"general", "fast"}
+    assert set(config.enabled_slots()) == {"general", "fast", "perception"}
+
+
+def test_the_committed_perception_slot_is_internal_and_matches_the_answer_slots(
+    tmp_path: Path,
+) -> None:
+    """Phase 4 Step 1's config edit (D26): the ``perception`` slot routes to the
+    same two Gemini models already declared in ``general``/``fast``, in the same
+    capability order, and must agree with them on ``reserved_fraction`` — the
+    startup check in ``registry.py`` is the only thing standing between this and
+    D8's two halves silently drifting apart."""
+    config = get_providers_config()
+
+    assert config.slots["perception"].internal is True
+    perception_models = [c.model for c in config.slots["perception"].candidates]
+    assert perception_models == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+    for candidate in config.slots["perception"].candidates:
+        assert candidate.provider == "gemini"
+        assert candidate.reserved_fraction == 0.5
+
+    for slot_name in ("general", "fast"):
+        gemini_candidates = [
+            c for c in config.slots[slot_name].candidates if c.provider == "gemini"
+        ]
+        assert len(gemini_candidates) == 1
+        assert gemini_candidates[0].reserved_fraction == 0.5
 
 
 def test_openrouter_carries_its_attribution_headers() -> None:

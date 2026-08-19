@@ -605,6 +605,12 @@ def _validate_slot(registry: ProviderRegistry, requested: str) -> None:
     with no key, and both of those are our configuration being wrong, not the
     caller's request. Wrapping the router would label them 400s and send someone
     looking in the wrong place.
+
+    An *internal* slot (Phase 4's ``perception``) is routable — ``candidates()``
+    resolves it without raising — but gets the same 400 as an unknown name (D26):
+    it exists for the perception lane to call on itself, never for a client to
+    ask for, and a routable-but-forbidden slot is exactly as much a client
+    mistake as a typo.
     """
     if requested == selection.AUTO:
         return
@@ -616,6 +622,12 @@ def _validate_slot(registry: ProviderRegistry, requested: str) -> None:
             code="unknown_slot",
             details={"available": [selection.AUTO, *registry.slots()]},
         ) from exc
+    if registry.is_internal(requested):
+        raise InvalidRequest(
+            f"Unknown model slot {requested!r}.",
+            code="unknown_slot",
+            details={"available": [selection.AUTO, *registry.slots()]},
+        )
 
 
 def _is_substitution(requested_slot: str, served_slot: str) -> bool:
