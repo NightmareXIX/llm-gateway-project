@@ -165,9 +165,24 @@ jobs:
       # The hook URL already carries `?key=`, but the separator is computed
       # rather than assumed so a hook without a query string still composes.
       #
-      # `-f` is load-bearing: without it a 401 from a wrong or missing hook URL
-      # prints an error body and exits 0, and the deploy job goes green having
-      # deployed nothing.
+      # Deliberately not `curl -f`. `-f` does buy the one thing that matters —
+      # a rejected hook has to fail the job rather than print an error body and
+      # exit 0 — but it buys it by collapsing every answer Render can give into
+      # the same `curl: (22) ... error: 500` and discarding the body with it.
+      # Run #25 was a Render-side 500 and reported in exactly as much detail as
+      # a revoked key would have. So: no `-f`, read `%{http_code}` instead, and
+      # say what each status means. Same reasoning as the two guards below,
+      # applied to the half of the failure space that is on Render's side.
+      #
+      # Render's documented answers are 200 (queued), 202 (queued behind a
+      # running deploy), 400 (bad `ref`), 401 (bad `key`), 404 (no such service
+      # *or* no such commit), 405 (wrong method) and 409 (service suspended, or
+      # the workspace may not deploy — what running out of free instance hours
+      # looks like). 5xx is undocumented, means Render broke rather than that
+      # anything here is wrong, and is therefore the one class worth retrying:
+      # three attempts, 15s then 30s apart. Failing after that is deliberate —
+      # nothing shipped, and a green job that deployed nothing is the exact
+      # failure `-f` was there to prevent.
       #
       # The two guards in front of the curl exist because curl's own failure for
       # a bad secret is unreadable, and worse, ambiguous. A missing secret
@@ -212,7 +227,53 @@ jobs:
             *)    separator='?' ;;
           esac
 
-          curl -fsS -X POST "${hook}${separator}ref=${COMMIT_SHA}"
+          attempt=1
+          while : ; do
+            # Truncated first: curl leaves the file untouched when the
+            # request never completes, and reporting the previous attempt's
+            # body under this attempt's status would be a lie.
+            : > response.body
+            status="$(curl -sS -o response.body -w '%{http_code}'               -X POST "${hook}${separator}ref=${COMMIT_SHA}")" || status="000"
+
+            # Render's body, not ours, and the hook URL is a credential — scrub
+            # any `key=` it quotes back before it reaches a log that outlives
+            # this run. Truncated because a 5xx page is an HTML document.
+            body="$(head -c 400 response.body 2>/dev/null | sed 's/key=[^&]*/key=***/g')"
+
+            case "$status" in
+              200|202)
+                echo "Render queued a deploy of ${COMMIT_SHA} (HTTP $status)."
+                echo "$body"
+                exit 0
+                ;;
+              401)
+                echo "::error::Render rejected the deploy hook's key (HTTP 401). The secret is a well-formed hook URL but its key is wrong or was regenerated. Re-copy it from the service's Settings -> Deploy Hook and update the RENDER_DEPLOY_HOOK_URL repository secret. See docs/deploy.md section 6.5."
+                exit 1
+                ;;
+              404)
+                echo "::error::Render has no such service, or no such commit (HTTP 404). Either the srv-<id> in the secret names a service that was deleted or re-created, or Render cannot see commit ${COMMIT_SHA} — check the service exists and that its connected repository is this one. See docs/deploy.md section 6.5."
+                exit 1
+                ;;
+              409)
+                echo "::error::Render will not accept a deploy for this service (HTTP 409): it is suspended, or the workspace is not permitted to deploy. On the free plan this is what exhausting the month's 750 instance hours looks like — service and hook both stay put, deploys just stop until the next month or a paid instance type. See docs/deploy.md section 6.5."
+                exit 1
+                ;;
+              400|405)
+                echo "::error::Render rejected the request itself (HTTP $status). That is this workflow sending something wrong — the ref or the method — not a problem with the secret. Body: $body"
+                exit 1
+                ;;
+              *)
+                if [ "$attempt" -lt 3 ]; then
+                  echo "::warning::Render answered HTTP $status. Retrying in $((attempt * 15))s (attempt $attempt of 3). Body: $body"
+                  sleep "$((attempt * 15))"
+                  attempt=$((attempt + 1))
+                  continue
+                fi
+                echo "::error::Render did not accept the deploy after 3 attempts; the last answer was HTTP $status. A 5xx (or 000, meaning the request never completed) is Render's side of the wire, not this repository's: nothing was deployed and whatever instance was live still is. Check https://status.render.com and the service's Events tab, then re-run this job. See docs/deploy.md section 6.5. Body: $body"
+                exit 1
+                ;;
+            esac
+          done
 
     # The frontend is not deployed from here. Vercel's Git integration builds and
     # ships it on push, which is one fewer long-lived token for this repo to hold.

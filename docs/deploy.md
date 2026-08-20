@@ -457,6 +457,31 @@ deploy appear in Render's **Events** tab.
 Vercel is not deployed from here — its own Git integration builds the frontend on push, which is one
 fewer long-lived token for this repository to hold.
 
+### 6.5 When the `deploy` job fails
+
+Everything green except `deploy` means the code is fine and the *trigger* was not accepted. The step
+reads the HTTP status Render answered with and fails with a message naming it, so the log says which
+of these it was rather than `curl: (22)`:
+
+| Status | What it means | What to do |
+|---|---|---|
+| 200 / 202 | Queued. 202 means another deploy is already running and this one is behind it. | Nothing. Watch Render's **Events** tab. |
+| 400 | Render rejected the `ref`. | A workflow bug, not a secret problem. |
+| 401 | The `key` in the hook URL is wrong or was regenerated. | Re-copy the hook (§6.2) into the secret (§6.3). |
+| 404 | No such service, or Render cannot see the commit. | The service was deleted or re-created — its `srv-<id>` changed, so the old hook names nothing. Copy the new one. |
+| 409 | The service is suspended, or the workspace may not deploy. | Free plan: the workspace's 750 monthly instance hours are gone. Deploys resume at the start of the next month, or immediately on any paid instance type. |
+| 5xx / 000 | Render broke, or the request never completed. | Retried three times automatically (15s, then 30s). If it still fails, check [status.render.com](https://status.render.com) and the service's **Events** tab, then re-run the job. |
+
+**A failed `deploy` job ships nothing and breaks nothing.** Whatever instance was live stays live —
+the only consequence is that `main` is ahead of what is deployed until the job is re-run. Re-running
+it is safe and idempotent: it posts the same `ref`, so it deploys the commit that run tested, not
+whatever `main` has moved on to.
+
+**Check the service itself before assuming the hook is the problem.** `curl -sI
+https://llm-gateway-sed.onrender.com/healthz` and read the `x-render-routing` header:
+`no-deploy` means the service has no live deploy at all — the deploy hook is a symptom then, not the
+cause, and the answer is in Render's Events tab.
+
 ---
 
 ## 7. Smoke test
