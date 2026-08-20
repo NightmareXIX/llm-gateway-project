@@ -121,6 +121,10 @@ ignore = [
 # (§2.2.3) was violated. `InvariantViolationError` reads as "an error about a
 # violation", one noun further from the fact. The contract's vocabulary wins.
 "app/memory/canonical.py" = ["N818"]
+# `StorageUnavailable` is D23's name for the perception lane's storage
+# exception verbatim (phase4.md §3) — matching `UnknownSlot` and
+# `InvariantViolation` above rather than the `Error`-suffixed convention.
+"app/perception/storage.py" = ["N818"]
 
 [tool.ruff.lint.isort]
 # `src` alone does not make these first-party — ruff resolves it by looking for

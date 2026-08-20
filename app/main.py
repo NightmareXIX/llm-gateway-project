@@ -31,6 +31,7 @@ from app.core.logging import (
     get_logger,
 )
 from app.db.session import create_db_engine, create_session_factory
+from app.perception.storage import build_store
 from app.providers.registry import build_registry
 from app.schemas.errors import DEFAULT_ERROR_RESPONSES, ErrorResponse
 from app.usage.metrics import LatencyTable
@@ -88,6 +89,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # discovering it as a 502 on the first real message.
     registry = build_registry(client=http_client, settings=settings)
     app.state.provider_registry = registry
+
+    # Phase 4 Step 2 (D23): the object store behind `POST /v1/files`. Built
+    # eagerly like the registry above it — `SupabaseStore` makes no network call
+    # at construction, so there is nothing to fail loudly on here, but which
+    # backend is live is a boot-time decision and should not be reconsidered
+    # per request.
+    app.state.object_store = build_store(client=http_client, settings=settings)
 
     # Lazy like the engine: from_url opens no socket, so an Upstash blip cannot
     # stop the process booting. Nothing reads it until Step 3's circuit breaker —

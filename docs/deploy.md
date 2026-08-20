@@ -104,7 +104,9 @@ from app.db.session import create_db_engine
 s = Settings(DATABASE_URL=os.environ['PROBE_URL'], REDIS_URL='redis://x',
              SUPABASE_URL='https://x.supabase.co', SUPABASE_JWT_AUDIENCE='authenticated',
              GROQ_API_KEY='x', GEMINI_API_KEY='x', OPENROUTER_API_KEY='x',
-             ENCRYPTION_KEY='x')
+             ENCRYPTION_KEY='x', FILES_STORAGE_BACKEND='local')
+# FILES_STORAGE_BACKEND='local' sidesteps Phase 4's SUPABASE_SERVICE_ROLE_KEY
+# requirement — this probe is testing DATABASE_URL, not Storage.
 async def main():
     e = create_db_engine(s)
     async with e.connect() as c:
@@ -211,12 +213,18 @@ migration exactly as loudly as it would fail the app, before the service ever be
 > change — otherwise the start command fails config validation and the deploy is cancelled, which
 > looks like a broken migration and is not one.
 
-Nine variables, and **only six of them are the values from your local `.env`**. Copying that file
+> **Phase 4 Step 1 added one more.** `SUPABASE_SERVICE_ROLE_KEY` is required whenever
+> `FILES_STORAGE_BACKEND` is `supabase` — its default, and unset anywhere in `render.yaml`, so
+> production needs it the moment this step's commit deploys. Same failure shape as the row above:
+> set it **before** that deploy, or the start command's config validation fails and the deploy is
+> cancelled rather than the service coming up degraded.
+
+Ten variables, and **only seven of them are the values from your local `.env`**. Copying that file
 wholesale points production at your laptop:
 
 | Variable | Value |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` | same as `.env` |
+| `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | same as `.env` — the service-role key bypasses row-level security on the whole project, so handle it exactly like a provider key: never logged, never in an error message |
 | `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
 | `REDIS_URL` | Upstash, from step 2 — `.env` holds `localhost:6379` |
 | `ENCRYPTION_KEY` | **generate a fresh one.** Nothing is encrypted with it until Phase 6, so a new key is free now; sharing dev's means a leaked dev `.env` also decrypts production, and rotating later is a migration |
@@ -225,7 +233,7 @@ wholesale points production at your laptop:
 > That last row is a real failure, not a hypothetical. Anything scripted that interpolates a missing
 > key yields an empty string, and the start command dies with `Input should be a valid boolean,
 > unable to interpret input`. Anything with a default in `app/config.py` is a candidate for this;
-> only the five in the first row are safe to read out of `.env` programmatically, because only those
+> only the six in the first row are safe to read out of `.env` programmatically, because only those
 > are always present. Typing them into the dashboard sidesteps it — paste each value, and do not
 > paste a trailing space.
 

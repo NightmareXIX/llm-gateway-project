@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 1 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 2 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -124,8 +124,23 @@ two Gemini models `general` and `fast` already route to, `reserved_fraction: 0.5
 Migration `0004` adds `files` (per-user ownership, unique on `(user_id, file_hash)`, D24) and
 `file_extractions` (content-addressed and global, keyed on `file_hash` alone, D22) — mirrored in
 `app/db/models.py` as `File`/`FileExtraction`. The `Dockerfile`'s runtime stage installs
-`tesseract-ocr`/`tesseract-ocr-eng` ahead of Step 7's local tier (D30). Step 2
-(`app/perception/storage.py`, the `ObjectStore` behind `POST /v1/files`) is next.
+`tesseract-ocr`/`tesseract-ocr-eng` ahead of Step 7's local tier (D30).
+
+**Step 2 (`app/perception/storage.py`) is in.** `ObjectStore` (D23) is a `Protocol` — `put`/`get`/`exists`
+on a content-addressed `path` — with three implementations: `SupabaseStore` (every deployed environment,
+over `app.state.http_client` so it shares the pool and timeouts every provider adapter already uses),
+`LocalStore` (a dev box without Storage configured, path-traversal-checked against its root), and
+`MemoryStore` (tests — a dict, so a byte never touches a disk or the network in CI). `object_path(hash)`
+is the `{hash[:2]}/{hash}` sharding D23 specifies. Every failure normalizes to `StorageUnavailable`,
+never a raw `httpx` error and never one carrying the key or the bytes. `build_store` picks a backend from
+`FILES_STORAGE_BACKEND` and is called once from `main.py`'s lifespan (`app.state.object_store`, mirroring
+`build_registry`); `deps.py` gained `get_store`/`StoreDep`. Verified against a real Supabase Storage
+bucket while building this step, not just the `MockTransport` suite in `tests/unit/test_storage.py`: the
+live API wraps a missing object *and* a non-upserted duplicate as a literal HTTP 400 with the true status
+as a string inside the JSON body (`{"statusCode": "404", ...}` / `{"statusCode": "409", ...}`) rather than
+using that status directly — `SupabaseStore`'s internal `_logical_status` unwraps it, and without that
+unwrapping `exists()` would have raised on every ordinary miss instead of returning `False`, which Step
+3's dedup check depends on. Step 3 (`POST /v1/files`) is next.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

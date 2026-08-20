@@ -25,6 +25,7 @@ from app.config import GatewayLimits, get_limits_config, get_settings
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.errors import TooManyRequests
 from app.core.logging import get_logger
+from app.perception.storage import ObjectStore
 from app.providers.registry import ProviderRegistry
 from app.quota.tracker import QuotaTracker
 from app.quota.windows import sliding_count
@@ -87,6 +88,17 @@ def get_registry(request: Request) -> ProviderRegistry:
     """
     registry: ProviderRegistry = request.app.state.provider_registry
     return registry
+
+
+def get_store(request: Request) -> ObjectStore:
+    """The process-wide object store, built once in the lifespan (D23).
+
+    Built rather than looked up per request, mirroring ``get_registry``: which
+    backend is live (``FILES_STORAGE_BACKEND``) is a boot-time decision, not
+    a per-request one.
+    """
+    store: ObjectStore = request.app.state.object_store
+    return store
 
 
 def get_redis(request: Request) -> Redis:
@@ -417,6 +429,7 @@ def get_rate_limiter(request: Request) -> RateLimiter | None:
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 SessionFactoryDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)]
 RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
+StoreDep = Annotated[ObjectStore, Depends(get_store)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
 BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]

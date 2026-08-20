@@ -78,6 +78,7 @@ from app.core.clock import FixedClock
 from app.db.models import ApiKey, Conversation, User
 from app.deps import get_session, get_session_factory
 from app.main import create_app
+from app.perception.storage import build_store
 from app.providers.registry import build_registry
 from app.usage.metrics import LatencyTable
 
@@ -418,6 +419,13 @@ async def app(
     # Built over the same mock-transport client, so an adapter reached through
     # the app cannot escape to the network either.
     application.state.provider_registry = build_registry(client=client)
+
+    # Phase 4 Step 2: the object store the lifespan would otherwise build.
+    # Reads `FILES_STORAGE_BACKEND` from the same `get_settings()` the app
+    # itself uses (`supabase` by default, over this same mock-transport
+    # client) rather than hardcoding a backend the app would not actually
+    # run with; `test_storage.py` exercises all three backends directly.
+    application.state.object_store = build_store(client=client, settings=get_settings())
 
     # The lifespan's Redis leg, supplied by hand like the rest. Every route that
     # touches Redis reads it from here, so an integration test gets real Redis
