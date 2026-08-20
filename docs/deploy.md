@@ -472,6 +472,14 @@ of these it was rather than `curl: (22)`:
 | 409 | The service is suspended, or the workspace may not deploy. | Free plan: the workspace's 750 monthly instance hours are gone. Deploys resume at the start of the next month, or immediately on any paid instance type. |
 | 5xx / 000 | Render broke, or the request never completed. | Retried three times automatically (15s, then 30s). If it still fails, check [status.render.com](https://status.render.com) and the service's **Events** tab, then re-run the job. |
 
+**A persistent 500 is usually Render, not you.** During a platform incident Render disables
+builds, deploys and spin-up *for free web services specifically* — and that state answers the deploy
+hook with a bare `500 Internal Server Error` rather than the documented 409, while the service itself
+serves 502 `no-deploy` because a spun-down free instance cannot wake either. Three 500s in a row over
+45 seconds means this; [status.render.com](https://status.render.com) confirms it in one request.
+There is nothing to fix on this side, and re-running the job once the incident clears is the whole
+recovery.
+
 **A failed `deploy` job ships nothing and breaks nothing.** Whatever instance was live stays live —
 the only consequence is that `main` is ahead of what is deployed until the job is re-run. Re-running
 it is safe and idempotent: it posts the same `ref`, so it deploys the commit that run tested, not
