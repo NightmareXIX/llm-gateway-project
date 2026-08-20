@@ -91,7 +91,7 @@ app/
   cache/{keys,client,exact}.py
   keys_resolution/resolver.py
   usage/{logger,metrics}.py
-  db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,extractions}.py}
+  db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,files,extractions}.py}
 frontend/            # Next.js App Router + Tailwind; lib/sse.ts, components/ModelIndicator.tsx, components/ModelPicker.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 2 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 3 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -140,7 +140,40 @@ live API wraps a missing object *and* a non-upserted duplicate as a literal HTTP
 as a string inside the JSON body (`{"statusCode": "404", ...}` / `{"statusCode": "409", ...}`) rather than
 using that status directly — `SupabaseStore`'s internal `_logical_status` unwraps it, and without that
 unwrapping `exists()` would have raised on every ordinary miss instead of returning `False`, which Step
-3's dedup check depends on. Step 3 (`POST /v1/files`) is next.
+3's dedup check depends on.
+
+**Step 3 (`POST /v1/files`) is in.** The upload endpoint, and the only thing in the system that puts
+bytes into it. It stores bytes and metadata and *nothing else* — no extraction runs here (D22), so the
+route either succeeds or does not and there is no partial-success state to define. `app/api/v1/files.py`
+parses the multipart body **itself**, incrementally out of `request.stream()` via `python_multipart`'s
+`MultipartParser` and a small `_FilePartReader` callback set, rather than declaring an `UploadFile`
+parameter: FastAPI finishes parsing (and spooling to an unbounded `SpooledTemporaryFile`) before the
+handler runs, so a cap checked afterwards has already lost — trap 3 is enforced by counting bytes as they
+arrive and raising `PayloadTooLarge` from inside `on_part_data`, which abandons the `async for` and never
+reads the rest. `sniff_mime` reads the leading 12 bytes (PDF, PNG, JPEG and WebP magic numbers; the WebP
+check is why 12 and not 8); **the sniffer's range is the allowlist**, so there is no second list to drift
+— an unrecognized format is a 415 rather than something handed to PyMuPDF to find out (trap 2), and a
+declared/sniffed mismatch is an info log, because the sniffed type is what gets stored either way. Dedup
+runs *before* the store is touched: a hash the caller already owns returns the existing row with
+`deduplicated: true` and writes nothing; a hash somebody else uploaded skips `put` (guarded by
+`ObjectStore.exists`) but still writes the row, because bytes are global and the right to reference them
+is not (D24). 201 either way — the status promises "this hash is now yours to reference", and
+`deduplicated` says whether bytes moved. `GET /v1/files/{file_hash}` returns metadata only,
+ownership-scoped in the query, 404 on a miss and never 403. `core/errors.py` gained `PayloadTooLarge`
+(413) and `UnsupportedMediaType` (415) — both codes were already in `_CODE_BY_STATUS`. `db/repo/files.py`
+has `get_owned` and `create_if_absent` (an `ON CONFLICT DO NOTHING` against `uq_files_user_id_file_hash`
+returning `(row, created)`, so two simultaneous uploads of one file by one user are two 201s and not a
+500) and deliberately **no** "does anybody own this hash" query — whether the object exists is the
+store's question, not a table another user could probe. `schemas/files.py` carries
+`FileOut`/`FileUploadResponse` and `FILE_HASH_PATTERN`, which Step 4's `InputMessage.file_refs` reuses.
+D20's rate limiter now gates uploads too, so `enforce_rate_limit`/`RateLimitDep` moved from
+`api/v1/chat.py` to `app/auth/dependency.py` — two route modules sharing a dependency through a third,
+rather than one importing the other. Verified end to end against the real Supabase bucket, not only
+`tests/integration/test_files_endpoint.py`: a real PyMuPDF-built PDF uploads, re-uploads as a dedup hit
+with the same `created_at`, reads back byte-identical through the service-role key and 400s through the
+public URL, a PNG named `report.pdf` stores as `image/png`, an `.exe` named `invoice.pdf` is a 415, and
+an 11MB body is a 413 — with no service-role key anywhere in the logs. Step 4 (`file_refs` on a chat
+turn) is next.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

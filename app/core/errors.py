@@ -127,6 +127,34 @@ class Conflict(AppError):
     message = "The request conflicts with the current state of the resource."
 
 
+class PayloadTooLarge(AppError):
+    """The body is bigger than this endpoint will accept.
+
+    Phase 4 Step 3's upload cap (``FILE_MAX_BYTES``). Raised *mid-stream*, as
+    soon as the running byte count passes the limit, rather than after the
+    whole body has been read — a ``Content-Length`` is a claim, and a cap
+    enforced only once the memory has been spent is not a cap (trap 3).
+    """
+
+    status_code = 413
+    code = "payload_too_large"
+    message = "The uploaded file is larger than this gateway accepts."
+
+
+class UnsupportedMediaType(AppError):
+    """The bytes are not a format any tier of the perception lane can read.
+
+    Decided on the *sniffed* type, never the declared one (trap 2): a browser
+    will happily call anything ``application/pdf``, and the allowlist is the
+    only thing standing between the upload endpoint and handing arbitrary
+    bytes to PyMuPDF.
+    """
+
+    status_code = 415
+    code = "unsupported_media_type"
+    message = "That file type is not one the gateway can read."
+
+
 class TooManyRequests(AppError):
     """D20: *our* limit on *our* user, not a provider's limit on us.
 

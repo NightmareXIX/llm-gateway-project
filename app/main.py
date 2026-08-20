@@ -20,6 +20,7 @@ from app.api import auth as auth_routes
 from app.api import keys as keys_routes
 from app.api.v1 import chat as chat_routes
 from app.api.v1 import conversations as conversations_routes
+from app.api.v1 import files as files_routes
 from app.api.v1 import models as models_routes
 from app.auth.jwt import JwksCache
 from app.cache.client import LuaScriptRegistry, create_redis_client, probe, redacted_target
@@ -180,6 +181,7 @@ def create_app() -> FastAPI:
     app.include_router(keys_routes.router)
     app.include_router(chat_routes.router)
     app.include_router(conversations_routes.router)
+    app.include_router(files_routes.router)
     app.include_router(models_routes.router)
 
     @app.get("/healthz", tags=["health"])

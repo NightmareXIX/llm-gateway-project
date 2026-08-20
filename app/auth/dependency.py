@@ -28,7 +28,7 @@ from app.core.errors import Unauthenticated
 from app.core.logging import bind_user_id, get_logger
 from app.db.repo import api_keys as api_keys_repo
 from app.db.repo import users as users_repo
-from app.deps import SessionDep
+from app.deps import RateLimiterDep, SessionDep
 
 logger = get_logger("app.auth")
 
@@ -152,3 +152,35 @@ async def get_principal(request: Request, session: SessionDep) -> Principal:
 
 PrincipalDep = Annotated[Principal, Depends(get_principal)]
 """What endpoints depend on. Named so the function can be refactored freely."""
+
+
+# --------------------------------------------------------------------------- #
+# D20 — the gateway's own per-user limit, as a dependency
+# --------------------------------------------------------------------------- #
+async def enforce_rate_limit(principal: PrincipalDep, limiter: RateLimiterDep) -> None:
+    """Count this request against the caller's tier, and 429 before any work.
+
+    Lives here rather than in ``app/deps.py`` because it needs the principal,
+    and this module already imports ``app.deps`` — the dependency that knows
+    about both can only live downstream of both. It arrived in
+    ``api/v1/chat.py`` in Phase 3 Step 10, when chat was the only endpoint that
+    spent anything; Phase 4 Step 3 gives ``POST /v1/files`` the same gate, and
+    two route modules sharing a dependency through a third is better than one
+    importing the other.
+
+    **Writes only, still.** Rate-limiting the conversation list makes the UI
+    feel broken and protects nothing. What is limited is what costs: a
+    generation spends a free tier's quota, and an upload spends storage and a
+    request's worth of streaming — the D20 limiter is keyed on the user and
+    does not care which.
+    """
+    if limiter is not None:
+        await limiter.enforce(principal)
+
+
+RateLimitDep = Annotated[None, Depends(enforce_rate_limit)]
+"""Declared by an endpoint purely for its side effect: a 429 before any work.
+
+``get_principal`` is resolved once per request and cached by FastAPI, so
+depending on it from both here and the endpoint costs one authentication, not
+two."""
