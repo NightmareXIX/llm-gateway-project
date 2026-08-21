@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 5 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 6 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -212,8 +212,41 @@ that was never incremented); a hand-built `Reservation` with no `counter_keys` �
 caller and test used before this step — still falls back to the old derivation. No Lua changed. Verified
 end to end against the real `config/providers.yaml`/`config/limits.yaml`: a chat reservation and a
 perception reservation on the same Gemini model land on separate daily counters, share the same `rpm`
-counter, and `commit_perception` settles the shared `tpm` counter correctly. Milestone B's remaining
-steps (6–9: the extraction call, the local tier, the lane itself, and native passthrough) are next.
+counter, and `commit_perception` settles the shared `tpm` counter correctly.
+
+**Step 6 (`app/perception/extractors.py`, tier 2) is in.** The half of Gemini's budget Step 5 made
+spendable is now spent by something: a model that can read a PDF is asked to describe one for a model
+that cannot. Deliberately the least novel module in the phase — same adapters, same breaker, same
+normalized errors, same reserve-before/commit-after discipline, pointed at the internal `perception`
+slot and paid for through `lanes.reserve_perception`/`commit_perception`/`release_perception`. Four
+things are *not* the answer lane's: **the prompt is committed code** (`EXTRACTION_PROMPT`, D28's four
+sections with `Summary` first and `Verbatim text` last, because everything downstream truncates from the
+tail — trap 10), pinned by a golden payload (`tests/fixtures/golden_payloads/gemini_extraction.json`)
+via `_build_payload`, the same discipline every `build_payload` gets; **there is no streaming**, since
+an extraction has no reader waiting on its first token; **a total failure is not an error** — a chain
+that runs out of candidates returns `None` and the lane will fall to tier 3 (D25, trap 12), so
+`ContentFiltered`/`BadRequest` stop the chain and everything failover-eligible moves on, read off
+Contract A's class flags; and **one extraction per hash**, guarded by `SET lock:extract:{hash} NX EX 60`
+with a token checked before release (trap 16), where a loser polls tier 0 for `LOCK_WAIT_S` and then
+extracts anyway rather than hanging the turn. `grade()` returns `high` only for all four headings *plus*
+a verbatim block over `MIN_VERBATIM_CHARS`, and **never `low`** — `low` is tier 3's marker and the thing
+that sets `degraded`, so a thin-but-real reading must not light the "read by local OCR" disclosure.
+Write-through is Postgres first (`db/repo/extractions.py`, new this step — the one table with no
+`user_id` column, D24, and an `ON CONFLICT DO UPDATE ... WHERE tier = 'local'` that lets an `llm` row
+upgrade a local one but never the reverse, which is invariant 6's retroactive improvement in one
+direction and outage protection in the other), then `extract:{hash}` in Redis, where a failure is a log
+line. `load_cached` is tier 0 in full (Redis, then Postgres, writing a row-hit back up) and Step 8's
+lane will reuse it. Step 9's work arrived early only where Step 6 could not proceed without it:
+`gemini.py`'s `_render_attachment` `NotImplementedError` is gone, replaced by `_render_parts` /
+`_native_parts` emitting an `inline_data` part beside the message's text part — `estimate_tokens` still
+ignores every non-`text` part (trap 9), and Groq's and OpenRouter's refusals stay. `ResolvedAttachment`
+still has no `token_cost`/`pages`, and `fitting.py`/`render.py` are untouched: those, plus the full
+attachment golden, are still Step 9. Verified end to end against live Gemini, live Upstash and live
+Postgres, not only the fixture suite: a real two-page PyMuPDF-built PDF came back with all four sections
+grading `high`, `lane:perception` went to 1 while `:rpd` stayed untouched and the shared `:rpm` went to
+1, the row and the cache key were written, the lock was released, and the second call was served from
+tier 0 with no provider round trip and no new spend. Milestone B's remaining steps (7–9: the local tier,
+the lane itself, and native passthrough) are next.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

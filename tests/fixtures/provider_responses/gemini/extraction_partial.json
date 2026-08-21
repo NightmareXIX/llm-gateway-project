@@ -1,0 +1,38 @@
+{
+  "recorded_at": "2026-08-21T09:14:02Z",
+  "source": "synthetic",
+  "note": "The `confidence=\"medium\"` case, and the reason grading is not just a header count. The model produced three of D28's four sections — no \"## Figures and tables\" — over a page it could barely read. It is a thin reading, not a degraded one: a model actually opened the file, so this must never grade `low`, which is tier 3's marker and the thing that lights the \"read by local OCR\" disclosure.",
+  "request": {
+    "method": "POST",
+    "path": "/models/gemini-3.5-flash-lite:generateContent"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "## Summary\nA single scanned page, heavily skewed, apparently a handwritten delivery note. Most of it is not legible.\n\n## Structure\nPDF, 1 page, no headings detectable.\n\n## Verbatim text\nDELIVERY NOTE [illegible] 14/0? [illegible]\n[remainder of the page could not be read]"
+              }
+            ],
+            "role": "model"
+          },
+          "finishReason": "STOP",
+          "index": 0
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 1204,
+        "candidatesTokenCount": 61,
+        "totalTokenCount": 1265
+      },
+      "modelVersion": "gemini-3.5-flash-lite",
+      "responseId": "extraction-partial-0001"
+    }
+  }
+}

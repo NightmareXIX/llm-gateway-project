@@ -20,6 +20,7 @@ If a golden diff is ever confusing, the fix is to understand it, not to bless it
 
 from __future__ import annotations
 
+import base64
 import sys
 
 import httpx
@@ -293,30 +294,74 @@ def test_an_unresolved_file_ref_is_a_loud_failure_not_a_silent_drop(
         adapter.build_payload(_history_with_file("abc123"), spec, GenParams(), [])
 
 
-def test_gemini_refuses_to_embed_a_file_natively_yet(
+def test_a_native_file_becomes_an_inline_data_part_beside_the_text(
     adapter: GeminiAdapter, spec: ModelSpec
 ) -> None:
-    """The one branch this adapter deliberately leaves unbuilt.
+    """The branch this adapter left unbuilt until the perception lane needed it.
 
-    Gemini *can* read a PDF natively via ``inline_data`` — unlike Groq, which
-    cannot — but no ``file_ref`` can exist before ``POST /v1/files`` does, which is
-    Phase 4. Building it now would ship an untested path presenting itself as a
-    capability. The refusal names both the capability and the phase, so the failure
-    explains itself.
+    Gemini's ``parts`` is a list of *modalities*, which is what `_render_text`'s
+    docstring has claimed since Phase 2 — so the bytes do not join the text, they
+    sit beside it as their own part. Groq and OpenRouter still refuse, and their
+    refusals still say something true: they cannot read a PDF at all.
     """
+    attachment = ResolvedAttachment(
+        file_hash="abc123",
+        filename="q3.pdf",
+        mime="application/pdf",
+        size_bytes=8,
+        mode="native",
+        data=b"%PDF-1.7",
+    )
+
+    payload = adapter.build_payload(_history_with_file("abc123"), spec, GenParams(), [attachment])
+    parts = payload["contents"][0]["parts"]
+
+    assert parts[0] == {"text": "Summarise the revenue table."}
+    assert parts[1] == {
+        "inline_data": {
+            "mime_type": "application/pdf",
+            "data": base64.b64encode(b"%PDF-1.7").decode("ascii"),
+        }
+    }
+
+
+def test_the_base64_blob_is_invisible_to_the_token_estimator(
+    adapter: GeminiAdapter, spec: ModelSpec
+) -> None:
+    """Trap 9. A 6MB PDF is ~8M base64 characters, and a characters-over-four
+    estimator turns that into a two-million-token reservation that fails closed on
+    every candidate. The honest number comes from the page/tile rate instead, so
+    ``estimate_tokens`` has to keep ignoring every non-``text`` part."""
+    big = ResolvedAttachment(
+        file_hash="abc123",
+        filename="q3.pdf",
+        mime="application/pdf",
+        size_bytes=200_000,
+        mode="native",
+        data=b"%PDF-1.7" + bytes(200_000),
+    )
+
+    with_file = adapter.build_payload(_history_with_file("abc123"), spec, GenParams(), [big])
+    text_only = adapter.build_payload(fx.canonical_history(), spec, GenParams(), [])
+
+    assert adapter.estimate_tokens(with_file) < adapter.estimate_tokens(text_only)
+
+
+def test_a_native_attachment_without_its_bytes_is_a_loud_failure(
+    adapter: GeminiAdapter, spec: ModelSpec
+) -> None:
+    """``mode="native"`` is a promise that the bytes are here. Base64-encoding
+    ``None`` would be a TypeError three frames down; this names the resolver."""
     attachment = ResolvedAttachment(
         file_hash="abc123",
         filename="q3.pdf",
         mime="application/pdf",
         size_bytes=8192,
         mode="native",
-        data=b"%PDF-1.7",
     )
 
-    with pytest.raises(NotImplementedError, match="inline_data") as caught:
+    with pytest.raises(ValueError, match="no bytes"):
         adapter.build_payload(_history_with_file("abc123"), spec, GenParams(), [attachment])
-
-    assert "Phase 4" in str(caught.value)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,38 @@
+{
+  "recorded_at": "2026-08-21T09:12:44Z",
+  "source": "synthetic",
+  "note": "A tier-2 extraction that came back with all four of D28's sections and a real verbatim block — the `confidence=\"high\"` case. Synthetic rather than live: the recorder does not learn the extraction case until Phase 4 Step 11, and the body below is shaped exactly like `success.json`'s (same envelope, same finishReason, same usageMetadata keys) with the text replaced by what EXTRACTION_PROMPT asks for. The *shape* was confirmed against a live gemini-3.6-flash extraction of a real two-page PyMuPDF-built PDF on 2026-08-21 while Step 6 was written — four sections in D28's order, grading `high` — so this is a hand-authored body of a verified shape rather than a guess at one. `scripts/record_fixtures.py` learns the extraction case in Step 11 and replaces it. The verbatim section is deliberately over MIN_VERBATIM_CHARS, because that threshold is half of what `grade` checks.",
+  "request": {
+    "method": "POST",
+    "path": "/models/gemini-3.6-flash:generateContent"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json; charset=UTF-8"
+    },
+    "body": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "## Summary\nA two-page internal finance memo reporting Q3 2026 results for the Northwind trading desk. Revenue rose 12% quarter over quarter to $4.8M on flat headcount; the memo attributes the gain to the new settlement pipeline and warns that Q4 carries a one-off migration cost.\n\n## Structure\nPDF, 2 pages. Headings in order: \"Q3 2026 Results\", \"Revenue\", \"Costs\", \"Outlook\", \"Appendix A: methodology\".\n\n## Figures and tables\nTable 1 (page 1), \"Revenue by desk\": Northwind 4.8, Ashgrove 2.1, Kestrel 0.6, all in $M. Figure 1 (page 2) is a line chart of monthly revenue from Jan to Sep 2026, rising from 1.1 to 1.7 with a dip to 0.9 in May.\n\n## Verbatim text\nQ3 2026 Results\n\nRevenue\nRevenue for the quarter was $4.8M, up 12% from $4.3M in Q2. The increase is attributable almost entirely to the settlement pipeline that went live on 14 July; excluding it, revenue would have been approximately flat.\n\nCosts\nOperating costs were $3.1M against $3.0M in Q2. Headcount was unchanged at 41. The largest single line item remains clearing fees at $0.9M.\n\nOutlook\nWe expect Q4 revenue between $4.9M and $5.2M. Note that the ledger migration scheduled for November carries a one-off cost of approximately $0.4M which is not reflected in the range above.\n\nAppendix A: methodology\nRevenue is recognised on settlement date. Figures are unaudited."
+              }
+            ],
+            "role": "model"
+          },
+          "finishReason": "STOP",
+          "index": 0
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 4821,
+        "candidatesTokenCount": 412,
+        "totalTokenCount": 5233
+      },
+      "modelVersion": "gemini-3.6-flash",
+      "responseId": "extraction-complete-0001"
+    }
+  }
+}

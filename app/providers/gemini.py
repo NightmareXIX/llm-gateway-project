@@ -37,6 +37,7 @@ Gemini key adds nothing and why D8's 50/50 lane split has to be enforced by us.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from collections.abc import AsyncIterator
@@ -209,10 +210,7 @@ class GeminiAdapter(HttpProviderAdapter):
             _render_text(message, by_hash) for message in messages if message.role == "system"
         ]
         contents = [
-            {
-                "role": _ROLES[message.role],
-                "parts": [{"text": _render_text(message, by_hash)}],
-            }
+            {"role": _ROLES[message.role], "parts": _render_parts(message, by_hash)}
             for message in messages
             if message.role != "system"
         ]
@@ -634,6 +632,70 @@ class GeminiAdapter(HttpProviderAdapter):
 # Pure helpers — deliberately module-level, so `build_payload` cannot reach
 # instance state and quietly stop being pure.
 # --------------------------------------------------------------------------- #
+def _render_parts(
+    message: CanonicalMessage,
+    attachments: dict[str, ResolvedAttachment],
+) -> list[dict[str, Any]]:
+    """One message's ``parts`` list: its text, then whatever bytes ride beside it.
+
+    The list ``_render_text``'s docstring has predicted since Phase 2. Gemini's
+    ``parts`` is a list of *modalities*, not of content blocks — so every text
+    block, omission marker and injected document collapses into one ``text``
+    part, and each natively attached file becomes its own ``inline_data`` part
+    after it. Order matters only in that the instruction precedes the bytes,
+    which is how the extraction prompt reads to the model.
+
+    The text part is dropped only when it would be empty *and* something else
+    is carrying the message — a lone attachment with no accompanying words is
+    legal; an empty ``{"text": ""}`` part beside it is noise.
+    """
+    text = _render_text(message, attachments)
+    native = _native_parts(message, attachments)
+    parts: list[dict[str, Any]] = []
+    if text or not native:
+        parts.append({"text": text})
+    parts.extend(native)
+    return parts
+
+
+def _native_parts(
+    message: CanonicalMessage,
+    attachments: dict[str, ResolvedAttachment],
+) -> list[dict[str, Any]]:
+    """The ``inline_data`` parts for this message's natively resolved files.
+
+    Base64 rather than a Files-API handle: the gateway holds the bytes already
+    (they came out of its own private bucket) and an upload would be a second
+    round trip against a second quota for a document that is about to be read
+    once. The cost of the encoding is real and is *not* measured from this
+    string — ``estimate_tokens`` ignores every non-``text`` part on purpose
+    (trap 9), and the honest number comes from the page/tile rate instead.
+    """
+    parts: list[dict[str, Any]] = []
+
+    for block in message.content:
+        if block["type"] != "file_ref":
+            continue
+        attachment = attachments.get(block["file_hash"])
+        if attachment is None or attachment.mode != "native":
+            continue
+        if attachment.data is None:
+            raise ValueError(
+                f"native attachment {attachment.file_hash[:12]}… reached build_payload with "
+                "no bytes; render step 1 resolves mode='native' only when it has them"
+            )
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": attachment.mime,
+                    "data": base64.b64encode(attachment.data).decode("ascii"),
+                }
+            }
+        )
+
+    return parts
+
+
 def _render_text(
     message: CanonicalMessage,
     attachments: dict[str, ResolvedAttachment],
@@ -649,9 +711,10 @@ def _render_text(
     measured, so ``RenderReport.estimated_tokens`` stays comparable to reported
     usage.
 
-    ``parts`` is still the right home for Phase 4's native attachments — a
-    ``inline_data`` part sits *beside* this text part. The list is for modalities,
-    not for content blocks.
+    ``parts`` is still the right home for native attachments — an ``inline_data``
+    part sits *beside* this text part, which is what :func:`_native_parts` builds
+    and :func:`_render_parts` assembles. The list is for modalities, not for
+    content blocks, so a native file contributes nothing here.
     """
     parts: list[str] = []
 
@@ -671,29 +734,13 @@ def _render_text(
                     f"file_ref {block['file_hash'][:12]}… reached build_payload unresolved; "
                     "render step 1 must resolve every attachment first"
                 )
-            parts.append(_render_attachment(attachment))
+            if attachment.mode == "injected":
+                # Native bytes are not text. They leave this function
+                # entirely and come back as their own `inline_data` part,
+                # built by `_native_parts` and placed beside this one.
+                parts.append(document_envelope(attachment))
 
     return "\n\n".join(parts)
-
-
-def _render_attachment(attachment: ResolvedAttachment) -> str:
-    """Refuse native files; hand injected ones to the shared envelope.
-
-    Gemini's refusal says something different from Groq's, and the difference is
-    the honest part. Groq *cannot* read a PDF. Gemini can, natively, via
-    ``inline_data`` — but no ``file_ref`` can exist before ``POST /v1/files`` does,
-    which is Phase 4. Building the branch now would ship an untested code path
-    presenting itself as a capability, which is the exact thing the Groq adapter's
-    ``build_payload`` docstring refuses to do about the system field.
-    """
-    if attachment.mode == "native":
-        raise NotImplementedError(
-            f"gemini could read {attachment.mime} natively via inline_data, but the "
-            "perception lane lands in Phase 4 and no file_ref can exist before "
-            "POST /v1/files does; render step 1 must not route a native attachment here yet"
-        )
-
-    return document_envelope(attachment)
 
 
 def _split_model(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
