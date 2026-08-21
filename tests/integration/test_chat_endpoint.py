@@ -1094,11 +1094,7 @@ async def test_an_unowned_file_hash_is_a_404_and_writes_nothing(
 
     response = await client.post(
         COMPLETIONS,
-        json={
-            "messages": [
-                {"role": "user", "content": "read this", "file_refs": [bobs_hash]}
-            ]
-        },
+        json={"messages": [{"role": "user", "content": "read this", "file_refs": [bobs_hash]}]},
         headers=alice,
     )
 
@@ -1117,11 +1113,7 @@ async def test_a_malformed_file_hash_is_a_422(
     """A hash that does not match the pattern never reaches the database."""
     response = await client.post(
         COMPLETIONS,
-        json={
-            "messages": [
-                {"role": "user", "content": "hi", "file_refs": ["not-a-real-hash"]}
-            ]
-        },
+        json={"messages": [{"role": "user", "content": "hi", "file_refs": ["not-a-real-hash"]}]},
         headers=_headers(make_jwt),
     )
     assert response.status_code == 422
