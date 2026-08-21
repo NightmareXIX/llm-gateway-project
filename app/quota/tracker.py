@@ -40,7 +40,7 @@ from redis.asyncio import Redis
 
 from app.cache import keys
 from app.cache.client import LuaScriptRegistry
-from app.config import LimitsConfig
+from app.config import LimitsConfig, ModelLimits, ResetKind
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
 from app.providers.types import ModelSpec, QuotaHint
@@ -90,9 +90,45 @@ class Reservation:
     """Which windows were actually incremented. Empty when the model declares no
     limits at all, in which case nothing was written and nothing needs undoing."""
 
+    counter_keys: tuple[str, ...] = ()
+    """The Redis keys actually touched, parallel to :attr:`windows`. Populated by
+    :meth:`QuotaTracker.reserve_windows` (and therefore by :meth:`reserve`, which
+    is now a thin wrapper around it) so commit/release settle exactly the keys
+    reserve did — Step 5's reason for existing: the perception lane's daily
+    window touches ``lane:perception``, not the ``:rpd`` that :func:`keys.quota`
+    would derive from the label alone (D26). Left empty only by a
+    :class:`Reservation` built by hand (a test, mostly), in which case
+    :meth:`QuotaTracker._keys_for` falls back to deriving the standard key —
+    the behaviour every caller had before this field existed."""
+
     @property
     def is_empty(self) -> bool:
         return not self.windows
+
+
+@dataclass(frozen=True, slots=True)
+class WindowGrant:
+    """One window's full addressing for :meth:`QuotaTracker.reserve_windows`.
+
+    :meth:`QuotaTracker.reserve` builds these from ``_budget(spec)`` against the
+    standard :func:`keys.quota` key — the answer lane's own reduction. This is
+    the generalization Step 5 pulls that behaviour out of:
+    ``quota/lanes.py::reserve_perception`` builds its own grants, whose daily
+    window's *limit* comes from :func:`app.quota.lanes.perception_budget` rather
+    than :meth:`QuotaTracker._effective_limit`, and whose daily window's *key* is
+    :func:`keys.quota_perception_lane` rather than the label-derived one — while
+    its ``rpm``/``tpm`` grants keep the *same* key chat uses, checked against the
+    full published ceiling instead of the halved one (D26). Neither
+    :meth:`reserve_windows` nor the Lua script it drives needs to know which
+    caller built the grants; the label/limit/key split is exactly what makes
+    that true.
+    """
+
+    window: keys.QuotaWindow
+    limit: int
+    reset: ResetKind
+    cost_is_tokens: bool
+    key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,86 +182,133 @@ class QuotaTracker:
         measurement, which is ``adapter.estimate_tokens`` over the finished
         payload — the only trustworthy number available before the call, and the
         reason D17 puts the reservation *after* render rather than before it.
+
+        The answer lane's own shape: grants derived from ``_budget(spec)``
+        against the standard :func:`keys.quota` key. :meth:`reserve_windows` is
+        where the actual work happens now — Step 5 pulled it out so the
+        perception lane could reuse it with a grant set of its own.
+        """
+        window_specs = self._budget(spec)
+        grants = tuple(
+            WindowGrant(
+                window=window.window,
+                limit=window.limit,
+                reset=window.reset,
+                cost_is_tokens=window.cost_is_tokens,
+                key=keys.quota(scope, spec.provider, spec.model, window.window),
+            )
+            for window in window_specs
+        )
+        return await self.reserve_windows(
+            grants,
+            scope=scope,
+            provider=spec.provider,
+            model=spec.model,
+            estimated_tokens=estimated_tokens,
+            request_id=request_id,
+        )
+
+    async def reserve_windows(
+        self,
+        grants: tuple[WindowGrant, ...],
+        *,
+        scope: keys.Scope,
+        provider: str,
+        model: str,
+        estimated_tokens: int,
+        request_id: str,
+    ) -> QuotaDecision:
+        """Reserve against an explicit set of :class:`WindowGrant`\\ s.
+
+        The generic core :meth:`reserve` is a thin wrapper around: it does not
+        know or care whether a grant's key is the standard
+        ``q:{scope}:{provider}:{model}:{window}`` or, as
+        ``quota/lanes.py::reserve_perception`` (Step 5) builds for the daily
+        window, ``q:{scope}:{provider}:{model}:lane:perception`` — the split
+        between "which counters, at what ceiling" (the caller's job, and where
+        D8/D26's policy lives) and "check-then-increment, atomically" (this
+        method's) is exactly what lets one caller share the other's ``rpm``/
+        ``tpm`` key while pointing its daily window somewhere else entirely.
         """
         if estimated_tokens < 0:
             raise ValueError(f"estimated_tokens must be non-negative, got {estimated_tokens}")
 
-        window_specs = self._budget(spec)
         reservation = Reservation(
             scope=scope,
-            provider=spec.provider,
-            model=spec.model,
+            provider=provider,
+            model=model,
             request_id=request_id,
             tokens=estimated_tokens,
-            windows=tuple(window.window for window in window_specs),
+            windows=tuple(grant.window for grant in grants),
+            counter_keys=tuple(grant.key for grant in grants),
         )
 
-        if not window_specs:
+        if not grants:
             # Nothing declared, nothing to enforce, no round trip. Not the same
             # as fail-open: this candidate has no published limit to overspend.
             return QuotaDecision(allowed=True, reservation=reservation)
 
         now = self._clock.now()
-        args: list[Any] = [len(window_specs)]
-        for window in window_specs:
+        args: list[Any] = [len(grants)]
+        for grant in grants:
             args += [
-                window.window,
-                window.limit,
-                self._cost(window, estimated_tokens),
-                windows.ttl_s(window.reset, now=now),
-                "1" if window.reset in _CONVERGING_RESETS else "0",
+                grant.window,
+                grant.limit,
+                estimated_tokens if grant.cost_is_tokens else 1,
+                windows.ttl_s(grant.reset, now=now),
+                "1" if grant.reset in _CONVERGING_RESETS else "0",
             ]
         args += [keys.RESERVATION_TTL_S, request_id]
 
         try:
             raw: Any = await self._scripts[RESERVE](
                 keys=[
-                    keys.quota_reservation(scope, spec.provider, spec.model, request_id),
-                    *self._counter_keys(scope, spec.provider, spec.model, reservation.windows),
+                    keys.quota_reservation(scope, provider, model, request_id),
+                    *(grant.key for grant in grants),
                 ],
                 args=args,
             )
         except Exception as exc:
-            return self._fail_closed(spec, scope, exc)
+            # D15: Redis did not answer, so this candidate is not attempted.
+            # Warning rather than error: one unreachable Redis produces one of
+            # these per candidate per request, and the request itself already
+            # fails with a ``RateLimited`` the client can see. The line exists
+            # so the cause is in the log rather than inferred from a fleet that
+            # suddenly refuses everything.
+            logger.warning(
+                "quota.fail_closed",
+                provider=provider,
+                model=model,
+                scope=scope,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return QuotaDecision(allowed=False, degraded=True)
 
         if int(raw[0]) == 1:
             return QuotaDecision(allowed=True, reservation=reservation)
 
-        return self._blocked(
-            spec, scope, window_specs, blocked=str(raw[1]), ttl=int(raw[2]), now=now
-        )
-
-    def _blocked(
-        self,
-        spec: ModelSpec,
-        scope: keys.Scope,
-        window_specs: tuple[WindowSpec, ...],
-        *,
-        blocked: str,
-        ttl: int,
-        now: datetime,
-    ) -> QuotaDecision:
-        """Turn the script's ``{0, window, ttl}`` into a decision the router can log.
-
-        The script's TTL wins over a recomputed window width because a fixed
-        window is aligned to its *first* increment: a minute counter created
-        forty seconds ago has twenty seconds left, and ``windows.ttl_s`` would
-        confidently say sixty. Only when the key vanished between the check and
-        the TTL read — a real race, and a rare one — is the pure function the
-        better answer available.
-        """
-        window = next((w for w in window_specs if w.window == blocked), None)
-        if ttl <= 0 and window is not None:
-            ttl = windows.ttl_s(window.reset, now=now)
+        # Turn the script's ``{0, window, ttl}`` into a decision the router can
+        # log. The script's TTL wins over a recomputed window width because a
+        # fixed window is aligned to its *first* increment: a minute counter
+        # created forty seconds ago has twenty seconds left, and
+        # ``windows.ttl_s`` would confidently say sixty. Only when the key
+        # vanished between the check and the TTL read — a real race, and a rare
+        # one — is the pure function the better answer available.
+        blocked = str(raw[1])
+        ttl = int(raw[2])
+        blocking_grant = next((grant for grant in grants if grant.window == blocked), None)
+        if ttl <= 0 and blocking_grant is not None:
+            ttl = windows.ttl_s(blocking_grant.reset, now=now)
 
         retry_after_s = float(max(ttl, 0))
         logger.info(
             "quota.blocked",
-            provider=spec.provider,
-            model=spec.model,
+            provider=provider,
+            model=model,
             scope=scope,
             window=blocked,
-            limit=window.limit if window is not None else None,
+            limit=blocking_grant.limit if blocking_grant is not None else None,
             retry_after_s=retry_after_s,
         )
         return QuotaDecision(
@@ -234,25 +317,6 @@ class QuotaTracker:
             retry_after_s=retry_after_s,
             resets_at=now + timedelta(seconds=retry_after_s),
         )
-
-    def _fail_closed(self, spec: ModelSpec, scope: keys.Scope, exc: Exception) -> QuotaDecision:
-        """Redis did not answer, so this candidate is not attempted (D15).
-
-        Warning rather than error: one unreachable Redis produces one of these
-        per candidate per request, and the request itself already fails with a
-        ``RateLimited`` the client can see. The line exists so the cause is in
-        the log rather than inferred from a fleet that suddenly refuses
-        everything.
-        """
-        logger.warning(
-            "quota.fail_closed",
-            provider=spec.provider,
-            model=spec.model,
-            scope=scope,
-            error=str(exc),
-            error_type=type(exc).__name__,
-        )
-        return QuotaDecision(allowed=False, degraded=True)
 
     # ----------------------------------------------------------------- #
     # Settling
@@ -341,9 +405,7 @@ class QuotaTracker:
                         reservation.model,
                         reservation.request_id,
                     ),
-                    *self._counter_keys(
-                        reservation.scope, reservation.provider, reservation.model, settled
-                    ),
+                    *self._keys_for(reservation, settled),
                 ],
                 args=args,
             )
@@ -564,15 +626,58 @@ class QuotaTracker:
         return max(1, floor(published * (1.0 - self._headroom) * lanes.answer_share(spec)))
 
     @staticmethod
-    def _cost(window: WindowSpec, estimated_tokens: int) -> int:
-        return estimated_tokens if window.cost_is_tokens else 1
-
-    @staticmethod
     def _counter_keys(
         scope: keys.Scope, provider: str, model: str, settled: tuple[keys.QuotaWindow, ...]
     ) -> list[str]:
-        """Counter keys in window order — the order the scripts index KEYS by."""
+        """Counter keys in window order — the order the scripts index KEYS by.
+
+        The pre-Step-5 way to find them: derive each from its label alone. Still
+        correct for the answer lane, and still the fallback :meth:`_keys_for`
+        uses for a :class:`Reservation` that was built by hand with no
+        :attr:`~Reservation.counter_keys` of its own.
+        """
         return [keys.quota(scope, provider, model, window) for window in settled]
+
+    def _keys_for(
+        self, reservation: Reservation, settled: tuple[keys.QuotaWindow, ...]
+    ) -> list[str]:
+        """The Redis keys ``settled`` actually touched, for commit/release.
+
+        Prefers :attr:`Reservation.counter_keys` — populated by
+        :meth:`reserve_windows` since Step 5, so a perception reservation's
+        daily settlement lands on ``lane:perception`` rather than the ``:rpd``
+        a bare label would derive. Falls back to :meth:`_counter_keys` when a
+        ``Reservation`` carries none, which is only ever one built by hand.
+        """
+        if reservation.counter_keys:
+            by_window = dict(zip(reservation.windows, reservation.counter_keys, strict=True))
+            return [by_window[window] for window in settled]
+        return self._counter_keys(
+            reservation.scope, reservation.provider, reservation.model, settled
+        )
+
+    # ----------------------------------------------------------------- #
+    # Perception lane support — Step 5
+    # ----------------------------------------------------------------- #
+    def declared_windows(self, spec: ModelSpec) -> tuple[WindowSpec, ...]:
+        """The windows ``limits.yaml`` publishes for ``spec``, at face value.
+
+        ``quota/lanes.py::reserve_perception``'s way to see the *published*
+        numbers — ``_budget`` would reduce them for the answer lane alone, and
+        the perception lane needs its own reduction (D26), not that one's.
+        """
+        return self._declared(spec.provider, spec.model)
+
+    def limits_for(self, spec: ModelSpec) -> ModelLimits | None:
+        """``limits.yaml``'s raw entry for ``spec``, for
+        ``lanes.perception_budget`` to reduce on the lane's own terms."""
+        return self._limits.for_model(spec.provider, spec.model)
+
+    @property
+    def headroom(self) -> float:
+        """D16's safety margin, exposed so ``quota/lanes.py`` can apply it to
+        the perception lane's own limits without reaching into a private field."""
+        return self._headroom
 
 
 def _closest_window(
@@ -622,4 +727,5 @@ __all__ = [
     "QuotaDecision",
     "QuotaTracker",
     "Reservation",
+    "WindowGrant",
 ]

@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 4 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 5 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -189,8 +189,31 @@ message row is written; a hash this caller does not own is a 404 naming it (`cod
 same rule `GET /v1/files/{hash}` and `conversations` already follow — never a 403, since that would
 confirm the hash names real bytes). Each resolved hash becomes a `canonical.file_ref_block` appended
 **after** the message's text block, so a stored message reads "what I asked" then "what I attached".
-`frontend/lib/types.ts`'s `InputMessage` gained the matching optional `file_refs?: string[]`. Milestone
-B (Steps 5–9: the models can actually see what was attached) is next.
+`frontend/lib/types.ts`'s `InputMessage` gained the matching optional `file_refs?: string[]`.
+
+**Step 5 (`quota/lanes.py`'s reserve → commit/release lifecycle) is in — Milestone B is under way.**
+The budget D8 fenced off since Phase 3 is now spendable, and nothing spends it yet. `lanes.reserve_perception`
+is no longer the typed `NotImplementedError` stub; it walks Contract C's one perception key
+(`keys.quota_perception_lane`) against the daily half of `lanes.perception_budget`, and the *shared*
+`rpm`/`tpm` counters against their full published ceiling rather than the answer lane's halved one (D26) —
+a per-minute collision between a chat turn and an extraction resolves itself in under sixty seconds, so
+only the daily window is actually fenced. `lanes.commit_perception`/`release_perception` delegate straight
+to `QuotaTracker.commit`/`release`; the reservation itself already knows which keys it touched, so neither
+needed lane-specific logic of its own. The one honest awkwardness the phase plan calls out —
+`QuotaTracker._effective_limit` bakes `lanes.answer_share` into every limit it computes, which is wrong
+for a lane that isn't the answer lane — is resolved by pulling `reserve`'s body into a new
+`QuotaTracker.reserve_windows`, driven by an explicit `WindowGrant` (label, ceiling, reset policy, actual
+Redis key) per window; `reserve()` is now a thin wrapper that derives its grants from `_budget(spec)` the
+way it always did, and `reserve_perception` builds its own — pointing the daily grant's key at
+`lane:perception` instead of `:rpd` while sharing `rpm`/`tpm`'s key outright. `Reservation` gained
+`counter_keys`, populated alongside `windows`, so `commit`/`release` settle exactly the keys `reserve`
+touched instead of re-deriving them from the window label (which would send a perception commit at `:rpd`
+that was never incremented); a hand-built `Reservation` with no `counter_keys` — the shape every existing
+caller and test used before this step — still falls back to the old derivation. No Lua changed. Verified
+end to end against the real `config/providers.yaml`/`config/limits.yaml`: a chat reservation and a
+perception reservation on the same Gemini model land on separate daily counters, share the same `rpm`
+counter, and `commit_perception` settles the shared `tpm` counter correctly. Milestone B's remaining
+steps (6–9: the extraction call, the local tier, the lane itself, and native passthrough) are next.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 
