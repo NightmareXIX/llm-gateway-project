@@ -14,16 +14,25 @@ field-for-field — ``served_by``, ``requested_slot``, ``substituted``,
 non-streaming answer's provenance has, by construction, already learned to render
 a streamed one's.
 
-Request/response models only. Nothing here imports from the rest of the app or
-knows what a ``ModelSpec`` is; ``app/api/v1/chat.py`` does the translating.
+Request/response models only. Nothing here knows what a ``ModelSpec`` is;
+``app/api/v1/chat.py`` does the translating. The one import from outside this
+module is ``FILE_HASH_PATTERN``, so a hash's shape is defined in exactly one
+place rather than copied between the upload and chat schemas.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.schemas.files import FILE_HASH_PATTERN
+
+FileHash = Annotated[str, Field(pattern=FILE_HASH_PATTERN)]
+"""A SHA-256, lowercase hex — the same pattern ``GET /v1/files/{file_hash}``
+validates on its path parameter. A malformed hash is a 422 from pydantic here
+too, never a database round trip."""
 
 InputRole = Literal["system", "user"]
 """What a client may author.
@@ -47,6 +56,14 @@ class InputMessage(BaseModel):
     """Plain text. Content blocks are Contract B's storage shape, not the client's
     input shape — a ``file_ref`` is produced by ``POST /v1/files`` in Phase 4 and
     referenced by hash, never inlined here."""
+
+    file_refs: list[FileHash] = Field(default_factory=list, max_length=4)
+    """Hashes this turn attaches, per message rather than per request — a
+    ``file_ref`` is content, and content belongs to the message it was attached
+    to, so a conversation where turn three's attachment is indistinguishable
+    from turn one's is a conversation the renderer cannot fit correctly.
+    Ownership is checked once for every hash in the request, before any message
+    is written (D24); a hash this caller does not own is a 404 naming it."""
 
 
 class ChatCompletionRequest(BaseModel):

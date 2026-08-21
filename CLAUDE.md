@@ -99,13 +99,13 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 3 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 4 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
 perception lane, per `project-overview.md` §4.5 and `development-plan.md` §3) is next per the phased
 build plan; its step-by-step plan is [phase4.md](doc/reference/phase4.md) (D22–D30). Milestone A
-(Steps 1–4, the bytes land) is in progress.
+(Steps 1–4, the bytes land) is done.
 
 **Step 1 (config surface, settings, migration) is in.** Nothing behaves differently yet — this step is
 paperwork before mechanism, exactly as Phase 3 Step 1 — but `perception` is now a declared slot, the
@@ -172,8 +172,25 @@ rather than one importing the other. Verified end to end against the real Supaba
 `tests/integration/test_files_endpoint.py`: a real PyMuPDF-built PDF uploads, re-uploads as a dedup hit
 with the same `created_at`, reads back byte-identical through the service-role key and 400s through the
 public URL, a PNG named `report.pdf` stores as `image/png`, an `.exe` named `invoice.pdf` is a 415, and
-an 11MB body is a 413 — with no service-role key anywhere in the logs. Step 4 (`file_refs` on a chat
-turn) is next.
+an 11MB body is a 413 — with no service-role key anywhere in the logs.
+
+**Step 4 (`file_refs` on a chat turn) is in — Milestone A is done.** Nothing resolves an attachment
+yet, so this step's success condition is a *loud* failure: a turn with an attachment reaches render
+step 1 and the default `NoAttachments` resolver raises `NotImplementedError`, exactly as it was written
+to since Phase 1 — the last time that assertion is ever green, since Milestone B gives the resolver
+something real to do. `schemas/chat.py`'s `InputMessage` gained `file_refs: list[FileHash]`, capped at
+4, each pattern-validated against `schemas/files.py::FILE_HASH_PATTERN` (the one import `chat.py` takes
+from outside its own module, so a hash's shape is defined once) — a malformed hash is a 422 from
+pydantic, never a database round trip. Per-message rather than per-request: a `file_ref` is content,
+and content belongs to the message it was attached to. `api/v1/chat.py::_resolve_file_refs` is D24's
+gate — one query over the union of every message's hashes via `db/repo/files.py`'s new
+`get_owned_many` (`WHERE file_hash = ANY(:hashes) AND user_id = :uid`), run once before a single
+message row is written; a hash this caller does not own is a 404 naming it (`code="file_not_found"`,
+same rule `GET /v1/files/{hash}` and `conversations` already follow — never a 403, since that would
+confirm the hash names real bytes). Each resolved hash becomes a `canonical.file_ref_block` appended
+**after** the message's text block, so a stored message reads "what I asked" then "what I attached".
+`frontend/lib/types.ts`'s `InputMessage` gained the matching optional `file_refs?: string[]`. Milestone
+B (Steps 5–9: the models can actually see what was attached) is next.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

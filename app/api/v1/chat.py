@@ -44,8 +44,9 @@ from app.config import get_settings
 from app.core.clock import SYSTEM_CLOCK
 from app.core.errors import InvalidRequest, NotFound
 from app.core.logging import get_logger, get_request_id
-from app.db.models import Conversation
+from app.db.models import Conversation, File
 from app.db.repo import conversations as conversations_repo
+from app.db.repo import files as files_repo
 from app.db.repo import messages as messages_repo
 from app.deps import (
     BreakerDep,
@@ -57,7 +58,13 @@ from app.deps import (
     SessionDep,
     SessionFactoryDep,
 )
-from app.memory.canonical import CanonicalMessage, MessageMeta, text_block
+from app.memory.canonical import (
+    CanonicalMessage,
+    ContentBlock,
+    MessageMeta,
+    file_ref_block,
+    text_block,
+)
 from app.providers.errors import to_app_error
 from app.providers.registry import ProviderRegistry, UnknownSlot
 from app.providers.types import GenParams
@@ -127,14 +134,31 @@ async def create_chat_completion(
     conversation = await _resolve_conversation(session, principal=principal, body=body)
     conversation_id = conversation.id
 
+    # D24: every `file_ref` in the request is ownership-checked once, before a
+    # single message row is written — a hash this caller does not own is a 404
+    # naming it, and nothing about this turn is persisted.
+    owned_files = await _resolve_file_refs(session, principal=principal, body=body)
+
     # --- persist the inbound turn, then let go of the transaction ----------- #
     for message in body.messages:
+        # A message reads "what I asked" then "what I attached" — the text
+        # block first, a `file_ref` block per attachment after it.
+        content: list[ContentBlock] = [text_block(message.content)]
+        content.extend(
+            file_ref_block(
+                file_hash=owned_files[file_hash].file_hash,
+                filename=owned_files[file_hash].filename,
+                mime=owned_files[file_hash].mime,
+                bytes=owned_files[file_hash].bytes,
+            )
+            for file_hash in message.file_refs
+        )
         await messages_repo.append(
             session,
             conversation_id=conversation_id,
             user_id=principal.user_id,
             role=message.role,
-            content=[text_block(message.content)],
+            content=content,
         )
     await conversations_repo.touch(
         session, conversation_id=conversation_id, user_id=principal.user_id
@@ -565,6 +589,38 @@ async def _resolve_conversation(
         )
 
     return existing
+
+
+async def _resolve_file_refs(
+    session: AsyncSession, *, principal: Principal, body: ChatCompletionRequest
+) -> dict[str, File]:
+    """D24's gate: every hash the turn's messages reference, ownership-checked
+    once, before any message is written.
+
+    One query over the union of every message's ``file_refs`` rather than one
+    per message — a hash referenced twice in one request costs one lookup, not
+    two. A hash missing from the result is a 404 naming it, never a 403: the
+    same rule, and the same reasoning, ``_resolve_conversation`` applies to a
+    ``conversation_id`` that is not the caller's.
+    """
+    hashes = {file_hash for message in body.messages for file_hash in message.file_refs}
+    if not hashes:
+        return {}
+
+    owned = await files_repo.get_owned_many(
+        session, user_id=principal.user_id, file_hashes=list(hashes)
+    )
+    by_hash = {file.file_hash: file for file in owned}
+
+    missing = hashes - by_hash.keys()
+    if missing:
+        file_hash = sorted(missing)[0]
+        raise NotFound(
+            f"No file with hash {file_hash!r} is owned by this user.",
+            code="file_not_found",
+            details={"file_hash": file_hash},
+        )
+    return by_hash
 
 
 def _validate_slot(registry: ProviderRegistry, requested: str) -> None:

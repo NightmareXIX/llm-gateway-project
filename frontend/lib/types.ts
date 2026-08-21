@@ -122,6 +122,8 @@ export type InputMessage = {
   /** `assistant` is absent by design: the gateway owns history, clients cannot forge it. */
   role: "system" | "user";
   content: string;
+  /** Hashes from `POST /v1/files`, at most 4. A hash this user does not own is a 404. */
+  file_refs?: string[];
 };
 
 export type ChatCompletionRequest = {

@@ -48,6 +48,25 @@ async def get_owned(session: AsyncSession, *, user_id: UUID, file_hash: str) -> 
     return result.scalar_one_or_none()
 
 
+async def get_owned_many(
+    session: AsyncSession, *, user_id: UUID, file_hashes: list[str]
+) -> list[File]:
+    """Load every hash in ``file_hashes`` this user owns, in one query (D24).
+
+    The gate a chat turn's ``file_refs`` pass through before any message is
+    written: one statement against every hash the request carries, rather than
+    one per hash. A hash absent from the result is either bytes nobody has
+    ever uploaded or bytes somebody *else* owns — both read the same to the
+    caller, and both are a 404, never a 403.
+    """
+    if not file_hashes:
+        return []
+    result = await session.execute(
+        select(File).where(File.user_id == user_id, File.file_hash.in_(file_hashes))
+    )
+    return list(result.scalars().all())
+
+
 async def create_if_absent(
     session: AsyncSession,
     *,

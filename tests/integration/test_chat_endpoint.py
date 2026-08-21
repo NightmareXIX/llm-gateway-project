@@ -12,6 +12,7 @@ response mid-test and inspect the payload that was sent.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ProvidersConfig, get_providers_config
 from app.db.models import Conversation, Message, Request
+from app.perception.storage import MemoryStore
 from app.providers.registry import build_registry
 from tests import provider_fixtures
 from tests.conftest import TokenFactory
@@ -32,6 +34,8 @@ from tests.provider_fixtures import ScriptedHandler
 pytestmark = pytest.mark.integration
 
 COMPLETIONS = "/v1/chat/completions"
+FILES = "/v1/files"
+PDF_BYTES = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n%%EOF\n"
 
 
 def _groq_only() -> ProvidersConfig:
@@ -149,8 +153,28 @@ async def fleet_script(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHand
             await client.aclose()
 
 
+@pytest.fixture
+def store(app: FastAPI) -> MemoryStore:
+    """Swap the lifespan's object store for a dict, so a file_ref test can
+    upload through the real endpoint without touching Supabase or a disk."""
+    memory = MemoryStore()
+    app.state.object_store = memory
+    return memory
+
+
 def _headers(make_jwt: TokenFactory, **kwargs: Any) -> dict[str, str]:
     return {"Authorization": f"Bearer {make_jwt(**kwargs)}"}
+
+
+async def _upload(client: httpx.AsyncClient, headers: dict[str, str]) -> str:
+    """Upload the fixture PDF and return the hash this caller now owns."""
+    response = await client.post(
+        FILES,
+        files={"file": ("report.pdf", PDF_BYTES, "application/pdf")},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    return str(response.json()["file_hash"])
 
 
 async def _messages(session: AsyncSession, conversation_id: str | UUID) -> list[Message]:
@@ -963,4 +987,154 @@ async def test_malformed_bodies_are_422(
     client: httpx.AsyncClient, make_jwt: TokenFactory, body: dict[str, Any]
 ) -> None:
     response = await client.post(COMPLETIONS, json=body, headers=_headers(make_jwt))
+    assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4 Step 4 — `file_refs` on a chat turn
+# --------------------------------------------------------------------------- #
+async def test_a_valid_file_ref_stores_a_two_block_message_then_fails_loudly(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    db_session: AsyncSession,
+) -> None:
+    """The whole path from upload to stored `file_ref` block works. Nothing
+    resolves an attachment yet, so this turn's success condition is a *loud*
+    failure: render step 1's default `NoAttachments` resolver raises, because a
+    history that references a file it cannot show the model must never be sent
+    to one silently. This is the last time that assertion is ever green —
+    Milestone B gives the resolver something real to do.
+    """
+    headers = _headers(make_jwt)
+    file_hash = await _upload(client, headers)
+
+    response = await client.post(
+        COMPLETIONS,
+        json={
+            "messages": [
+                {"role": "user", "content": "what does this say?", "file_refs": [file_hash]}
+            ]
+        },
+        headers=headers,
+    )
+
+    # Unhandled: `NoAttachments.resolve` raises `NotImplementedError`, which is
+    # not an `AppError`, so it lands in the catch-all handler as a generic 500.
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+
+    result = await db_session.execute(select(Message).where(Message.role == "user"))
+    rows = list(result.scalars().all())
+    assert len(rows) == 1
+    assert rows[0].content == [
+        {"type": "text", "text": "what does this say?"},
+        {
+            "type": "file_ref",
+            "file_hash": file_hash,
+            "filename": "report.pdf",
+            "mime": "application/pdf",
+            "bytes": len(PDF_BYTES),
+        },
+    ]
+
+
+async def test_multiple_file_refs_on_one_message_all_land_after_the_text(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    db_session: AsyncSession,
+) -> None:
+    headers = _headers(make_jwt)
+    first_hash = await _upload(client, headers)
+    second_response = await client.post(
+        FILES,
+        files={"file": ("chart.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, "image/png")},
+        headers=headers,
+    )
+    assert second_response.status_code == 201
+    second_hash = second_response.json()["file_hash"]
+
+    response = await client.post(
+        COMPLETIONS,
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "compare these",
+                    "file_refs": [first_hash, second_hash],
+                }
+            ]
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 500
+
+    result = await db_session.execute(select(Message).where(Message.role == "user"))
+    rows = list(result.scalars().all())
+    assert len(rows) == 1
+    content = rows[0].content
+    assert content[0] == {"type": "text", "text": "compare these"}
+    assert {block["file_hash"] for block in content[1:]} == {first_hash, second_hash}
+
+
+async def test_an_unowned_file_hash_is_a_404_and_writes_nothing(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    db_session: AsyncSession,
+) -> None:
+    """D24: ownership is checked once, before any message is written. Bob's
+    hash is a 404, never a 403 — the same rule `conversations` follows — and
+    Alice's attempt to reference it leaves no trace."""
+    alice = _headers(make_jwt, sub=uuid4(), email="alice@example.com")
+    bob = _headers(make_jwt, sub=uuid4(), email="bob@example.com")
+    bobs_hash = await _upload(client, bob)
+
+    response = await client.post(
+        COMPLETIONS,
+        json={
+            "messages": [
+                {"role": "user", "content": "read this", "file_refs": [bobs_hash]}
+            ]
+        },
+        headers=alice,
+    )
+
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "file_not_found"
+    assert error["details"]["file_hash"] == bobs_hash
+
+    result = await db_session.execute(select(Message))
+    assert list(result.scalars().all()) == []
+
+
+async def test_a_malformed_file_hash_is_a_422(
+    client: httpx.AsyncClient, make_jwt: TokenFactory
+) -> None:
+    """A hash that does not match the pattern never reaches the database."""
+    response = await client.post(
+        COMPLETIONS,
+        json={
+            "messages": [
+                {"role": "user", "content": "hi", "file_refs": ["not-a-real-hash"]}
+            ]
+        },
+        headers=_headers(make_jwt),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+async def test_more_than_four_file_refs_is_a_422(
+    client: httpx.AsyncClient, make_jwt: TokenFactory
+) -> None:
+    five_hashes = [hashlib.sha256(str(n).encode()).hexdigest() for n in range(5)]
+    response = await client.post(
+        COMPLETIONS,
+        json={"messages": [{"role": "user", "content": "hi", "file_refs": five_hashes}]},
+        headers=_headers(make_jwt),
+    )
     assert response.status_code == 422
