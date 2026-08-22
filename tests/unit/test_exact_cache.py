@@ -87,20 +87,38 @@ def test_a_degraded_response_is_never_cacheable() -> None:
     assert is_cacheable(temperature=0.0, history=[_message()]) is True
 
 
-def test_a_file_ref_anywhere_in_history_bypasses() -> None:
-    with_attachment = [
-        _message(seq=0, text="here's a file"),
+def _with_attachment(
+    *, file_hash: str = "a" * 64, filename: str = "doc.pdf", text: str = "what does this say?"
+) -> list[CanonicalMessage]:
+    """A one-turn history whose message carries text *and* an attachment — the
+    shape ``api/v1/chat.py::_resolve_file_refs`` writes."""
+    return [
         _message(
-            seq=1,
+            seq=0,
             role="user",
             blocks=[
+                text_block(text),
                 file_ref_block(
-                    file_hash="a" * 64, filename="doc.pdf", mime="application/pdf", bytes=1024
-                )
+                    file_hash=file_hash, filename=filename, mime="application/pdf", bytes=1024
+                ),
             ],
-        ),
+        )
     ]
-    assert is_cacheable(temperature=0.0, history=with_attachment) is False
+
+
+def test_a_file_ref_in_history_no_longer_bypasses() -> None:
+    """D29 reversed Phase 3's blanket exclusion.
+
+    The whole feature this phase exists for would never hit the cache under the
+    old rule — every document question carries a ``file_ref``.
+    """
+    assert is_cacheable(temperature=0.0, history=_with_attachment()) is True
+
+
+def test_a_degraded_answer_over_an_attachment_is_still_refused() -> None:
+    """D29's entire safety argument, and trap 14: the exclusion moved onto
+    ``degraded``, so it has to actually hold for the attachment case."""
+    assert is_cacheable(temperature=0.0, history=_with_attachment(), degraded=True) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +157,31 @@ def test_the_served_model_is_not_part_of_the_hash() -> None:
     import inspect
 
     assert "served" not in inspect.signature(request_hash).parameters
+
+
+def test_a_file_ref_changes_the_hash() -> None:
+    """Same question, one with a document attached and one without, are two
+    different questions — the projection collapses a ``file_ref`` to its hash
+    but never drops the block."""
+    assert _hash(history=_with_attachment()) != _hash(
+        history=[_message(seq=0, role="user", text="what does this say?")]
+    )
+
+
+def test_different_bytes_hash_differently() -> None:
+    """The identity that matters: two documents, one question, two keys."""
+    assert _hash(history=_with_attachment(file_hash="a" * 64)) != _hash(
+        history=_with_attachment(file_hash="b" * 64)
+    )
+
+
+def test_the_same_bytes_under_a_different_filename_hash_identically() -> None:
+    """D29: the *hash* is what the answer depended on. ``filename`` is a label
+    the uploader chose, and two people who renamed one document asked one
+    question."""
+    assert _hash(history=_with_attachment(filename="q3.pdf")) == _hash(
+        history=_with_attachment(filename="quarterly-report-final-FINAL.pdf")
+    )
 
 
 @pytest.mark.parametrize(

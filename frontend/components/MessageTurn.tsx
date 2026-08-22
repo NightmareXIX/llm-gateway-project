@@ -1,9 +1,12 @@
 "use client";
 
+import { cn } from "@/lib/cn";
+import { describeTier, formatBytes } from "@/lib/files";
 import { absoluteTime } from "@/lib/format";
 import { fromMessage } from "@/lib/provenance";
-import type { ContentBlock, Message } from "@/lib/types";
+import type { ContentBlock, ExtractionTier, Message } from "@/lib/types";
 import { ModelIndicator } from "./ModelIndicator";
+import { FileIcon } from "./ui/FileIcon";
 
 /**
  * One stored turn.
@@ -13,17 +16,40 @@ import { ModelIndicator } from "./ModelIndicator";
  * answer is long-form and reads badly inside one — so the assistant turn is
  * full-width prose on the ground colour, capped at a readable measure, with its
  * provenance directly beneath it.
+ *
+ * `reading` is how the turn's attachments reached the model, and it is only ever
+ * given for a *user* turn: the tier is recorded on the assistant row that
+ * answered, but the file it describes is on the row above it, and a badge that
+ * says "read by local OCR" belongs next to the document it is talking about
+ * rather than one paragraph below. `MessageList` is what pairs the two.
  */
-export function MessageTurn({ message }: { message: Message }) {
+export function MessageTurn({
+  message,
+  reading,
+}: {
+  message: Message;
+  reading?: AttachmentReading;
+}) {
   if (message.role === "system") return <SystemTurn message={message} />;
-  return message.role === "user" ? <UserTurn message={message} /> : <AssistantTurn message={message} />;
+  return message.role === "user" ? (
+    <UserTurn message={message} reading={reading} />
+  ) : (
+    <AssistantTurn message={message} />
+  );
 }
 
-function UserTurn({ message }: { message: Message }) {
+/** The assistant row's verdict on the user row's attachments. */
+export type AttachmentReading = { tier: ExtractionTier | null; degraded: boolean };
+
+function UserTurn({ message, reading }: { message: Message; reading?: AttachmentReading }) {
   return (
     <article className="flex justify-end" aria-label="Your message">
       <div className="max-w-[min(42rem,85%)] rounded-card rounded-br-sm border border-subtle bg-raised px-4 py-3 shadow-sm">
-        <Blocks blocks={message.content} className="prose-answer text-[0.9375rem] text-ink" />
+        <Blocks
+          blocks={message.content}
+          reading={reading}
+          className="prose-answer text-[0.9375rem] text-ink"
+        />
         <time
           dateTime={message.created_at}
           className="mt-1.5 block text-right text-[0.6875rem] text-ink-tertiary"
@@ -67,7 +93,15 @@ function SystemTurn({ message }: { message: Message }) {
  * transcript that throws on one would turn a forward-compatible schema into a
  * broken page for everyone with an old conversation.
  */
-function Blocks({ blocks, className }: { blocks: ContentBlock[]; className?: string }) {
+function Blocks({
+  blocks,
+  className,
+  reading,
+}: {
+  blocks: ContentBlock[];
+  className?: string;
+  reading?: AttachmentReading;
+}) {
   return (
     <div className={className}>
       {blocks.map((block, index) => {
@@ -89,22 +123,19 @@ function Blocks({ blocks, className }: { blocks: ContentBlock[]; className?: str
           }
 
           case "file_ref": {
-            const filename = String((block as { filename?: unknown }).filename ?? "attachment");
+            const { filename, mime, bytes } = block as {
+              filename?: unknown;
+              mime?: unknown;
+              bytes?: unknown;
+            };
             return (
-              <p
+              <AttachedFile
                 key={index}
-                className="my-1 inline-flex items-center gap-1.5 rounded-control border border-subtle bg-sunken px-2 py-1 text-xs text-ink-secondary"
-              >
-                <svg viewBox="0 0 24 24" fill="none" className="size-3.5" aria-hidden>
-                  <path
-                    d="M14 3v5h5M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-                {filename}
-              </p>
+                filename={String(filename ?? "attachment")}
+                mime={typeof mime === "string" ? mime : undefined}
+                bytes={typeof bytes === "number" ? bytes : null}
+                reading={reading}
+              />
             );
           }
 
@@ -117,5 +148,60 @@ function Blocks({ blocks, className }: { blocks: ContentBlock[]; className?: str
         }
       })}
     </div>
+  );
+}
+
+/**
+ * A `file_ref` in stored history: what was attached, and how it was read.
+ *
+ * The chip is a record rather than a control — the bucket is private, there is
+ * no download endpoint and no signed URL is ever minted (D23), so there is
+ * deliberately nothing here to click. What it can say is the filename, the size,
+ * and — when the answer that followed came out of local OCR — that the model was
+ * working from a reading nobody vouches for. That badge is the disclosure a
+ * person scrolling back needs, because by then the indicator under the answer
+ * has scrolled past and the question "which of these three files went wrong?"
+ * has only one place it can be answered.
+ */
+function AttachedFile({
+  filename,
+  mime,
+  bytes,
+  reading,
+}: {
+  filename: string;
+  mime?: string;
+  bytes: number | null;
+  reading?: AttachmentReading;
+}) {
+  // Only when the answer was degraded. Every attachment gets a tier, and a chip
+  // on every one of them saying "read directly" would be noise on the common
+  // path — what a person scrolling back needs is the one that went wrong.
+  const tier =
+    reading?.degraded && reading.tier
+      ? describeTier(reading.tier, "the model", reading.degraded)
+      : null;
+
+  return (
+    <span className="my-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+      <span className="inline-flex max-w-full items-center gap-1.5 rounded-control border border-subtle bg-sunken px-2 py-1 text-xs text-ink-secondary">
+        <FileIcon mime={mime} className="size-3.5 text-ink-tertiary" />
+        <span className="truncate">{filename}</span>
+        {bytes !== null && (
+          <span className="shrink-0 text-[0.6875rem] text-ink-tertiary">{formatBytes(bytes)}</span>
+        )}
+      </span>
+      {tier && (
+        <span
+          className={cn(
+            "inline-flex items-center rounded-control px-1.5 py-0.5",
+            "bg-warn-wash text-[0.6875rem] font-medium text-warn",
+          )}
+          title={tier.detail}
+        >
+          {tier.label}
+        </span>
+      )}
+    </span>
   );
 }

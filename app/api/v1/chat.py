@@ -200,8 +200,10 @@ async def create_chat_completion(
 
     # --- D5/D19: an exact-match hit skips routing, the breaker and quota ---- #
     # entirely. `cache_key` stays `None` when the request was never eligible
-    # (`temperature > 0`, or a history carrying a `file_ref`), which is what
-    # tells the write branch below not to bother computing one twice.
+    # (`temperature > 0`), which is what tells the write branch below not to
+    # bother computing one twice. A history carrying a `file_ref` *is* eligible
+    # since D29 — the hashes are folded into the key, and `degraded` on the
+    # write side is what keeps an untrusted reading from being replayed.
     started = time.perf_counter()
     cache_key: str | None = None
     x_cache: exact.CacheStatus = exact.BYPASS

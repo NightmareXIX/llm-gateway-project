@@ -101,6 +101,85 @@ const delta = (content: string) => ({ choices: [{ delta: { content } }] });
 
 beforeEach(() => vi.clearAllMocks());
 
+describe("attachments on a turn", () => {
+  it("puts the hashes on the message that carried them, not on the request", async () => {
+    // Per-message, because a `file_ref` is content and content belongs to the
+    // message it was attached to (`InputMessage.file_refs`).
+    const stream = pausedScript((handlers) => handlers.onMeta?.(META));
+    const { result } = renderHook(() => useSendMessage("conv-1"));
+
+    let sent!: Promise<void>;
+    await act(async () => {
+      sent = result.current.send("what does this say?", [
+        { file_hash: "a".repeat(64), filename: "q3.pdf", mime: "application/pdf", bytes: 1024 },
+      ]);
+    });
+
+    expect(openCompletionStream.mock.calls[0]?.[0].messages).toEqual([
+      { role: "user", content: "what does this say?", file_refs: ["a".repeat(64)] },
+    ]);
+
+    await act(async () => {
+      stream.release();
+      await sent;
+    });
+  });
+
+  it("sends an ordinary turn without a `file_refs` key at all", async () => {
+    const stream = pausedScript((handlers) => handlers.onMeta?.(META));
+    const { result } = renderHook(() => useSendMessage("conv-1"));
+
+    let sent!: Promise<void>;
+    await act(async () => {
+      sent = result.current.send("hi");
+    });
+
+    expect(openCompletionStream.mock.calls[0]?.[0].messages[0]).not.toHaveProperty("file_refs");
+
+    await act(async () => {
+      stream.release();
+      await sent;
+    });
+  });
+
+  it("keeps the files on a retry rather than making the user re-attach them", async () => {
+    const attachment = {
+      file_hash: "b".repeat(64),
+      filename: "scan.pdf",
+      mime: "application/pdf",
+      bytes: 2048,
+    };
+    script(async (handlers) => {
+      handlers.onMeta?.(META);
+      handlers.onDone?.({ ...DONE, status: "failed" });
+    });
+
+    const { result } = renderHook(() => useSendMessage("conv-1"));
+    await act(async () => {
+      await result.current.send("what does this say?", [attachment]);
+    });
+    expect(result.current.pending?.status).toBe("failed");
+
+    const stream = pausedScript((handlers) => handlers.onMeta?.(META));
+    let sent!: Promise<void>;
+    await act(async () => {
+      result.current.retry();
+      sent = Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(openCompletionStream.mock.calls.at(-1)?.[0].messages[0].file_refs).toEqual([
+        attachment.file_hash,
+      ]),
+    );
+
+    await act(async () => {
+      stream.release();
+      await sent;
+    });
+  });
+});
+
 describe("a restart", () => {
   it("clears the bubble instead of splicing the two attempts", async () => {
     const stream = pausedScript((handlers) => {

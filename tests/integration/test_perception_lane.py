@@ -317,8 +317,9 @@ async def _ask(
     conversation_id: str | None = None,
     stream: bool = False,
     slot: str = "general",
+    question: str = "what does this document say?",
 ) -> httpx.Response:
-    message: dict[str, Any] = {"role": "user", "content": "what does this document say?"}
+    message: dict[str, Any] = {"role": "user", "content": question}
     if file_hash is not None:
         message["file_refs"] = [file_hash]
     body: dict[str, Any] = {
@@ -537,7 +538,12 @@ async def test_a_stored_model_reading_beats_a_native_passthrough(
     assert (await _ask(client, headers, file_hash=file_hash)).json()["extraction_tier"] == "llm"
 
     gemini_fleet = fleet(general=("gemini",), gemini=["success"])
-    response = await _ask(client, headers, file_hash=file_hash)
+    # A *different* question about the same document, deliberately. Since D29 an
+    # attachment turn is cacheable, so re-asking the identical question in a
+    # fresh conversation would be answered by `cache/exact.py` before the lane
+    # ran at all — a real behaviour, tested on its own below, and the wrong one
+    # to assert a tier through.
+    response = await _ask(client, headers, file_hash=file_hash, question="summarize this document")
 
     assert response.json()["extraction_tier"] == "cache"
     assert gemini_fleet.extraction_calls() == 0
@@ -754,6 +760,112 @@ async def test_the_streaming_path_surfaces_an_unreadable_file_as_a_422(
     assert response.headers["content-type"].startswith("application/json")
     assert response.json()["error"]["code"] == "file_unreadable"
     assert handler.calls("groq") == 0
+
+
+# --------------------------------------------------------------------------- #
+# D29 — the exact-match cache over an attachment turn (Step 10)
+# --------------------------------------------------------------------------- #
+async def test_an_identical_question_over_the_same_file_is_a_cache_hit(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+) -> None:
+    """D29 reversed Phase 3's blanket exclusion, and this is what it bought.
+
+    Three things have to be true at once, because a cache that hits while still
+    calling a provider is a cache that costs more than it saves: the header says
+    ``HIT``, no answer request left the process, and — the half specific to this
+    phase — **no lane call either**. The response cache sits in front of render,
+    so a hit skips the extraction chain as completely as it skips the router.
+    """
+    handler = fleet(general=("groq",), groq=["success"], gemini=["extraction_complete"])
+    headers = _headers(make_jwt)
+    file_hash = await _upload(client, headers)
+
+    first = await _ask(client, headers, file_hash=file_hash)
+    assert first.headers["X-Cache"] == "MISS"
+    assert first.json()["extraction_tier"] == "llm"
+
+    second = await _ask(client, headers, file_hash=file_hash)
+
+    assert second.status_code == 200, second.text
+    assert second.headers["X-Cache"] == "HIT"
+    assert (
+        second.json()["choices"][0]["message"]["content"]
+        == (first.json()["choices"][0]["message"]["content"])
+    )
+    # One answer call and one extraction call in total — both from the first turn.
+    assert handler.calls("groq") == 1
+    assert handler.extraction_calls() == 1
+    # A hit never ran the lane, so there is no tier to disclose. The tier that
+    # produced the text is on the *first* answer's own row.
+    assert second.json()["extraction_tier"] is None
+
+
+async def test_the_same_question_over_different_bytes_misses(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+) -> None:
+    """The hash is the identity of the content (D29). Two documents, one
+    question, two keys — otherwise the cache would answer about the wrong
+    document, which is the failure mode the blanket exclusion was protecting
+    against in the first place."""
+    handler = fleet(
+        general=("groq",),
+        groq=["success", "success"],
+        gemini=["extraction_complete", "extraction_complete"],
+    )
+    headers = _headers(make_jwt)
+    first_hash = await _upload(client, headers)
+    second_hash = await _upload(client, headers, content=_pdf_of(2), filename="other.pdf")
+    assert first_hash != second_hash
+
+    assert (await _ask(client, headers, file_hash=first_hash)).headers["X-Cache"] == "MISS"
+    second = await _ask(client, headers, file_hash=second_hash)
+
+    assert second.headers["X-Cache"] == "MISS"
+    assert handler.calls("groq") == 2
+
+
+async def test_a_degraded_answer_is_never_written_to_the_cache(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+    perception: Callable[..., None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trap 14, which is the whole safety argument D29 rests on.
+
+    An answer built on an OCR reading nobody trusts must not be replayed for an
+    hour. The read side cannot know a tier — it runs before anything is
+    resolved — so the guarantee lives entirely in the write side's ``degraded``
+    gate, and the observable consequence is that the second identical request
+    is a ``MISS`` that calls a provider again.
+    """
+    monkeypatch.setattr(local_tier, "ocr_available", lambda: True)
+    monkeypatch.setattr(
+        pytesseract, "image_to_string", lambda _image: "Quarterly revenue was flat."
+    )
+    perception(PERCEPTION_LOCAL_ONLY=True)
+    handler = fleet(general=("groq",), groq=["success", "success"], gemini=[])
+    headers = _headers(make_jwt)
+    file_hash = await _upload(client, headers, content=SCANNED_PDF, filename="scan.pdf")
+
+    first = await _ask(client, headers, file_hash=file_hash)
+    assert first.json()["degraded"] is True
+    # `MISS`, not `BYPASS`: the request *was* eligible on the way in, and only
+    # the answer turned out not to be. That distinction is the one `X-Cache`'s
+    # third value exists for.
+    assert first.headers["X-Cache"] == "MISS"
+
+    second = await _ask(client, headers, file_hash=file_hash)
+
+    assert second.headers["X-Cache"] == "MISS"
+    assert handler.calls("groq") == 2
 
 
 # --------------------------------------------------------------------------- #

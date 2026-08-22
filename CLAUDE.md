@@ -92,20 +92,21 @@ app/
   keys_resolution/resolver.py
   usage/{logger,metrics}.py
   db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,files,extractions}.py}
-frontend/            # Next.js App Router + Tailwind; lib/sse.ts, components/ModelIndicator.tsx, components/ModelPicker.tsx
+frontend/            # Next.js App Router + Tailwind; lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip}.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
 docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ holds the source specs
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 9 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 10 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
 perception lane, per `project-overview.md` §4.5 and `development-plan.md` §3) is next per the phased
-build plan; its step-by-step plan is [phase4.md](doc/reference/phase4.md) (D22–D30). Milestone A
-(Steps 1–4, the bytes land) is done.
+build plan; its step-by-step plan is [phase4.md](doc/reference/phase4.md) (D22–D30). Milestones A
+(Steps 1–4, the bytes land) and B (Steps 5–9, the models can see) are done; Milestone C (honest and
+shippable) is under way.
 
 **Step 1 (config surface, settings, migration) is in.** Nothing behaves differently yet — this step is
 paperwork before mechanism, exactly as Phase 3 Step 1 — but `perception` is now a declared slot, the
@@ -348,6 +349,52 @@ million euros", correct — with `rpd` +1 and **`lane:perception` untouched** (t
 and Gemini reported **21,297 prompt tokens** for the turn: five figures, against the eight the
 placeholder used to measure it at, and the same order of magnitude as the 10,320 the rate table
 now reserves.
+
+**Step 10 (cache and the frontend) is in — Milestone C is under way.** The phase becomes demoable to
+somebody who has never seen a terminal. **D29 on the backend:** `is_cacheable`'s blanket `file_ref`
+exclusion — which Phase 3 wrote deliberately so this would be a Phase 4 decision — is gone, and
+`request_hash` covers each `file_ref`'s **hash** instead, projected by a new `_identity_of` so that
+`filename`, `mime` and `bytes` (a label the uploader chose, and two functions of the same bytes) do
+not enter the key while the block itself still does — "summarize this" with a document and without one
+must not collide. `CACHE_FORMAT_VERSION` went to 2, which is what that constant is for. The predicate
+is still **one function** shared by the read and write sides, and `degraded` now carries the whole
+weight of the attachment argument: the read side runs before anything is resolved and cannot know a
+tier, but the one case where two identical requests over identical bytes deserve different answers is
+a reading nobody trusts, and that is exactly what the write-side gate refuses (trap 14). One existing
+test had to change and the change *is* the feature: `test_a_stored_model_reading_beats_a_native_passthrough`
+asked the same question twice and now gets an `X-Cache: HIT` before the lane runs at all, so it asks a
+different question and D29 gets three integration tests of its own. **On the frontend**, `lib/files.ts`
+is new and holds both ends of one story — the gate a file passes before it is uploaded (the allowlist
+mirroring `sniff_mime`'s range, `MAX_FILE_BYTES` mirroring the setting, both duplicated knowingly
+because there is no codegen across that boundary and the gateway stays authoritative) and
+`describeTier`, the disclosure that comes back. `api.uploadFile` is the only thing on that side that
+puts bytes in; `request()`'s JSON `Content-Type` is now conditional on a *string* body, since a
+`FormData` must set its own boundary. `useAttachments` (in `hooks.ts`) **uploads on selection, not on
+send** — so the hash is in hand when the message is, and a 413 lands on the chip that caused it
+seconds before the message exists — mirroring its list into a ref because `add` both counts remaining
+slots and starts uploads, which a functional `setState` updater would run twice under StrictMode.
+`Composer` owns that hook (a file is part of composing a message), gained an attach button, a chip row,
+drag-and-drop with a depth counter, a submit blocked while an upload is in flight, and the privacy line
+D29's docs require **before** the send rather than in a settings page. `send(text, attachments)` puts
+`file_refs` on the *message*, `PendingTurn` carries them so a retry does not make the user re-attach,
+and `applyOptimisticTurn` writes the same text-then-`file_ref` block order the server does.
+`ModelIndicator`'s rule 4 gained its *why*: `Provenance.extractionTier` reaches it from all three
+adapters, and `describeTier` maps the four tiers to four different guarantees — `native` names the
+answering model (it is the reader), `llm` says "read by another model" because **nothing on the wire
+carries which perception candidate won** and inventing one is the single thing this component must
+never do, and `local`/`cache` are sharpened by `degraded`, since tier 3 is a PDF's own text layer *or*
+OCR over a scan and calling the first one OCR would simply be wrong. `MessageList` pairs each user row
+with the *immediately* following assistant row (invariant 3 permits consecutive user messages, and
+reaching further would attribute an answer's reading to a file it never saw) so a degraded turn's chip
+is badged next to the document it is about. `ErrorState` branches on `code` before `status` and renders
+413/415/422 from `ATTACHMENT_ERROR_COPY`, shared with the failed chip so the two never describe one
+refusal differently. Verified end to end against live Groq, live Gemini, live Supabase and live
+Upstash, and then again through a real browser: a PDF uploaded from the composer and asked on `fast`
+answered "Revenue was 4.2 million euros." disclosing **read by another model**; the identical request
+came back `X-Cache: HIT` with the perception counter unmoved, `attempts: 0` and no tier claimed; the
+same question over different bytes was a `MISS` and a different answer; an 11MB file and an `.mp4` were
+both refused in the composer **with no request made**; and with `PERCEPTION_LOCAL_ONLY=true` the same
+document answered correctly at tier `local`, disclosed as **read locally**, with zero Gemini calls.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

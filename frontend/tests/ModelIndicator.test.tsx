@@ -31,6 +31,7 @@ const BASE: Provenance = {
   substituted: false,
   attempts: 1,
   degraded: false,
+  extractionTier: null,
   tokensIn: 812,
   tokensOut: 340,
   wastedTokensOut: 0,
@@ -128,11 +129,47 @@ describe("rule 3 — attempts > 1 carries the trail", () => {
   });
 });
 
-describe("rule 4 — degraded says so", () => {
-  it("marks an answer that reached the model through local extraction", () => {
+describe("rule 4 — degraded says so, and says why", () => {
+  it("falls back to a bare degraded marker on a row with no tier recorded", () => {
+    // Every assistant row written before Phase 4. All that was recorded is that
+    // something went wrong, and inventing a tier for it would be worse than the
+    // vaguer sentence.
     render(<ModelIndicator provenance={{ ...BASE, degraded: true }} />);
 
     expect(screen.getByText("read with local extraction")).toBeInTheDocument();
+  });
+
+  it("names local OCR as the reader when that is what read the document", () => {
+    render(
+      <ModelIndicator provenance={{ ...BASE, degraded: true, extractionTier: "local" }} />,
+    );
+
+    expect(screen.getByText("read by local OCR")).toBeInTheDocument();
+    // The full sentence is available without a pointer — the reason a person
+    // should distrust this answer is information, not a hover affordance.
+    expect(screen.getAllByText(/ran OCR over it/).length).toBeGreaterThan(0);
+  });
+
+  it("discloses a tier even when the answer was not degraded", () => {
+    // `served_by`'s discipline, applied to perception: "read directly" and
+    // "read by another model" are different guarantees, and the gateway does
+    // not get to be silent about which one this answer got.
+    render(<ModelIndicator provenance={{ ...BASE, extractionTier: "native" }} />);
+
+    expect(screen.getByText("read directly")).toBeInTheDocument();
+    expect(screen.getAllByText(/GPT-OSS 120B was handed the file itself/).length).toBe(1);
+  });
+
+  it("says an extraction was reused rather than pretending it was fresh", () => {
+    render(<ModelIndicator provenance={{ ...BASE, extractionTier: "cache" }} />);
+
+    expect(screen.getByText("read earlier")).toBeInTheDocument();
+  });
+
+  it("says nothing about perception for a turn that carried no attachment", () => {
+    render(<ModelIndicator provenance={BASE} />);
+
+    expect(screen.queryByText(/read /)).not.toBeInTheDocument();
   });
 });
 
@@ -153,6 +190,17 @@ describe("provenance adapters", () => {
 
   it("builds provenance from a stored message's meta", () => {
     expect(fromMessageMeta(meta)).toEqual(BASE);
+  });
+
+  it("carries the extraction tier off a stored row", () => {
+    expect(fromMessageMeta({ ...meta, extraction_tier: "llm" })?.extractionTier).toBe("llm");
+  });
+
+  it("reads a pre-Phase-4 row's missing tier as no attachment, not as unknown", () => {
+    const withoutTier: Partial<MessageMeta> = { ...meta };
+    delete withoutTier.extraction_tier;
+
+    expect(fromMessageMeta(withoutTier)?.extractionTier).toBeNull();
   });
 
   it("returns null when a row carries no provider", () => {
@@ -238,5 +286,16 @@ describe("a restarted stream, end to end", () => {
     expect(screen.getByText("2 attempts")).toBeInTheDocument();
     // The trail, without a pointer: the attempt that died and why.
     expect(screen.getByText(/provider unavailable/)).toBeInTheDocument();
+  });
+
+  it("carries the tier off `done` onto the same indicator", () => {
+    // The streaming path's own copy of the disclosure. It reaches the component
+    // through `provenance.ts` exactly as the stored row's does, which is the
+    // check that the Phase 1 contract is still doing its job.
+    render(
+      <ModelIndicator provenance={fromDoneEvent({ ...done, extraction_tier: "llm" })} />,
+    );
+
+    expect(screen.getByText("read by another model")).toBeInTheDocument();
   });
 });

@@ -7,6 +7,7 @@ import type {
   Conversation,
   ConversationDetail,
   ErrorResponse,
+  FileUploadResponse,
   Me,
   ModelsResponse,
 } from "./types";
@@ -160,7 +161,12 @@ async function request<T>(
     response = await fetch(`${GATEWAY_BASE}${path}`, {
       ...rest,
       headers: {
-        ...(rest.body ? { "Content-Type": "application/json" } : {}),
+        // Only for a JSON body. A `FormData` body must be allowed to set its
+        // own `Content-Type`, because the boundary token is generated with it
+        // — declaring `multipart/form-data` by hand produces a header with no
+        // boundary, and the gateway's parser rejects it as malformed before a
+        // single byte of the file is read.
+        ...(typeof rest.body === "string" ? { "Content-Type": "application/json" } : {}),
         ...(await authHeaders()),
         ...rest.headers,
       },
@@ -180,6 +186,27 @@ export const api = {
 
   /** Live per-slot status, no upstream call (D21). `useModels` is the usual caller. */
   fetchModels: () => request<ModelsResponse>("/v1/models"),
+
+  /**
+   * Upload one file and get back the hash a turn can reference.
+   *
+   * The only thing on this side of the wire that puts bytes into the gateway.
+   * Called on *selection* rather than on send (Step 10), so the hash is already
+   * in hand by the time the message is written — an upload that starts when the
+   * user hits Enter would put a multi-second pause between the send and the
+   * first token, on top of the extraction the first turn already pays for.
+   *
+   * A 413 or a 415 arrives as an ordinary `GatewayError` and is rendered as
+   * itself; the client-side gate in `lib/files.ts` is what keeps the common
+   * cases from getting this far.
+   */
+  uploadFile: (file: File, signal?: AbortSignal) => {
+    const form = new FormData();
+    // `"file"` is `files.UPLOAD_FIELD`. The gateway parses the multipart body
+    // itself and keeps exactly this one part.
+    form.append("file", file, file.name);
+    return request<FileUploadResponse>("/v1/files", { method: "POST", body: form, signal });
+  },
 
   listConversations: () => request<Conversation[]>("/v1/conversations"),
 

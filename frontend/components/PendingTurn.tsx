@@ -1,9 +1,11 @@
 "use client";
 
+import { formatBytes } from "@/lib/files";
 import type { PendingTurn as PendingTurnState } from "@/lib/hooks";
 import { modelLabel } from "@/lib/models";
 import { restartReason } from "@/lib/provenance";
 import { ModelIndicator } from "./ModelIndicator";
+import { FileIcon } from "./ui/FileIcon";
 
 /**
  * The turn in flight.
@@ -32,6 +34,21 @@ export function PendingTurn({ pending }: { pending: PendingTurnState }) {
       <article className="flex justify-end opacity-60" aria-label="Your message">
         <div className="max-w-[min(42rem,85%)] rounded-card rounded-br-sm border border-subtle bg-raised px-4 py-3">
           <p className="prose-answer text-[0.9375rem] text-ink">{pending.text}</p>
+          {/* Same chip the stored row will render a moment later, so the turn
+              does not visibly change shape when the optimistic message is
+              replaced by the one that came back from the gateway. */}
+          {pending.attachments.map((attachment) => (
+            <span
+              key={attachment.file_hash}
+              className="mt-1.5 inline-flex max-w-full items-center gap-1.5 rounded-control border border-subtle bg-sunken px-2 py-1 text-xs text-ink-secondary"
+            >
+              <FileIcon mime={attachment.mime} className="size-3.5 text-ink-tertiary" />
+              <span className="truncate">{attachment.filename}</span>
+              <span className="shrink-0 text-[0.6875rem] text-ink-tertiary">
+                {formatBytes(attachment.bytes)}
+              </span>
+            </span>
+          ))}
           {/* Dropped once tokens are arriving: by then the message has provably
               landed, and a label still claiming otherwise is just wrong. */}
           {pending.status === "sending" && (

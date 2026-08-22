@@ -1,6 +1,7 @@
 "use client";
 
 import { cn } from "@/lib/cn";
+import { describeTier } from "@/lib/files";
 import { formatTokens } from "@/lib/format";
 import { modelLabel, providerLabel } from "@/lib/models";
 import type { Provenance } from "@/lib/provenance";
@@ -24,7 +25,11 @@ import { VisuallyHidden } from "./ui/VisuallyHidden";
  *      else answered" is the disclosure; hiding which slot was asked for would
  *      make the substitution silent again.
  *   3. `attempts > 1` → a subtle marker carrying the attempt trail.
- *   4. `degraded` → say so plainly.
+ *   4. `degraded` → say so plainly. Step 10 of Phase 4 gave that rule its
+ *      *why*: `extraction_tier` names how the document actually reached the
+ *      model, and the four tiers are four different guarantees. A tier is
+ *      disclosed whenever there is one, degraded or not — the same reasoning
+ *      that makes `served_by` unconditional.
  *
  * Everything it needs arrives as one `Provenance` object, built by an adapter in
  * `lib/provenance.ts`. That indirection is what lets a stored message, a
@@ -38,11 +43,20 @@ export function ModelIndicator({
   provenance: Provenance;
   className?: string;
 }) {
-  const { servedBy, requestedSlot, substituted, attempts, degraded, tokensIn, tokensOut } =
-    provenance;
+  const {
+    servedBy,
+    requestedSlot,
+    substituted,
+    attempts,
+    degraded,
+    extractionTier,
+    tokensIn,
+    tokensOut,
+  } = provenance;
 
   const model = modelLabel(servedBy.model);
   const provider = providerLabel(servedBy.provider);
+  const reading = extractionTier ? describeTier(extractionTier, model, degraded) : null;
 
   return (
     <div
@@ -99,12 +113,36 @@ export function ModelIndicator({
         </>
       )}
 
-      {/* Rule 4 — degraded perception. */}
-      {degraded && (
+      {/* Rule 4 — how the attachment was read, and whether to trust it.
+          `reading` is the specific answer; the bare `degraded` fallback below it
+          covers a row from before `extraction_tier` existed, where all that was
+          ever recorded is that something went wrong. */}
+      {reading ? (
         <>
           <Separator />
-          <span className="font-medium text-warn">read with local extraction</span>
+          <Tooltip content={<span>{reading.detail}</span>}>
+            <span
+              tabIndex={0}
+              className={cn(
+                "inline-flex cursor-help items-center gap-1 rounded border-b border-dotted",
+                reading.tone === "warn"
+                  ? "border-warn font-medium text-warn"
+                  : "border-ink-tertiary text-ink-tertiary",
+              )}
+            >
+              <FileGlyph />
+              {reading.label}
+            </span>
+          </Tooltip>
+          <VisuallyHidden>{reading.detail}</VisuallyHidden>
         </>
+      ) : (
+        degraded && (
+          <>
+            <Separator />
+            <span className="font-medium text-warn">read with local extraction</span>
+          </>
+        )
       )}
 
       {(tokensIn !== null || tokensOut !== null) && (
@@ -119,6 +157,20 @@ export function ModelIndicator({
         </>
       )}
     </div>
+  );
+}
+
+/** Small enough to sit in a 12px row without becoming the loudest thing in it. */
+function FileGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className="size-3" aria-hidden>
+      <path
+        d="M14 3v5h5M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 

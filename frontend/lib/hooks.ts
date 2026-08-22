@@ -5,10 +5,12 @@ import { useRouter } from "next/navigation";
 import useSWR, { mutate as globalMutate } from "swr";
 
 import { GatewayError, NetworkError, api, swrFetcher } from "./api";
+import { MAX_ATTACHMENTS, rejectionFor, uploadFailureReason, type SentAttachment } from "./files";
 import { deriveTitle } from "./format";
 import { buildAttemptTrail, fromDoneEvent, fromMetaEvent, type Provenance } from "./provenance";
 import { openCompletionStream, type DoneEvent, type MetaEvent, type RestartEvent } from "./sse";
 import type {
+  ContentBlock,
   Conversation,
   ConversationDetail,
   Me,
@@ -66,6 +68,157 @@ export function useConversation(id: string | null) {
   return { conversation: data, error, isLoading, mutate };
 }
 
+// --------------------------------------------------------------------------- //
+// Attachments (Phase 4, Step 10)
+// --------------------------------------------------------------------------- //
+/**
+ * One file in the composer, at whatever point of its short life it is at.
+ *
+ * `rejected` and `failed` are two different things and are kept apart: the
+ * first never left the browser (`lib/files.ts`'s gate said no), the second was
+ * refused by the gateway. Both show the file with its reason rather than
+ * vanishing into a toast — the user chose that file, and the chip is where the
+ * explanation belongs.
+ */
+export type Attachment = {
+  /** Client-side identity. Selecting the same file twice makes two chips; the
+   *  gateway dedups the *bytes*, which is a different question (D24). */
+  id: string;
+  name: string;
+  size: number;
+  status: "uploading" | "ready" | "rejected" | "failed";
+  /** Set once `status === "ready"` — the hash and the metadata a turn needs. */
+  file?: SentAttachment;
+  /** Set on `rejected` and `failed`. One sentence, rendered on the chip. */
+  reason?: string;
+};
+
+/**
+ * The composer's attachment list, and the uploads behind it.
+ *
+ * **The upload happens on selection, not on send.** That is the whole reason
+ * this is a hook with its own lifecycle rather than a `FormData` assembled at
+ * submit time: by the time the user finishes typing, the hash is already in
+ * hand, so pressing Enter costs exactly what it costs without a file. It also
+ * means a 413 or a 415 is reported next to the file that caused it, seconds
+ * before the message exists — instead of failing a send the user has already
+ * committed to.
+ *
+ * The list is mirrored into a ref because `add` has to know how many slots are
+ * left *and* start uploads for what it accepted, and doing both inside a
+ * functional `setState` updater would run the side effect twice under React's
+ * StrictMode. The ref is the value; `setItems` is how it gets rendered.
+ */
+export function useAttachments() {
+  const [items, setItems] = useState<Attachment[]>([]);
+  const itemsRef = useRef<Attachment[]>([]);
+  const uploadsRef = useRef(new Map<string, AbortController>());
+
+  const commit = useCallback((next: Attachment[]) => {
+    itemsRef.current = next;
+    setItems(next);
+  }, []);
+
+  const patch = useCallback(
+    (id: string, changes: Partial<Attachment>) => {
+      commit(
+        itemsRef.current.map((item) => (item.id === id ? { ...item, ...changes } : item)),
+      );
+    },
+    [commit],
+  );
+
+  const upload = useCallback(
+    async (id: string, file: File) => {
+      const controller = new AbortController();
+      uploadsRef.current.set(id, controller);
+      try {
+        const uploaded = await api.uploadFile(file, controller.signal);
+        patch(id, {
+          status: "ready",
+          file: {
+            file_hash: uploaded.file_hash,
+            filename: uploaded.filename,
+            // The **sniffed** mime, not the one the browser declared: a PNG
+            // named `report.pdf` is stored as an image, and the chip should
+            // say what the gateway actually kept.
+            mime: uploaded.mime,
+            bytes: uploaded.bytes,
+          },
+        });
+      } catch (error) {
+        // Removed while in flight — the chip is already gone, and patching a
+        // row that no longer exists would resurrect nothing but would log a
+        // failure nobody can dismiss.
+        if (controller.signal.aborted) return;
+        patch(id, { status: "failed", reason: uploadFailureReason(error) });
+      } finally {
+        uploadsRef.current.delete(id);
+      }
+    },
+    [patch],
+  );
+
+  /** Queue files: rejected ones become chips with a reason, the rest upload. */
+  const add = useCallback(
+    (files: File[]) => {
+      const next = [...itemsRef.current];
+      const queued: { id: string; file: File }[] = [];
+      let room = MAX_ATTACHMENTS - next.length;
+
+      for (const file of files) {
+        // Silently dropping the overflow rather than reporting it: the attach
+        // button is already disabled at the cap, so the only way to get here is
+        // a multi-select or a drop, where "four of these six" is obvious from
+        // what appeared.
+        if (room <= 0) break;
+        room -= 1;
+
+        const id = `${Date.now().toString(36)}-${next.length}-${file.name}`;
+        const reason = rejectionFor(file);
+        next.push({
+          id,
+          name: file.name,
+          size: file.size,
+          status: reason ? "rejected" : "uploading",
+          ...(reason ? { reason } : {}),
+        });
+        if (!reason) queued.push({ id, file });
+      }
+
+      commit(next);
+      for (const item of queued) void upload(item.id, item.file);
+    },
+    [commit, upload],
+  );
+
+  const remove = useCallback(
+    (id: string) => {
+      uploadsRef.current.get(id)?.abort();
+      uploadsRef.current.delete(id);
+      commit(itemsRef.current.filter((item) => item.id !== id));
+    },
+    [commit],
+  );
+
+  /** After a successful send. Deliberately does not abort: everything still
+   *  uploading was, by `blocked` below, not part of the message that went. */
+  const clear = useCallback(() => commit([]), [commit]);
+
+  return {
+    attachments: items,
+    add,
+    remove,
+    clear,
+    /** What rides on the next message. */
+    ready: items.flatMap((item) => (item.file ? [item.file] : [])),
+    /** True while any upload is in flight — the send button waits for it, so a
+     *  message can never be sent referencing a hash that does not exist yet. */
+    uploading: items.some((item) => item.status === "uploading"),
+    atCapacity: items.length >= MAX_ATTACHMENTS,
+  };
+}
+
 /**
  * The turn currently in flight, and everything on screen because of it.
  *
@@ -83,6 +236,10 @@ export function useConversation(id: string | null) {
  */
 export type PendingTurn = {
   text: string;
+  /** What rode along with `text`, for the optimistic user bubble and for
+   *  `retry` — a retried turn has to carry the same files, and re-selecting
+   *  them by hand would be the worst possible recovery. */
+  attachments: SentAttachment[];
   status: "sending" | "streaming" | "unsaved" | "failed";
   /**
    * The **current attempt's** text. Cleared on every `restart`, never appended
@@ -142,7 +299,7 @@ export function useSendMessage(conversationId: string | null, slot: string = DEF
   }, []);
 
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, attachments: SentAttachment[] = []) => {
       const trimmed = text.trim();
       if (!trimmed) return;
 
@@ -152,6 +309,7 @@ export function useSendMessage(conversationId: string | null, slot: string = DEF
 
       setPending({
         text: trimmed,
+        attachments,
         status: "sending",
         answer: "",
         provenance: null,
@@ -162,7 +320,19 @@ export function useSendMessage(conversationId: string | null, slot: string = DEF
         await openCompletionStream(
           {
             model: slot,
-            messages: [{ role: "user", content: trimmed }],
+            messages: [
+              {
+                role: "user",
+                content: trimmed,
+                // Per *message*, not per request: a `file_ref` is content, and
+                // content belongs to the message it was attached to. Omitted
+                // entirely when empty rather than sent as `[]`, so an ordinary
+                // turn's body is byte-for-byte what it has always been.
+                ...(attachments.length
+                  ? { file_refs: attachments.map((attachment) => attachment.file_hash) }
+                  : {}),
+              },
+            ],
             ...(conversationId ? { conversation_id: conversationId } : {}),
           },
           {
@@ -290,6 +460,7 @@ export function useSendMessage(conversationId: string | null, slot: string = DEF
         conversationId: id,
         messageId: meta.message_id,
         userText: trimmed,
+        attachments,
         answer: answerRef.current,
         done,
       });
@@ -319,7 +490,7 @@ export function useSendMessage(conversationId: string | null, slot: string = DEF
   const stop = useCallback(() => abortRef.current?.abort(), []);
 
   const retry = useCallback(() => {
-    if (pending?.status === "failed") void send(pending.text);
+    if (pending?.status === "failed") void send(pending.text, pending.attachments);
   }, [pending, send]);
 
   /** Pin a failed stream's partial into the transcript, unsaved and labelled so. */
@@ -356,12 +527,14 @@ async function applyOptimisticTurn({
   conversationId,
   messageId,
   userText,
+  attachments,
   answer,
   done,
 }: {
   conversationId: string;
   messageId: string;
   userText: string;
+  attachments: SentAttachment[];
   answer: string;
   done: DoneEvent;
 }) {
@@ -377,7 +550,15 @@ async function applyOptimisticTurn({
         id: `local-${messageId}-user`,
         seq: baseSeq + 1,
         role: "user",
-        content: [{ type: "text", text: userText }],
+        // Text first, then one `file_ref` block per attachment — the exact
+        // order `_resolve_file_refs` writes server-side, so the optimistic row
+        // and the row the revalidation replaces it with render identically.
+        content: [
+          { type: "text", text: userText },
+          ...attachments.map(
+            (attachment): ContentBlock => ({ type: "file_ref", ...attachment }),
+          ),
+        ],
         meta: {},
         created_at: now,
       };
@@ -400,6 +581,10 @@ async function applyOptimisticTurn({
           tokens_out: done.usage.completion_tokens,
           wasted_tokens_out: done.usage.wasted_tokens_out ?? 0,
           degraded: done.degraded,
+          // The perception disclosure survives the optimistic render too — an
+          // answer that says "read by local OCR" must not lose that label for
+          // the second between `done` and the revalidation.
+          extraction_tier: done.extraction_tier ?? null,
         } satisfies Partial<MessageMeta>,
         created_at: now,
       };

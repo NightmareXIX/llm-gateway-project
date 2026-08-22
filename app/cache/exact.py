@@ -24,6 +24,21 @@ never hit, or hits things it should have bypassed. ``degraded`` is the one
 dimension only the write side can know — nothing is knowable about a response
 before it exists — so it defaults to ``False`` and the read side simply never
 supplies it.
+
+**D29 — a turn carrying a file is cacheable.** Phase 3 refused any history with a
+``file_ref`` in it, deliberately, so that Phase 4 would have to decide rather than
+inherit. It has: :func:`request_hash` folds each ``file_ref``'s **hash** in, in
+message order, and the blanket exclusion is gone. A hash is exactly the identity
+of the bytes the answer depended on, so two identical questions over identical
+bytes are the same question; and the one case where they deserve different
+answers — the first was built on a reading nobody trusts — is ``degraded=True``,
+which the write side already refuses to store.
+
+The residual, recorded in ``docs/limitations.md`` rather than quietly absorbed:
+for up to ``EXACT_CACHE_TTL_S`` an answer cached from an ``llm`` extraction is
+replayed even where a ``native`` passthrough would now be available. The answer
+was not degraded, the window is an hour, and the alternative is a cache that
+never hits on the one feature Phase 4 exists to build.
 """
 
 from __future__ import annotations
@@ -38,13 +53,15 @@ from redis.asyncio import Redis
 
 from app.cache import keys
 from app.core.logging import get_logger
-from app.memory.canonical import CanonicalMessage, is_file_ref
+from app.memory.canonical import CanonicalMessage, ContentBlock, is_file_ref
 
 logger = get_logger("app.cache.exact")
 
-CACHE_FORMAT_VERSION: Final = 1
+CACHE_FORMAT_VERSION: Final = 2
 """Bumped on any change to what :func:`request_hash` folds in — invalidates the
-whole namespace at once rather than needing a key migration."""
+whole namespace at once rather than needing a key migration. Bumped to 2 in
+Phase 4 Step 10, when ``file_ref`` blocks started being projected to their hash
+alone (D29) instead of being excluded from the cache entirely."""
 
 CACHE_HEADER: Final = "X-Cache"
 
@@ -92,18 +109,40 @@ def is_cacheable(
 ) -> bool:
     """D19's single cacheability predicate. Read and write both call this.
 
+    Two dimensions, and ``history`` is deliberately not one of them any more.
+
     ``temperature > 0`` means identical inputs will not reliably reproduce a
     high-value output, and a cached creative answer is worse than a fresh one.
-    Any ``file_ref`` anywhere in the history excludes it — Phase 4's extraction
-    confidence can change underneath a hash that does not cover it. ``degraded``
-    is only ever known after a response exists, so the read side calls this with
-    the default and the write side supplies the real value.
+
+    ``degraded`` is only ever known after a response exists, so the read side
+    calls this with the default and the write side supplies the real value — and
+    since D29 it carries the whole weight of the attachment argument. An answer
+    built on a reading the gateway itself labelled untrustworthy is exactly the
+    answer that must not be replayed for an hour (trap 14); every *other* answer
+    over the same bytes is the same answer, which is why the blanket ``file_ref``
+    exclusion Phase 3 wrote here is gone and :func:`request_hash` covers the
+    hashes instead.
+
+    ``history`` stays in the signature because the predicate is shared verbatim
+    by both call sites and the read side has nothing else to key on; it is the
+    argument :func:`request_hash` needs one line later either way.
     """
     if temperature > 0:
         return False
-    if degraded:
-        return False
-    return all(not any(is_file_ref(block) for block in message.content) for message in history)
+    return not degraded
+
+
+def _identity_of(block: ContentBlock) -> object:
+    """One content block → the part of it that makes a request the same request.
+
+    Identity for everything except a ``file_ref``, which collapses to its hash
+    (D29). Deliberately *not* a filter: dropping the block entirely would let
+    "summarize this" with an attachment and "summarize this" without one collide
+    on one key.
+    """
+    if is_file_ref(block):
+        return {"type": "file_ref", "file_hash": block["file_hash"]}
+    return block
 
 
 def request_hash(
@@ -121,16 +160,27 @@ def request_hash(
     different questions even when they resolve identically today, and folding in
     the served model would make a hit's identity depend on which candidate
     happened to answer first. The full canonical history — role, ``seq`` order
-    and content blocks verbatim — plus the generation knobs that change what a
+    and content blocks — plus the generation knobs that change what a
     deterministic model would say. ``sort_keys`` makes the encoding
     deterministic across dict-key insertion order without reordering the
     history list itself, which is where the real ordering lives.
+
+    Every block but one is folded in verbatim. A ``file_ref`` is projected to
+    its **hash alone** (:func:`_identity_of`, D29): the hash *is* the identity of
+    the bytes the answer was built on, while ``filename`` is a label the uploader
+    chose and ``mime``/``bytes`` are both functions of those same bytes. Two
+    people asking one question about one document, one of whom renamed their
+    copy, asked the same question.
     """
     payload = {
         "v": CACHE_FORMAT_VERSION,
         "slot": requested_slot,
         "history": [
-            {"role": message.role, "seq": message.seq, "content": message.content}
+            {
+                "role": message.role,
+                "seq": message.seq,
+                "content": [_identity_of(block) for block in message.content],
+            }
             for message in history
         ],
         "temperature": temperature,

@@ -2,6 +2,7 @@
 
 import { GatewayError, NetworkError } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { ATTACHMENT_ERROR_COPY } from "@/lib/files";
 import { Button } from "./ui/Button";
 import { RequestId } from "./RequestId";
 
@@ -13,6 +14,10 @@ import { RequestId } from "./RequestId";
  * is not "the gateway said no" (something is wrong upstream, here is the id to
  * quote). And a `GatewayError` always renders its `code` and `request_id` —
  * that pairing is the entire reason the error envelope carries them.
+ *
+ * Branching on `code` before `status` is the rule, not a shortcut: the code is
+ * the stable half of the envelope, and two different 422s (a malformed body and
+ * a document nothing could read) are two different things to tell somebody.
  */
 export function describeError(error: unknown): { title: string; detail: string } {
   if (error instanceof NetworkError) {
@@ -23,6 +28,13 @@ export function describeError(error: unknown): { title: string; detail: string }
   }
 
   if (error instanceof GatewayError) {
+    // The attachment-shaped failures, in their own words. A 413 that reads
+    // "that didn't work" tells a user nothing they can act on; "the limit is
+    // 10.0 MB" tells them exactly what to do next. Shared with the failed-chip
+    // copy in `lib/files.ts` so the two never disagree about the same refusal.
+    const attachment = ATTACHMENT_ERROR_COPY[error.code];
+    if (attachment) return attachment;
+
     if (error.isRateLimited) {
       // Not a failure — a wait. The gateway (or, once our own limit exists, its
       // own guard) said exactly how much of its budget is left, not that

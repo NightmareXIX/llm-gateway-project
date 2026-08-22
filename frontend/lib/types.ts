@@ -120,6 +120,36 @@ export type Conversation = {
 export type ConversationDetail = Conversation & { messages: Message[] };
 
 // --------------------------------------------------------------------------- //
+// Files — app/schemas/files.py (Phase 4)
+// --------------------------------------------------------------------------- //
+/**
+ * One uploaded file, as the gateway describes it back.
+ *
+ * **The hash is the identifier** — there is no row id here and no URL. The
+ * bucket is private (D23), no signed URL is ever generated and there is no
+ * download endpoint, so a client can name a file and reference it in a turn but
+ * can never fetch the bytes back. That is deliberate, and it is why this type
+ * has nothing on it that looks like a link.
+ */
+export type FileOut = {
+  /** SHA-256, lowercase hex. What `InputMessage.file_refs` carries. */
+  file_hash: string;
+  filename: string;
+  /** The **sniffed** type, not the one the upload declared. A PNG named
+   *  `report.pdf` comes back as `image/png`, and that is the truth. */
+  mime: string;
+  bytes: number;
+  created_at: string;
+};
+
+export type FileUploadResponse = FileOut & {
+  /** True when this user already owned this hash: no bytes moved and no row was
+   *  written. 201 either way — the endpoint's promise is "this hash is yours to
+   *  reference", which was equally true both times. */
+  deduplicated: boolean;
+};
+
+// --------------------------------------------------------------------------- //
 // Chat — app/schemas/chat.py
 // --------------------------------------------------------------------------- //
 export type InputMessage = {

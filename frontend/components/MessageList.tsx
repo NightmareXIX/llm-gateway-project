@@ -4,7 +4,7 @@ import { useEffect, type RefObject } from "react";
 
 import type { PendingTurn as PendingTurnState } from "@/lib/hooks";
 import type { Message } from "@/lib/types";
-import { MessageTurn } from "./MessageTurn";
+import { MessageTurn, type AttachmentReading } from "./MessageTurn";
 import { PendingTurn } from "./PendingTurn";
 import { TurnErrorCard } from "./TurnErrorCard";
 import { Skeleton } from "./ui/Skeleton";
@@ -77,8 +77,12 @@ export function MessageList({
   return (
     <div className="mx-auto flex w-full max-w-[46rem] flex-col gap-6 px-4 py-6">
       <div role="log" aria-live="polite" aria-label="Conversation" className="flex flex-col gap-6">
-        {messages.map((message) => (
-          <MessageTurn key={message.id} message={message} />
+        {messages.map((message, index) => (
+          <MessageTurn
+            key={message.id}
+            message={message}
+            reading={readingFor(messages, index)}
+          />
         ))}
 
         {/* Not on `failed`: that branch revalidates the transcript, so the user's
@@ -98,6 +102,28 @@ export function MessageList({
       </div>
     </div>
   );
+}
+
+/**
+ * How this user turn's attachments were read, from the answer that followed.
+ *
+ * The tier is recorded on the assistant row — it is a property of the request
+ * that answered, not of the message that carried the file — but the file itself
+ * is on the row above, and that is where a "read by local OCR" badge has to
+ * appear to mean anything. So the pairing happens here, in the one component
+ * that can see both rows.
+ *
+ * Deliberately the *immediately* following row, not a search: invariant 3 lets
+ * consecutive user messages exist (a client can send two before an answer
+ * arrives), and in that case the earlier one genuinely has no verdict yet.
+ * Reaching further down the list to find one would attribute an answer's
+ * reading to a file it never saw.
+ */
+function readingFor(messages: Message[], index: number): AttachmentReading | undefined {
+  if (messages[index]?.role !== "user") return undefined;
+  const next = messages[index + 1];
+  if (!next || next.role !== "assistant") return undefined;
+  return { tier: next.meta.extraction_tier ?? null, degraded: next.meta.degraded ?? false };
 }
 
 /** The transcript's loading state — turn-shaped, alternating, so the page does
