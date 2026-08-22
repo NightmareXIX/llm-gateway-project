@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
+import pytesseract
 import pytest
 from fastapi import Depends, FastAPI
 from sqlalchemy import select
@@ -614,7 +615,7 @@ async def test_an_ocr_reading_arrives_and_is_marked_degraded(
     """
     monkeypatch.setattr(local_tier, "ocr_available", lambda: True)
     monkeypatch.setattr(
-        local_tier.pytesseract, "image_to_string", lambda _image: "Quarterly revenue was flat."
+        pytesseract, "image_to_string", lambda _image: "Quarterly revenue was flat."
     )
     perception(PERCEPTION_LOCAL_ONLY=True)
     fleet(general=("groq",), groq=["success"], gemini=[])
