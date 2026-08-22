@@ -124,6 +124,7 @@ class Collector:
                 tokens_out=result.usage.tokens_out,
                 wasted_tokens_out=result.wasted_tokens_out,
                 degraded=result.degraded,
+                extraction_tier=result.extraction_tier,
             ),
         )
         await usage_logger.record_success(

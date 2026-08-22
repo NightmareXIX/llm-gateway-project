@@ -55,6 +55,7 @@ from app.deps import (
     QuotaDep,
     RedisDep,
     RegistryDep,
+    ResolverDep,
     SessionDep,
     SessionFactoryDep,
 )
@@ -65,9 +66,10 @@ from app.memory.canonical import (
     file_ref_block,
     text_block,
 )
+from app.memory.render import AttachmentResolver
 from app.providers.errors import to_app_error
 from app.providers.registry import ProviderRegistry, UnknownSlot
-from app.providers.types import GenParams
+from app.providers.types import ExtractionTier, GenParams
 from app.quota.tracker import QuotaTracker
 from app.routing import router as routing
 from app.routing import selection
@@ -115,6 +117,7 @@ async def create_chat_completion(
     redis: RedisDep,
     quota: QuotaDep,
     cache: ExactCacheDep,
+    resolver: ResolverDep,
     _rate_limit: RateLimitDep = None,
 ) -> ChatCompletionResponse | StreamingResponse:
     """Answer one turn, persisting both halves of it.
@@ -191,6 +194,7 @@ async def create_chat_completion(
             redis=redis,
             quota=quota,
             cache=cache,
+            resolver=resolver,
             session_factory=session_factory,
         )
 
@@ -239,6 +243,10 @@ async def create_chat_completion(
             metrics=latency,
             rank_by_latency=get_settings().ROUTING_LATENCY_RANKING,
             quota=quota,
+            # Phase 4 Step 8: the first non-`None` this parameter has ever been
+            # given. `render` step 1 has carried it since Phase 1 and the router
+            # since Phase 2 Step 5; neither changed to accept it here.
+            resolver=resolver,
             # Constant until Phase 6's `resolve_provider_key` replaces it with a
             # real per-user scope — the same pattern `registry.system_key` uses.
             scope=keys.SYSTEM_SCOPE,
@@ -294,6 +302,10 @@ async def create_chat_completion(
             tokens_in=completion.usage.tokens_in,
             tokens_out=completion.usage.tokens_out,
             degraded=outcome.report.degraded,
+            # The worst tier the lane fell back to on this turn (D25). Stored
+            # rather than only returned, so re-opening the thread tomorrow
+            # still says how the document reached the model.
+            extraction_tier=outcome.report.extraction_tier,
         ),
     )
     await usage_logger.record_success(
@@ -344,6 +356,7 @@ async def create_chat_completion(
         tokens_out=completion.usage.tokens_out,
         estimated=completion.usage.estimated,
         degraded=outcome.report.degraded,
+        extraction_tier=outcome.report.extraction_tier,
         attempts=outcome.attempts,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -411,6 +424,9 @@ async def _serve_cache_hit(
         tokens_out=0,
         estimated=False,
         degraded=False,
+        # A hit never ran the lane, so there is no tier to disclose — the tier
+        # that produced the *original* answer is on that answer's own row.
+        extraction_tier=None,
         attempts=0,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -435,6 +451,7 @@ async def _stream_chat_completion(
     redis: Redis,
     quota: QuotaTracker | None,
     cache: exact.ExactCache | None,
+    resolver: AttachmentResolver | None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> StreamingResponse:
     """Drive the router loop far enough to know whether anything will be sent,
@@ -510,6 +527,9 @@ async def _stream_chat_completion(
         metrics=latency,
         rank_by_latency=get_settings().ROUTING_LATENCY_RANKING,
         quota=quota,
+        # Same per-request instance the non-streaming path uses, and the same
+        # memo: a mid-stream restart (D1) re-renders and must not re-extract.
+        resolver=resolver,
         # Same constant, same reason as the non-streaming path above.
         scope=keys.SYSTEM_SCOPE,
         redis=redis,
@@ -696,6 +716,7 @@ def _to_response(
     tokens_out: int,
     estimated: bool,
     degraded: bool,
+    extraction_tier: ExtractionTier | None,
     attempts: int,
     conversation_id: UUID,
     assistant: CanonicalMessage,
@@ -731,6 +752,7 @@ def _to_response(
         substituted=_is_substitution(body.model, served_by.slot),
         attempts=attempts,
         degraded=degraded,
+        extraction_tier=extraction_tier,
         conversation_id=conversation_id,
         message_id=assistant.id,
     )

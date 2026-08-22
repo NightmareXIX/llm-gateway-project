@@ -33,6 +33,17 @@ spliced into the prompt, because it does not.
 
 ExtractionConfidence = Literal["high", "medium", "low"]
 
+ExtractionTier = Literal["cache", "native", "llm", "local"]
+"""Which tier of the perception lane (D25) produced a resolved attachment.
+
+Declared here, beside :data:`AttachmentMode` and :data:`ExtractionConfidence`,
+because it is a fact about *how an attachment was resolved* and therefore
+belongs to the same vocabulary. ``app/memory/canonical.py`` imports it for
+``MessageMeta.extraction_tier`` rather than declaring a second copy — two
+identical literals in two modules is one literal that eventually gains a member
+in only one of them.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
@@ -172,6 +183,15 @@ class ResolvedAttachment:
     confidence: ExtractionConfidence | None = None
     """How much to trust ``text``. ``low`` means local OCR produced it, which is
     what sets ``degraded`` on the response."""
+
+    tier: ExtractionTier | None = None
+    """Which tier of the perception lane produced this (D25), for disclosure.
+
+    Distinct from ``mode``, which says how the attachment reaches the model:
+    ``mode`` is ``injected`` for a reading that came from tier 0, tier 2 and
+    tier 3 alike, and only this says which. ``None`` on an attachment nobody
+    resolved, which in practice means a test double.
+    """
 
 
 @dataclass(frozen=True, slots=True)

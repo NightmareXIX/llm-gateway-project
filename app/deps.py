@@ -25,6 +25,8 @@ from app.config import GatewayLimits, get_limits_config, get_settings
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.errors import TooManyRequests
 from app.core.logging import get_logger
+from app.memory.render import AttachmentResolver
+from app.perception.lane import PerceptionResolver
 from app.perception.storage import ObjectStore
 from app.providers.registry import ProviderRegistry
 from app.quota.tracker import QuotaTracker
@@ -171,6 +173,52 @@ def get_exact_cache(request: Request) -> ExactCache | None:
     if not settings.CACHE_EXACT_ENABLED:
         return None
     return ExactCache(get_redis(request))
+
+
+def get_resolver(
+    store: Annotated[ObjectStore, Depends(get_store)],
+    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+    registry: Annotated[ProviderRegistry, Depends(get_registry)],
+    breaker: Annotated[CircuitBreaker, Depends(get_breaker)],
+    quota: Annotated[QuotaTracker | None, Depends(get_quota)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> AttachmentResolver | None:
+    """Phase 4's perception lane, or ``None`` when it is switched off.
+
+    **One instance per request, and that is load-bearing rather than tidy**
+    (D22, trap 6): the resolver memoizes on ``(file_hash, native_wanted)``, and
+    render runs once per candidate — up to three times per turn under failover.
+    A process-wide resolver would memoize across *users*; a per-render one
+    would re-extract the same document on every spill.
+
+    ``None`` rather than a permissive resolver, mirroring ``get_quota``,
+    ``get_exact_cache`` and ``get_rate_limiter``: with ``PERCEPTION_ENABLED``
+    off, ``render`` falls back to ``NoAttachments`` and a turn carrying a
+    ``file_ref`` fails loudly, instead of quietly answering a question about a
+    document nobody read.
+
+    Its six resources arrive as sub-dependencies rather than being read off
+    ``request.app.state`` here, which is the one place in this module that
+    matters: ``get_session_factory`` is overridden in tests, and a direct call
+    would walk straight past the override to a piece of app state a test app
+    never sets.
+
+    ``scope`` is left at its default ``keys.SYSTEM_SCOPE``, exactly as it is at
+    the answer lane's call sites, so Phase 6 replaces one constant in two lanes
+    rather than one.
+    """
+    settings = get_settings()
+    if not settings.PERCEPTION_ENABLED:
+        return None
+    return PerceptionResolver(
+        store=store,
+        session_factory=session_factory,
+        registry=registry,
+        breaker=breaker,
+        quota=quota,
+        redis=redis,
+        settings=settings,
+    )
 
 
 def get_latency(request: Request) -> LatencyTable:
@@ -430,6 +478,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 SessionFactoryDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)]
 RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
 StoreDep = Annotated[ObjectStore, Depends(get_store)]
+ResolverDep = Annotated[AttachmentResolver | None, Depends(get_resolver)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
 BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]

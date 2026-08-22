@@ -155,6 +155,26 @@ class UnsupportedMediaType(AppError):
     message = "That file type is not one the gateway can read."
 
 
+class FileUnreadable(AppError):
+    """Every tier of the perception lane failed on one file (D25, Phase 4).
+
+    The *only* tier failure a caller ever sees. Tiers 0 to 2 log and fall
+    through — that is trap 12, and the whole "always degrade, never just fail"
+    rule — but when tier 3 recovers nothing there is no reading of the document
+    at all, and answering a question about a document nobody read is the worst
+    behaviour available. So the turn stops here, naming the file.
+
+    422 rather than 400: the request was well-formed and the hash is genuinely
+    the caller's; what failed is our ability to read those bytes with anything
+    we have left. Not a 502 either — no upstream necessarily failed, and on the
+    common path (an image, with no Tesseract binary) none was even called.
+    """
+
+    status_code = 422
+    code = "file_unreadable"
+    message = "The gateway could not read that file with any of its extractors."
+
+
 class TooManyRequests(AppError):
     """D20: *our* limit on *our* user, not a provider's limit on us.
 

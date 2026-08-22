@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ProvidersConfig, get_providers_config
 from app.db.models import Conversation, Message, Request
+from app.deps import get_resolver
 from app.perception.storage import MemoryStore
 from app.providers.registry import build_registry
 from tests import provider_fixtures
@@ -160,6 +161,21 @@ def store(app: FastAPI) -> MemoryStore:
     memory = MemoryStore()
     app.state.object_store = memory
     return memory
+
+
+@pytest.fixture
+def no_perception(app: FastAPI) -> None:
+    """``PERCEPTION_ENABLED=False``, as ``deps.get_resolver`` expresses it.
+
+    The two tests below are about *what a `file_ref` turn stores*, not about
+    what the lane then does with it — that is
+    ``tests/integration/test_perception_lane.py``'s whole subject. Switching
+    the lane off keeps them pinned to the one thing they assert, and turns the
+    500 they expect from an accident of Milestone A into the kill switch
+    behaving as designed: ``NoAttachments`` raises rather than resolving a
+    reference to nothing.
+    """
+    app.dependency_overrides[get_resolver] = lambda: None
 
 
 def _headers(make_jwt: TokenFactory, **kwargs: Any) -> dict[str, str]:
@@ -997,14 +1013,18 @@ async def test_a_valid_file_ref_stores_a_two_block_message_then_fails_loudly(
     client: httpx.AsyncClient,
     make_jwt: TokenFactory,
     store: MemoryStore,
+    no_perception: None,
     db_session: AsyncSession,
 ) -> None:
-    """The whole path from upload to stored `file_ref` block works. Nothing
-    resolves an attachment yet, so this turn's success condition is a *loud*
-    failure: render step 1's default `NoAttachments` resolver raises, because a
-    history that references a file it cannot show the model must never be sent
-    to one silently. This is the last time that assertion is ever green —
-    Milestone B gives the resolver something real to do.
+    """The whole path from upload to stored `file_ref` block works, and with
+    the lane switched off the turn then fails *loudly*: render step 1's default
+    `NoAttachments` resolver raises, because a history that references a file it
+    cannot show the model must never be sent to one silently.
+
+    Step 8 gave the resolver something real to do, so the failure here is now
+    the ``PERCEPTION_ENABLED`` escape hatch rather than an unbuilt seam — which
+    is the more useful assertion anyway, since that switch is what a deploy
+    reaches for when the lane itself is what is being debugged.
     """
     headers = _headers(make_jwt)
     file_hash = await _upload(client, headers)
@@ -1021,6 +1041,8 @@ async def test_a_valid_file_ref_stores_a_two_block_message_then_fails_loudly(
 
     # Unhandled: `NoAttachments.resolve` raises `NotImplementedError`, which is
     # not an `AppError`, so it lands in the catch-all handler as a generic 500.
+    # A 500 rather than a tidy message is deliberate — it is our bug or our
+    # switch, never something the caller can act on.
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
 
@@ -1043,6 +1065,7 @@ async def test_multiple_file_refs_on_one_message_all_land_after_the_text(
     client: httpx.AsyncClient,
     make_jwt: TokenFactory,
     store: MemoryStore,
+    no_perception: None,
     db_session: AsyncSession,
 ) -> None:
     headers = _headers(make_jwt)

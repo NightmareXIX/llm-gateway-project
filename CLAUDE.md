@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 7 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 8 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -271,8 +271,51 @@ which genuinely has no `tesseract` on its `PATH`: the text-layer PDF extracts wi
 ever being called, the scanned PDF and the PNG both correctly return `None` under a real "binary
 missing" probe, and the OCR-success paths (mocked at the `pytesseract.image_to_string` seam for
 determinism, plus one `skipif`-guarded test that runs the real binary when present) all grade `low`
-and cap a 40-page synthetic scan at 10 pages. Milestone B's remaining steps (8–9: the lane itself and
-native passthrough) are next.
+and cap a 40-page synthetic scan at 10 pages.
+
+**Step 8 (`app/perception/lane.py` and wiring the resolver in) is in — the feature works end to end.**
+Every seam Phases 1–3 left now carries something: `PerceptionResolver` is the first real
+`render.AttachmentResolver`, `route(resolver=…)`/`route_stream(resolver=…)` get their first non-`None`
+caller (no router change), `ResolvedAttachment` is built per request, `RenderReport.degraded` is
+reachable, and `MessageMeta.extraction_tier` is set. The lane answers one question per file per
+candidate — *how does this file reach this model* — walking D25's chain (`cache` → `native` → `llm` →
+`local`) with `_guarded` enforcing trap 12 in one place: every tier but the last turns an exception
+into a log line and falls through, and only `FileUnreadable` (new in `core/errors.py`, 422,
+`code="file_unreadable"`, naming the file) surfaces. Bytes are fetched lazily and at most once per
+chain (`_Lazy`), so the common case — a second turn about a document — touches object storage not at
+all. **Two decisions the phase plan left implicit.** D25 says tier 0 beats tier 1 because "the cached
+text came out of the same model that would have read the bytes" — true of a tier-2 row, false of a
+tier-3 one, so a stored `llm` row wins outright while a stored `local` row is held back as a
+*fallback* below tier 2; without that, one reading taken during a Gemini outage would serve that
+document forever and `repo/extractions.py`'s upgrade clause could never fire. And
+`PERCEPTION_LOCAL_ONLY` skips tier 0 as well as tier 2, and does not persist what tier 3 produced —
+otherwise the demo answers perfectly from a stored model reading, and a deliberately degraded reading
+outlives the demo in a global, content-addressed table. The memo is per-request and keyed on
+`(file_hash, native_wanted)` (D22, trap 6), under a per-key `asyncio.Lock`; `deps.get_resolver` builds
+it from six *sub-dependencies* rather than off `request.app.state`, because `get_session_factory` is
+overridden in tests and a direct call walks past the override. `RenderReport` gained
+`extraction_tier`, computed by `render.worst_tier` — which lives in `render.py`, not `lane.py`, since
+`lane` reaches `render` transitively through the adapters and the import the other way would close the
+loop. It ranks `native` < `llm` < `cache` < `local`, by how directly the answering model saw the
+document, with `cache` conservatively below `llm` because the label does not say which tier wrote the
+row it replays. `ExtractionTier` moved to `providers/types.py` (beside `AttachmentMode` and
+`ExtractionConfidence`, and `canonical.py` imports it) so `ResolvedAttachment` could carry `tier`
+without a second copy of the literal. The field is threaded to both paths: `ChatCompletionResponse`,
+`DoneEvent`, `StreamResult`, `_Turn` and `MessageMeta`, plus `frontend/lib/{types,sse}.ts`. **One
+done-when could not hold as written:** the plan asks for the `meta` frame *before* the lane runs, but
+Phase 2 Step 9 emits `meta` on the first delta rather than at attempt start — deliberately, since that
+is the D13 boundary — so emitting it earlier would commit a 200 before knowing anything would be sent
+and turn every pre-first-byte routing failure into an in-band error. `meta` stays where it is; a
+streamed turn whose file is unreadable therefore surfaces as an ordinary 422 envelope, which has its
+own test. Verified end to end against live Groq, live Gemini, live Supabase (Postgres + Auth +
+Storage) and live Upstash, not only the fixture suite: a real PyMuPDF-built PDF asked on `fast`
+answered "4.2 million euros" through a Groq model that cannot open a PDF (`extraction_tier: "llm"`,
+`lane:perception` +1, **`rpd` untouched**), the next two turns came back `cache` with no provider call
+in the lane, a Gemini-only fleet answered a fresh document `native` — spending `rpd` and **not**
+`lane:perception`, which is trap 7 proven on live counters — `PERCEPTION_LOCAL_ONLY` still answered
+correctly at tier `local` with zero Gemini calls, and a PNG with OCR disabled was a 422
+`file_unreadable`. Step 9 (native passthrough's token cost, `fitting.py`, the attachment golden) is
+next; `ResolvedAttachment` still has no `token_cost`/`pages`.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

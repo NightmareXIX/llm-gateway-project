@@ -30,6 +30,7 @@ from typing import Final, Literal
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict
 
+from app.providers.types import ExtractionTier
 from app.schemas.chat import ServedBy, UsageOut
 
 SSE_MEDIA_TYPE: Final = "text/event-stream"
@@ -180,6 +181,15 @@ class DoneEvent(BaseModel):
     attempts: int
     usage: StreamUsage
     degraded: bool
+    extraction_tier: ExtractionTier | None = None
+    """How this turn's attachments reached the model (Phase 4, D25) — ``cache``,
+    ``native``, ``llm`` or ``local``, and the worst of them when there was more
+    than one. ``None`` when the turn carried no attachment.
+
+    ``degraded`` says *whether* the reading was a fallback; this says *what
+    kind*, so the indicator can render "read by local OCR" rather than a bare
+    warning — the same disclosure discipline ``served_by`` gets."""
+
     status: Literal["ok", "failed"]
     partial_content: str | None = None
     """Set only when ``status == "failed"`` and the longest discarded buffer is

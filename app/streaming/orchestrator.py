@@ -70,7 +70,7 @@ from app.providers.base import (
     DEFAULT_READ_TIMEOUT_S,
 )
 from app.providers.registry import ProviderRegistry
-from app.providers.types import GenParams, ModelSpec, Usage
+from app.providers.types import ExtractionTier, GenParams, ModelSpec, Usage
 from app.quota.tracker import QuotaTracker
 from app.routing import router as routing
 from app.routing import selection
@@ -124,6 +124,12 @@ class StreamResult:
     ttft_ms: int | None
     wasted_tokens_out: int
     degraded: bool
+    extraction_tier: ExtractionTier | None = None
+    """The worst perception tier this turn's attachments needed (Phase 4).
+
+    Defaulted, unlike every field above it, because a :class:`StreamResult`
+    built by hand in a test predates this field and a turn with no attachment
+    genuinely has no tier."""
 
 
 class StreamPersistence(Protocol):
@@ -218,6 +224,9 @@ async def stream_cached_completion(
                 wasted_tokens_out=0,
             ),
             degraded=False,
+            # A replay never ran the lane; the tier that produced the original
+            # answer is recorded on that answer's own message row.
+            extraction_tier=None,
             status="ok",
         )
     )
@@ -454,6 +463,7 @@ class _Turn:
     ttft_ms: int | None
     wasted_tokens_out: int
     degraded: bool
+    extraction_tier: ExtractionTier | None
 
     def __init__(self, *, conversation_id: UUID, message_id: UUID, requested: str) -> None:
         self.conversation_id = conversation_id
@@ -476,6 +486,7 @@ class _Turn:
         self.ttft_ms = None
         self.wasted_tokens_out = 0
         self.degraded = False
+        self.extraction_tier = None
 
     # ---- transitions ------------------------------------------------------ #
     def begin(self, event: routing.AttemptStarted) -> None:
@@ -502,6 +513,7 @@ class _Turn:
         self.ttft_ms = event.ttft_ms
         self.wasted_tokens_out = event.wasted_tokens_out
         self.degraded = event.report.degraded
+        self.extraction_tier = event.report.extraction_tier
         self.done = True
 
     def record_failure(self, failure: routing.RoutingFailed) -> None:
@@ -562,6 +574,7 @@ class _Turn:
                 wasted_tokens_out=self.wasted_tokens_out,
             ),
             degraded=self.degraded,
+            extraction_tier=self.extraction_tier,
             status=self.status,
             partial_content=self.partial_content(),
         )
@@ -593,6 +606,7 @@ class _Turn:
             ttft_ms=self.ttft_ms,
             wasted_tokens_out=self.wasted_tokens_out,
             degraded=self.degraded,
+            extraction_tier=self.extraction_tier,
         )
 
     def _served(self) -> ModelSpec:

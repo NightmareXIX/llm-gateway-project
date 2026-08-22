@@ -447,7 +447,7 @@ async def _walk_candidates(
             provider=spec.provider,
             model=spec.model,
         )
-        await _persist(extraction, session_factory=session_factory, redis=redis)
+        await persist(extraction, session_factory=session_factory, redis=redis)
         logger.info(
             "perception.extracted",
             file_hash=file_hash,
@@ -569,13 +569,19 @@ def _estimated_tokens(adapter: ProviderAdapter, payload: dict[str, Any], *, size
     return adapter.estimate_tokens(payload) + max(1, size // 1024)
 
 
-async def _persist(
+async def persist(
     extraction: Extraction,
     *,
     session_factory: async_sessionmaker[AsyncSession],
     redis: Redis | None,
 ) -> None:
-    """Postgres first, Redis second. The order is the whole write-through rule."""
+    """Postgres first, Redis second. The order is the whole write-through rule.
+
+    Public since Step 8 because tier 3 writes through the same path: the row
+    and the key are about *these bytes*, not about which tier read them, and
+    the upgrade rule in ``repo/extractions.py`` is what keeps a local reading
+    from outliving the outage that produced it.
+    """
     async with session_factory() as session:
         await extractions_repo.upsert(
             session,
@@ -707,5 +713,6 @@ __all__ = [
     "extract_with_llm",
     "grade",
     "load_cached",
+    "persist",
     "sections",
 ]

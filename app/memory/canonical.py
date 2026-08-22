@@ -30,6 +30,8 @@ from datetime import datetime
 from typing import Any, Literal, TypedDict, TypeGuard, get_args
 from uuid import UUID
 
+from app.providers.types import ExtractionTier
+
 SCHEMA_VERSION = 1
 """Stamped on every message written. §2.2.4: migrating untagged JSONB is
 miserable, and the tag costs two bytes."""
@@ -37,7 +39,11 @@ miserable, and the tag costs two bytes."""
 Role = Literal["system", "user", "assistant"]
 ROLES: tuple[Role, ...] = get_args(Role)
 
-ExtractionTier = Literal["cache", "native", "llm", "local"]
+# `ExtractionTier` is imported rather than declared here (Phase 4 Step 8). The
+# tier is a property of how an attachment was *resolved*, so Contract A's
+# `providers/types.py` owns the vocabulary and `MessageMeta` records it. That
+# module imports nothing from the rest of the app, so the dependency runs one
+# way only, and a fifth tier is added in one place rather than two.
 
 TruncationReason = Literal["context_truncation"]
 

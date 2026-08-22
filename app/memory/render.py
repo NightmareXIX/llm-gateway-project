@@ -34,16 +34,52 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from app.core.logging import get_logger
 from app.memory import fitting
 from app.memory.canonical import CanonicalMessage, FileRefBlock, validate
 from app.providers.base import ProviderAdapter
 from app.providers.errors import ContextTooLong
-from app.providers.types import GenParams, ModelSpec, ResolvedAttachment
+from app.providers.types import ExtractionTier, GenParams, ModelSpec, ResolvedAttachment
 
 logger = get_logger("app.memory.render")
+
+_TIER_RANK: Final[dict[ExtractionTier, int]] = {
+    "native": 0,
+    "llm": 1,
+    "cache": 2,
+    "local": 3,
+}
+"""How much of a fallback each perception tier represents, worst last.
+
+Ranked by *how directly the answering model saw the document*, which is what
+the disclosure is about — not by what each tier costs, which is what D25 ranks
+when it decides the order they are tried in. ``native`` is the bytes
+themselves; ``llm`` is a model that read them during this turn; ``local`` is no
+model at all. ``cache`` sits below ``llm`` deliberately: the label does not say
+which tier wrote the row it replays, so it cannot honestly be ranked above the
+worst tier it might have come from.
+
+Lives here rather than in ``perception/lane.py`` because this module is where
+the many-attachment fact becomes the one-per-turn field, and because
+``lane.py`` reaches this module transitively through the adapters — an import
+the other way would close the loop.
+"""
+
+
+def worst_tier(attachments: list[ResolvedAttachment]) -> ExtractionTier | None:
+    """The most fallen-back-on tier across a turn, or ``None`` for no attachments.
+
+    One number per turn rather than per file, because the disclosure is about
+    the answer: a turn whose PNG was read natively and whose scan was OCR'd was
+    answered partly from OCR, and reporting ``native`` because one of the two
+    was is the same lie ``degraded`` exists to prevent (trap 13).
+    """
+    tiers = [attachment.tier for attachment in attachments if attachment.tier is not None]
+    if not tiers:
+        return None
+    return max(tiers, key=lambda tier: _TIER_RANK[tier])
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +109,15 @@ class RenderReport:
     """Set when an attachment reached the model through local OCR rather than a
     model that can read it (Phase 4). Copied onto ``MessageMeta.degraded`` and
     rendered by the frontend indicator, per §1.1."""
+
+    extraction_tier: ExtractionTier | None = None
+    """The *worst* tier the perception lane fell back to across this turn's
+    attachments, or ``None`` when the turn carried none (Phase 4 Step 8).
+
+    Worst rather than first, because the disclosure is about the answer as a
+    whole: a turn whose PNG was read natively and whose scan was OCR'd was
+    answered partly from OCR. ``degraded`` says *whether* to warn; this says
+    *why*, which is the same discipline ``served_by`` gets."""
 
     @property
     def truncated(self) -> bool:
@@ -202,6 +247,10 @@ async def render(
     native = sum(1 for attachment in attachments if attachment.mode == "native")
     injected = len(attachments) - native
     degraded = any(attachment.confidence == "low" for attachment in attachments)
+    # Read off the attachments rather than asked of the resolver: `render` runs
+    # once per candidate and the report describes *this* render, while the
+    # resolver's memo deliberately outlives all three of them.
+    extraction_tier = worst_tier(attachments)
 
     # Steps 2 to 4 — materialize, budget, fit. `materialize` is passed in rather than
     # imported by `fitting`, so the algorithm stays ignorant of how a message
@@ -237,6 +286,7 @@ async def render(
         attachments_native=native,
         attachments_injected=injected,
         degraded=degraded,
+        extraction_tier=extraction_tier,
     )
 
     if report.truncated:

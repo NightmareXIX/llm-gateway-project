@@ -73,6 +73,10 @@ export type ContentBlock = TextBlock | FileRefBlock | OmissionMarkerBlock | Unkn
  * nulls and defaults, so a reader never has to guess whether a missing key means
  * "false" or "not recorded". Typed accordingly: present, possibly null.
  */
+/** How an attachment reached the model (Phase 4, D25). Mirrors the gateway's
+ * own `ExtractionTier`, and the order here is the order the lane tries them. */
+export type ExtractionTier = "cache" | "native" | "llm" | "local";
+
 export type MessageMeta = {
   provider_used: string | null;
   model_used: string | null;
@@ -84,7 +88,7 @@ export type MessageMeta = {
   tokens_out: number | null;
   wasted_tokens_out: number;
   degraded: boolean;
-  extraction_tier: "cache" | "native" | "llm" | "local" | null;
+  extraction_tier: ExtractionTier | null;
 };
 
 export type MessageRole = "system" | "user" | "assistant";
@@ -163,6 +167,8 @@ export type ChatCompletionResponse = {
   substituted: boolean;
   attempts: number;
   degraded: boolean;
+  /** Field-for-field with the `done` event's own, per §1.1. */
+  extraction_tier?: ExtractionTier | null;
 
   conversation_id: string;
   message_id: string;

@@ -27,6 +27,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.providers.types import ExtractionTier
 from app.schemas.files import FILE_HASH_PATTERN
 
 FileHash = Annotated[str, Field(pattern=FILE_HASH_PATTERN)]
@@ -206,6 +207,15 @@ class ChatCompletionResponse(BaseModel):
     degraded: bool = False
     """Set when an attachment reached the model through local OCR rather than a
     model that can read it (Phase 4)."""
+
+    extraction_tier: ExtractionTier | None = None
+    """How this turn's attachments reached the model (Phase 4, D25) — ``cache``,
+    ``native``, ``llm`` or ``local``, and the worst of them when there was more
+    than one. ``None`` when the turn carried no attachment.
+
+    ``degraded`` says *whether* the reading was a fallback; this says *what
+    kind*, so the indicator can render "read by local OCR" rather than a bare
+    warning — the same disclosure discipline ``served_by`` gets."""
 
     # ---- gateway state ----------------------------------------------------- #
     conversation_id: UUID

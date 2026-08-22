@@ -22,7 +22,7 @@
  */
 
 import { GATEWAY_BASE, NetworkError, authHeaders, gatewayErrorFrom } from "./api";
-import type { ChatCompletionRequest, ServedBy, UsageOut } from "./types";
+import type { ChatCompletionRequest, ExtractionTier, ServedBy, UsageOut } from "./types";
 
 export type MetaEvent = {
   attempt: number;
@@ -53,6 +53,9 @@ export type DoneEvent = {
   attempts: number;
   usage: UsageOut & { wasted_tokens_out?: number };
   degraded: boolean;
+  /** How the turn's attachments reached the model (Phase 4): the worst tier of
+   * `cache` | `native` | `llm` | `local`, or null when it carried none. */
+  extraction_tier?: ExtractionTier | null;
   status: "ok" | "failed";
   /** Present only on `status: "failed"` with a non-trivial partial buffer. */
   partial_content?: string;
