@@ -152,6 +152,17 @@ files = ["app", "tests", "scripts"]
 module = ["jose.*", "asyncpg.*"]
 ignore_missing_imports = true
 
+# Phase 4 Step 7. `pytesseract` ships no stubs at all (plain `import-untyped`).
+# `pymupdf` is worse: it bundles a partial `.pyi` good enough for mypy to
+# resolve the import but not to type every call, which surfaces as
+# `no-untyped-call` on ordinary uses (`pymupdf.open(...)`, `Document.close()`)
+# instead. `follow_imports = "skip"` treats both as opaque `Any`, same as a
+# genuinely stub-less package gets under `ignore_missing_imports` alone.
+[[tool.mypy.overrides]]
+module = ["pymupdf.*", "pytesseract.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
