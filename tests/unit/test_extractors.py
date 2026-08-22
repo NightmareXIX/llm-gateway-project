@@ -371,7 +371,7 @@ async def test_a_recorded_response_becomes_a_stored_llm_extraction(
     assert result.provider == PROVIDER
     assert result.model == FIRST
     assert result.confidence == "high"
-    assert "Revenue rose 12%" in result.text
+    assert "Revenue rose 12 percent" in result.text
 
     assert table.writes == 1
     assert table.rows[FILE_HASH].tier == "llm"

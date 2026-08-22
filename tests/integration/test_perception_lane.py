@@ -586,6 +586,46 @@ async def test_a_failover_inside_one_turn_extracts_exactly_once(
     assert response.json()["extraction_tier"] == "cache"
 
 
+async def test_a_mid_stream_restart_re_renders_but_does_not_re_extract(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+    db_session: AsyncSession,
+) -> None:
+    """Trap 6, on the path the non-streaming version above cannot exercise.
+
+    D1's restart is a genuinely different failure than a pre-stream 429: Groq
+    gets far enough to emit real deltas before the connection dies mid-JSON, so
+    the router has already committed to a stream by the time it restarts onto
+    Gemini. Render still runs a second time for the replacement candidate — the
+    ``meta`` frame does not move, but the resolver does — and the memo plus
+    tier 0 are what stop that second render from spending a second extraction.
+    """
+    handler = fleet(
+        general=("groq", "gemini"),
+        groq=["stream_truncated.sse"],
+        gemini=["extraction_complete", "stream_success.sse"],
+    )
+    headers = _headers(make_jwt)
+    file_hash = await _upload(client, headers)
+
+    response = await _ask(client, headers, file_hash=file_hash, stream=True)
+
+    assert response.status_code == 200, response.text
+    frames = response.text
+    assert "event: restart" in frames
+    done = _last_done(frames)
+    assert done["attempts"] == 2
+    assert handler.extraction_calls() == 1
+    # Gemini's restart render found the row Groq's first render wrote, so it
+    # answered off tier 0 rather than re-reading the bytes natively.
+    assert done["extraction_tier"] == "cache"
+
+    result = await db_session.execute(select(Message).where(Message.role == "assistant"))
+    assert result.scalar_one().meta["extraction_tier"] == "cache"
+
+
 async def test_the_memo_is_what_stops_a_second_reading_when_nothing_is_stored(
     client: httpx.AsyncClient,
     make_jwt: TokenFactory,

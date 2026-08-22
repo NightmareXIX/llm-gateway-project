@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 from collections.abc import Callable
@@ -56,6 +57,7 @@ from pydantic import SecretStr
 from app.config import REPO_ROOT, ProviderEntry, get_providers_config, get_settings
 
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "provider_responses"
+FILES_ROOT = REPO_ROOT / "tests" / "fixtures" / "files"
 
 REDACTED_HEADERS = frozenset(
     {"authorization", "x-api-key", "api-key", "x-goog-api-key", "cookie", "set-cookie"}
@@ -225,6 +227,67 @@ GROQ = Recipe(
 
 
 # --------------------------------------------------------------------------- #
+# Gemini's fourth case: tier 2's extraction call, over a committed fixture PDF
+# --------------------------------------------------------------------------- #
+def _extraction_case() -> Case:
+    """The extraction request, built through the real pieces that send it.
+
+    Not a hand-shaped body: ``extractors._build_payload``/``_extraction_message``
+    and a registry assembled from the real ``config/providers.yaml`` are the
+    same calls ``extract_with_llm`` makes, so the recorded request is provably
+    the one the app sends rather than a test author's guess at its shape. The
+    committed ``text_layer.pdf`` fixture (Step 7's) is the input — a document
+    already known to have a real, if short, text layer — so the response this
+    provokes is a genuine tier-2 reading rather than a synthetic placeholder.
+
+    Written to ``extraction_complete.json``, the same name Step 6 shipped a
+    hand-authored placeholder under — its own note says this script would
+    replace it here.
+    """
+    from app.perception import extractors
+    from app.providers.registry import build_registry
+    from app.providers.types import ResolvedAttachment
+
+    data = (FILES_ROOT / "text_layer.pdf").read_bytes()
+    file_hash = hashlib.sha256(data).hexdigest()
+
+    registry = build_registry(client=httpx.AsyncClient(), config=get_providers_config())
+    spec = registry.candidates("perception")[0]
+    adapter = registry.adapter_for_spec(spec)
+
+    message = extractors._extraction_message(
+        file_hash=file_hash, filename="text_layer.pdf", mime="application/pdf", size=len(data)
+    )
+    attachment = ResolvedAttachment(
+        file_hash=file_hash,
+        filename="text_layer.pdf",
+        mime="application/pdf",
+        size_bytes=len(data),
+        mode="native",
+        data=data,
+    )
+    payload = extractors._build_payload(adapter, spec, attachment, message)
+    # `build_payload` returns Gemini's `_model` sentinel for `adapter.complete`'s
+    # own use (trap: `_split_model` pops it before the request ever goes out).
+    # This script posts the body itself rather than calling `complete`, so it
+    # has to strip that sentinel exactly as `complete` would — a raw `_model`
+    # key on the wire is not a Gemini field and comes back a 400.
+    body = {key: value for key, value in payload.items() if key != "_model"}
+
+    return Case(
+        name="extraction_complete",
+        method="POST",
+        path=f"/models/{spec.model}:generateContent",
+        body=body,
+        note=(
+            "Tier 2's real extraction call over the committed text_layer.pdf fixture "
+            "(D28's four sections, summary first). Recorded by scripts/record_fixtures.py "
+            "in Step 11, replacing the hand-authored placeholder Step 6 shipped."
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Gemini — model in the path, key in x-goog-api-key, its own body shape
 # --------------------------------------------------------------------------- #
 def _gemini_cases(model: str) -> list[Case]:
@@ -298,7 +361,7 @@ GEMINI = Recipe(
     invalid_key="AIzaSyDeliberatelyInvalidKeyForFixtures",
     # Not `?key=`, matching the adapter: a URL ends up in access logs on every hop.
     auth=lambda key, _entry: {"x-goog-api-key": key},
-    cases=_gemini_cases,
+    cases=lambda model: [*_gemini_cases(model), _extraction_case()],
     synthetic_only=(
         "rate_limited",
         "auth_failed",
@@ -310,6 +373,7 @@ GEMINI = Recipe(
         "server_error_html",
         "stream_success.sse",
         "stream_truncated.sse",
+        "extraction_partial",
     ),
     extra_notes=(
         "auth_failed (403 PERMISSION_DENIED) needs a key from a project without the "

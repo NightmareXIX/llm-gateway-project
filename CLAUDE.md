@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 10 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 11 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -395,6 +395,29 @@ came back `X-Cache: HIT` with the perception counter unmoved, `attempts: 0` and 
 same question over different bytes was a `MISS` and a different answer; an 11MB file and an `.mp4` were
 both refused in the composer **with no request made**; and with `PERCEPTION_LOCAL_ONLY=true` the same
 document answered correctly at tier `local`, disclosed as **read locally**, with zero Gemini calls.
+
+**Step 11 (tests and fixtures) is in.** `scripts/record_fixtures.py` gained Gemini's fourth case:
+`_extraction_case()` builds a real tier-2 request through the same `extractors._build_payload`/
+`_extraction_message` pieces `extract_with_llm` itself calls, over the committed `text_layer.pdf`
+fixture — not a hand-shaped body, so the recorded request is provably the one the app sends. Recording
+it live replaced `extraction_complete.json`'s Step-6-era hand-authored placeholder, exactly as that
+fixture's own note said this script would; the real capture graded `high` and transcribed "Revenue rose
+12 percent" (not the placeholder's invented "12%"), which needed one literal-text assertion in
+`test_extractors.py` updated to match a genuine live response instead of a guess at one. A full pass
+over §6's test matrix against the suite Steps 1–10 had already built found it essentially complete —
+including the stampede-guard concurrency test this step calls out by name ("two simultaneous first-turns
+on the same document make exactly one extraction call"), which already existed from Step 6 as
+`test_two_concurrent_extractions_of_one_hash_make_one_provider_call` — and turned up exactly two real
+gaps. `render.worst_tier` had no test exercising more than one attachment, so `test_render.py` gained one
+asserting that a turn with a native reading *and* a local one discloses `local`, the worse of the two,
+not whichever resolved first. And no test exercised D1's actual mid-stream restart with an attachment
+present — every existing failover-and-memo test used a pre-stream 429, never a stream that emitted real
+deltas and then died — so `test_perception_lane.py` gained
+`test_a_mid_stream_restart_re_renders_but_does_not_re_extract`, scripting Groq's `stream_truncated.sse`
+into a genuine restart onto Gemini and asserting the tier-0 memo held across it (`extraction_tier:
+"cache"` on the restart, one extraction call total). `make test` (1190 passed, 1 skipped — Tesseract
+absent from this machine), `make lint`, `make typecheck`, `make frontend-test` (81 passed) and
+`make frontend-lint` all green.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

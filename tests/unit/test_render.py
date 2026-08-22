@@ -287,6 +287,68 @@ async def test_a_native_attachments_token_cost_reaches_the_reported_estimate(
     assert report.estimated_tokens > 10_000
 
 
+async def test_extraction_tier_reports_the_worst_across_the_turns_attachments(
+    spec: ModelSpec,
+) -> None:
+    """§6's matrix line: ``extraction_tier`` is the *worst* tier across a turn,
+    not the first or the best one.
+
+    A turn can carry a PDF Gemini reads itself and a scan nobody but local OCR
+    could — reporting ``native`` because one of the two attachments got there
+    would be the same lie ``degraded`` exists to prevent (trap 13), just spread
+    across files instead of across confidence. ``local`` outranks ``native``
+    in ``render._TIER_RANK``, so it is what the turn as a whole must disclose.
+    """
+    gemini = GeminiAdapter(
+        client=fx.client_raising(httpx.ConnectError("render does not make requests")),
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+    )
+    gemini_spec = replace(spec, provider="gemini", model="gemini-3.6-flash", supports_pdf=True)
+    native = ResolvedAttachment(
+        file_hash="abc123",
+        filename="q3.pdf",
+        mime="application/pdf",
+        size_bytes=8192,
+        mode="native",
+        data=b"%PDF-1.7",
+        tier="native",
+        token_cost=258,
+        pages=1,
+    )
+    local = ResolvedAttachment(
+        file_hash="def456",
+        filename="scan.pdf",
+        mime="application/pdf",
+        size_bytes=4096,
+        mode="injected",
+        text="(illegible)",
+        confidence="low",
+        tier="local",
+    )
+    history = [
+        _message(
+            0,
+            "user",
+            [
+                text_block("What do these two documents say?"),
+                file_ref_block(
+                    file_hash="abc123", filename="q3.pdf", mime="application/pdf", bytes=8192
+                ),
+                file_ref_block(
+                    file_hash="def456", filename="scan.pdf", mime="application/pdf", bytes=4096
+                ),
+            ],
+        )
+    ]
+
+    _, report = await render(
+        history, gemini_spec, _params(), gemini, resolver=StubResolver(native, local)
+    )
+
+    assert report.extraction_tier == "local"
+    assert report.degraded is True
+
+
 async def test_an_injected_attachment_adds_no_cost_beyond_its_own_text(
     adapter: GroqAdapter, spec: ModelSpec
 ) -> None:
