@@ -128,6 +128,36 @@ Run this probe again after **any** change to the password or the URL. It costs t
 deploy that would otherwise tell you the same thing costs three minutes and leaves a failed release
 in the app's history.
 
+### Storage — the perception lane's bucket (Phase 4)
+
+Skip this if `FILES_STORAGE_BACKEND` will stay `local` or `memory`; every deployed environment uses
+`supabase`, and the bucket has to exist and be **private** before the first file upload reaches it.
+
+**Storage → New bucket.** Name it to match `FILES_BUCKET` (`uploads` unless `.env` overrides it) —
+the app never creates the bucket itself, only objects inside it. **Leave "Public bucket" off.**
+There is no signed-URL flow and no download endpoint anywhere in this phase (D23,
+[ADR-026](decisions/ADR-026-file-storage-and-ownership.md)) — the only reader of anything in this
+bucket is the gateway itself, over the service-role key, and a public bucket would be pure attack
+surface for a capability the product does not offer. No RLS policy is needed on the bucket either:
+`SupabaseStore` authenticates with the service-role key, which bypasses Storage's RLS the same way it
+bypasses Postgres's — access control lives in the `files` table, not in a Storage policy.
+
+**`SUPABASE_SERVICE_ROLE_KEY`** — **Project Settings → API → Project API keys → `service_role`**, the
+secret one below the public `anon` key, not that key. It bypasses row-level security on the *whole*
+project, not just this bucket, so it gets the same handling as a provider key from here on: it goes
+into Render's Environment tab in step 3 like every other secret, never into `render.yaml`, and never
+into a log line or an error body — `app/perception/storage.py`'s `StorageUnavailable` is written
+specifically to never carry it or the bytes it guards.
+
+Verify the bucket before the first real upload reaches it — a name mismatch between here and
+`FILES_BUCKET` fails as `StorageUnavailable` on the very first request, not at boot:
+
+```bash
+curl -sI "https://<ref>.supabase.co/storage/v1/bucket/uploads" \
+  -H "Authorization: Bearer <service_role_key>"
+# 200 means the bucket exists and the key can see it
+```
+
 ---
 
 ## 2. Upstash — Redis
@@ -255,6 +285,13 @@ drift.
 
 Render shows variable values back, unlike Fly's names-and-digests. Useful for catching a truncated
 paste; also worth knowing before treating the dashboard as a place secrets are hidden.
+
+> **Phase 4 roughly doubled the image.** The runtime stage's `apt-get install tesseract-ocr
+> tesseract-ocr-eng` (D30, [ADR-030](decisions/ADR-030-local-tier-dependencies.md)) adds about
+> 100MB, and on Render's free build tier that is a real risk of the build itself timing out rather
+> than just taking longer. Do a manual deploy of this change on its own, watching the **Logs** tab
+> during the *build* phase specifically, before it rides in with anything else — a build that times
+> out here is easy to mistake for a code problem in whatever else shipped alongside it.
 
 ### Deploy
 

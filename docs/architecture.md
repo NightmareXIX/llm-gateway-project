@@ -164,8 +164,61 @@ that double-counts a stream a `release` already refunded on another path.
 ([ADR-021](decisions/ADR-021-quotahint-transport.md)) — Groq and OpenRouter's own rate-limit headers
 correcting the gateway's estimate toward ground truth, one direction only.
 
-## Where this leaves Phase 4
+## Phase 4: two lanes, one system
 
-Nothing on either of the two diagrams above needs to change shape for the perception lane —
-`quota/lanes.py::reserve_perception` is the typed seam Phase 4 fills in, spending the half of Gemini's
-budget D8's `reserved_fraction` has already fenced off from the answer lane the whole time.
+Nothing on either diagram above needed to change shape for the perception lane —
+`quota/lanes.py::reserve_perception` was the typed seam Phase 4 filled in, spending the half of
+Gemini's budget D8's `reserved_fraction` had already fenced off from the answer lane the whole time.
+What Phase 4 adds is a second lane feeding render step 1, and its own decision inside the box the
+diagram above already labelled `render() -> build_payload()`.
+
+```mermaid
+flowchart LR
+    Upload(["POST /v1/files\nbytes + metadata only\n(ADR-025 — no extraction here)"]) --> Store["ObjectStore.put()\nprivate bucket, content-addressed\n{hash[:2]}/{hash} (ADR-026)"]
+    Store --> FilesRow[("files row\nuser_id, file_hash\nownership lives here")]
+
+    Turn(["Chat turn with file_refs"]) --> Gate{"Ownership check\nWHERE file_hash = ANY(:hashes)\nAND user_id = :uid"}
+    Gate -- "unowned hash" --> NotFound(["404 file_not_found\n(never 403 — D24)"])
+    Gate -- owned --> Stored[("message row\ntext block, then file_ref block")]
+
+    Stored -.->|"every render, every candidate\n(D22 — resolved here, not at upload)"| Lane
+
+    subgraph Lane["PerceptionResolver.resolve() — ADR-028's chain"]
+        direction TB
+        T0{"Tier 0: cache\nextract:{hash} or\nfile_extractions row?"}
+        T0 -- "llm row found" --> Injected0(["injected, tier=cache\nno provider call"])
+        T0 -- "no row / local row only" --> T1{"Tier 1: native\nsupports_mime and\nsize <= max_file_bytes?"}
+        T1 -- yes --> Native(["native, tier=native\nno perception reservation (trap 7)\ncost via token_cost (ADR-029)"])
+        T1 -- no --> T2{"Tier 2: llm\nperception slot has\nbudget + closed breaker?"}
+        T2 -- yes --> Injected2(["injected, tier=llm\nreserve_perception (ADR-027)\npersist: Postgres, then Redis"])
+        T2 -- "no / chain exhausted" --> T0f{"stored local row\nheld back above?"}
+        T0f -- yes --> Injected0b(["injected, tier=cache\nreplays the local fallback"])
+        T0f -- no --> T3{"Tier 3: local\nPyMuPDF text layer,\nor rasterize + Tesseract"}
+        T3 -- "reading produced" --> Injected3(["injected, tier=local\ndegraded=true, persisted\n(unless PERCEPTION_LOCAL_ONLY)"])
+        T3 -- "nothing recovered" --> Unreadable(["raise FileUnreadable\n422, no message written\n(only failure that surfaces)"])
+    end
+
+    Lane --> Payload["adapter.build_payload()\ninline_data (Gemini) or\ndocument_envelope text (others)"]
+    Payload --> Answer(["answer lane\n(the failover loop, above)"])
+
+    classDef terminal fill:#2f6f4f,color:#fff,stroke:none;
+    classDef fail fill:#8a3a3a,color:#fff,stroke:none;
+    class Injected0,Injected0b,Native,Injected2,Injected3 terminal;
+    class NotFound,Unreadable fail;
+```
+
+**Every tier but the last is wrapped in `_guarded`**, not shown as a separate box because it applies
+uniformly: an exception from any of tiers 0–2 is logged with the file hash and the tier, and the
+chain falls through exactly as if that tier had declined on its own terms. Only `FileUnreadable` from
+tier 3 is allowed to end the turn (ADR-028).
+
+**The memo, also not drawn, is what makes this diagram honest under failover.** `PerceptionResolver`
+is one instance per request, keyed on `(file_hash, native_wanted)` — so a turn that spills from Groq
+to Gemini under D1 runs this chain once per distinct file, not once per attempt (ADR-025, trap 6). A
+diagram of the chain alone would suggest it runs fresh every time render does; in practice the second
+and third renders of one turn mostly hit the in-memory memo before this flowchart's first box.
+
+**Bytes are fetched at most once per chain, and only when a tier needs them.** Tier 0 needs none —
+the common case, a second turn about an already-read document, never calls `ObjectStore.get` at all.
+A chain that falls from tier 1 through to tier 3 still only downloads once, held by `_Lazy` across the
+tiers that share the need.

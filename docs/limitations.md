@@ -120,6 +120,57 @@ guarantee this whole section is about.
 
 ---
 
+## The perception lane
+
+**The first turn about any document pays for its own extraction, in front of the answer.** D22
+(ADR-025) puts extraction inside the request that needs it rather than at upload time, on purpose —
+tier 1 cannot exist at upload, and invariant 6's retroactive-improvement guarantee only works if
+nothing about a reading is frozen in before a model is chosen. The honest cost of that decision: a
+large PDF's first question pays a real, multi-second Gemini call in front of the answering call. The
+`cache` tier (tier 0) turns this into a once-per-document cost instead of a per-turn one, and the
+streaming path emits its `meta` frame before the lane runs specifically so a client waiting on a slow
+extraction is shown *why*, rather than staring at silence that looks identical to a hung connection.
+
+**A cached `llm` reading can outlive the moment a `native` passthrough became available, for up to
+`EXACT_CACHE_TTL_S`.** D29 folds a `file_ref`'s hash into the exact-cache's identity rather than
+excluding every attachment from caching outright — two identical questions over identical bytes are
+the same question, and the cache hit rate this buys is worth having. The residual: for up to one
+hour, an answer built from a tier-2 extraction is served from cache even after the fleet's
+availability shifts such that a fresh request would have resolved `native` instead. The answer itself
+was never degraded — `degraded=True` is the one condition the write side already refuses to cache
+(trap 14) — so this is a staleness window on *which tier answered*, not on correctness.
+
+**Tier 0 beating tier 1 is the wrong call exactly once: a question about layout, not content.** D25
+puts the cache ahead of native passthrough because the cached text came from the same model that
+would otherwise read the bytes directly, and the free option should win when both are available. That
+reasoning holds for "what does this document say" and breaks for "what color is the header on page
+3" — a question the tier-2 extraction prompt was never asked to answer and the summary it wrote
+necessarily discarded. There is no flag that routes around this; a user who genuinely needs a visual
+read of a document neither the cache nor a fast passthrough exists for has to ask again after the
+cache entry expires, or wait for a native-capable candidate to be tried.
+
+**OCR is capped at `PERCEPTION_OCR_MAX_PAGES` (default 10), and pages past the cap are simply not
+read.** An unbounded OCR pass over a 400-page scan is minutes of CPU on a request that still has to
+return inside the client's timeout (trap 15). `perception/local.py` says which pages were skipped
+directly in the extracted text rather than silently truncating, but the tier-3 reading of a long scan
+is genuinely partial — a fact worth surfacing to a user asking about page 200 of a 300-page document
+that only the first ten pages of were ever OCR'd.
+
+**PyMuPDF is AGPL-3.0.** This project is not distributed as a closed-source product, so the licence
+costs nothing here — but it is a real constraint on anyone forking this codebase into something that
+is. `pypdfium2` (BSD) is the documented swap (ADR-030, D30) should that ever matter; the local tier
+is one module, and the swap is one function inside it.
+
+**An uploaded document is sent to a third-party provider for extraction, and free-tier terms vary on
+what that provider may do with it.** This is the concrete case `development-plan.md`'s risk register
+and `project-overview.md` §10 both flagged before the perception lane existed: tier 2 routes a
+document's bytes to Gemini, whose free tier's training-data terms differ from a paid one's.
+`PERCEPTION_LOCAL_ONLY=true` forces every extraction to stay on-box, at the cost of tier 2's quality —
+and the frontend composer discloses this trade-off before the send that would trigger it, not after,
+per the overview's own standard for what "visible" disclosure means.
+
+---
+
 ## Provider-pool honesty
 
 **Answer quality varies by which model actually served a given response.** Free-tier models differ
@@ -174,11 +225,17 @@ inserts a visible omission marker. Summarizing older turns into a compact system
 designed as a seam (`app/memory/summarize.py`) but deliberately not built — it costs quota on every
 switch to a smaller-context model and adds a failure mode (a bad summary) that truncation does not have.
 
-**No perception lane yet.** Phase 3 reserves the half of Gemini's daily budget the perception lane
-will spend (`reserved_fraction: 0.5`, D8) and builds the accounting seam
-(`quota/lanes.py::reserve_perception`, a typed signature raising `NotImplementedError` rather than a
-silently-passing stub) — but nothing increments it, because `POST /v1/files` does not exist until
-Phase 4. `render()`'s attachment-resolution step still returns `NoAttachments` unconditionally.
+**No file management UI, no summarization, no BYOK, no audio/video/office formats, no async
+extraction.** The perception lane (Phase 4) deliberately stops short of a file browser or a delete
+endpoint — a file is referenced by the turn that uploaded it, and `GET /v1/files/{hash}` returns
+metadata only. A truncated document keeps its summary through D28's prompt ordering rather than
+through a new summarization strategy (`memory/summarize.py` is still the unbuilt seam D4 always
+described). Every perception-lane reservation still runs under `keys.SYSTEM_SCOPE`, same as the
+answer lane, until Phase 6 replaces that one constant in both places. The upload allowlist is PDF,
+PNG, JPEG and WebP — a format with no tier-3 fallback is a format that fails at 3am rather than
+degrading, so nothing is accepted without one. And extraction runs synchronously inside the request
+that needs it (D22) rather than on a queue, because a background worker is a second runtime a free
+tier does not have room for.
 
 **Not a production system.** Built entirely on free tiers for a portfolio/learning purpose, which means
 lower throughput, higher latency variance, and lower consistency than a paid setup would have — stated

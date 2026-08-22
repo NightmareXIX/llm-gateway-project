@@ -12,11 +12,41 @@ Full design docs live in [`doc/reference/`](doc/reference/) — start with
 everything else is built against. Decision records are in [`docs/decisions/`](docs/decisions/);
 the honest-edges document is [`docs/limitations.md`](docs/limitations.md).
 
-*(This README covers one interview question in depth for now — the architecture diagrams, full
+*(This README covers two interview questions in depth for now — the architecture diagrams, full
 request-flow walkthrough, and "Design Decisions" index it will eventually carry are Phase 7 work,
 tracked in [`doc/reference/development-plan.md`](doc/reference/development-plan.md).)*
 
 ---
+
+## Why is "which model answers" a different decision from "which model can see the file"?
+
+Not every free-tier model reads a PDF or an image, and the ones that do meter it separately from
+plain chat — so a gateway that only ever attaches a file to whichever model happens to be answering
+loses file understanding the moment that model is a text-only one, or the moment its multimodal quota
+runs dry. The perception lane exists to decouple the two questions entirely: *which model generates
+this response* and *which model, if any, is used to understand an attached file* are handled by two
+independent fallback chains, and a text-only model answering a question about a PDF is a normal case,
+not a degraded one.
+
+The chain (`app/perception/lane.py`) walks four tiers in order, and the same "always degrade, never
+just fail" rule the rest of the gateway follows governs it: a cached reading beats a fresh one for
+free; a native passthrough hands the bytes straight to a model that can read them; a dedicated
+extraction call (Gemini, paid for out of a daily budget fenced off from plain chat, D8) reads the
+document and writes a structured summary for a model that cannot; and if every provider option is
+spent, local PyMuPDF/Tesseract still produces a worse-but-real answer rather than an error. Only the
+last tier's failure is ever allowed to reach the user — every tier above it logs and falls through,
+because a bug in one fallback should cost quality, not the whole request.
+
+The interesting design decision was not "add file upload" — it was working out *when* the reading
+happens. Extracting at upload time is the intuitive answer and the wrong one: the gateway does not
+know which model will eventually answer, and a document extracted at upload has its extraction
+frozen into that moment forever. Extraction instead resolves at render time, from a cache keyed on
+the file's content hash — so a better prompt or a bigger extraction model retroactively improves
+every stored conversation that ever referenced those bytes, the next time any of them is read. The
+reasoning, and what it costs (the first turn about a document pays for its own extraction, in front
+of the answer), is in
+[ADR-025](docs/decisions/ADR-025-extraction-at-render-not-upload.md) and the rest of the
+perception-lane ADRs (026–030) it sits alongside.
 
 ## Why a Lua script, and not a pipeline?
 
