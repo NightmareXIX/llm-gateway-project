@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Final
 
@@ -73,6 +74,21 @@ OCR'd for no reason, not a page that gets skipped."""
 RASTER_DPI: Final = 150
 """D30's rasterization resolution — enough for Tesseract to read ordinary
 body text, and not so much that a ten-page cap turns into a memory problem."""
+
+
+@dataclass(frozen=True, slots=True)
+class Measurement:
+    """What a file's size is, in the units a provider charges it in (D27).
+
+    Pages for a PDF, pixels for an image, and nothing at all for a file this
+    module could not open — which is a legitimate answer rather than an error,
+    because the caller's fallback is a coarser estimate and not a failed turn.
+    """
+
+    pages: int | None = None
+    width: int | None = None
+    height: int | None = None
+
 
 MIN_OCR_CHARS: Final = 10
 """Below this, OCR output is "nothing meaningful" (D25) rather than a thin
@@ -293,9 +309,48 @@ async def extract_locally(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Measurement (D27) — not a reading, and not this tier's job to answer with
+# --------------------------------------------------------------------------- #
+def _measure_sync(*, mime: str, data: bytes) -> Measurement:
+    """Page count for a PDF, pixel dimensions for an image. Never raises.
+
+    Everything here is best-effort by construction: a file this cannot open is
+    a file whose token cost has to be guessed from its size instead, which is
+    a worse number but not a failed turn — and tier 1 is about to hand these
+    same bytes to a model that will decide for itself whether they parse.
+    """
+    try:
+        if mime == "application/pdf":
+            with pymupdf.open(stream=data, filetype="pdf") as doc:
+                return Measurement(pages=doc.page_count)
+        if mime.startswith("image/"):
+            with Image.open(io.BytesIO(data)) as image:
+                return Measurement(width=image.width, height=image.height)
+    except Exception as exc:
+        logger.info("perception.measure_failed", mime=mime, error=str(exc))
+
+    return Measurement()
+
+
+async def measure(*, mime: str, data: bytes) -> Measurement:
+    """How big this document is, in the units its token cost is charged in.
+
+    Lives in the local tier because this is where PyMuPDF and Pillow already
+    are, and is called by the lane for a **native** attachment — the one case
+    where no tier reads the file and something still has to know its size.
+    Opening a PDF is synchronous and a 200-page one is not free, so it goes
+    through :func:`asyncio.to_thread` like every other call in this module
+    (trap 4).
+    """
+    return await asyncio.to_thread(_measure_sync, mime=mime, data=data)
+
+
 __all__ = [
     "LOCAL_MODEL",
     "LOCAL_PROVIDER",
+    "Measurement",
     "extract_locally",
+    "measure",
     "ocr_available",
 ]

@@ -14,6 +14,7 @@ the report says what actually happened.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -37,6 +38,7 @@ from app.memory.render import (
     render,
 )
 from app.providers.errors import ContextTooLong
+from app.providers.gemini import GeminiAdapter
 from app.providers.groq import GroqAdapter
 from app.providers.types import GenParams, ModelSpec, ResolvedAttachment
 from tests import provider_fixtures as fx
@@ -234,6 +236,90 @@ async def test_the_resolver_sees_every_reference_and_the_target_model(
     assert report.attachments_native == 0
     assert report.degraded is True, "low-confidence extraction is the local-OCR path"
     assert '<document name="q3.pdf"' in payload["messages"][0]["content"]
+
+
+async def test_a_native_attachments_token_cost_reaches_the_reported_estimate(
+    spec: ModelSpec,
+) -> None:
+    """D27, at the far end of the chain the number has to travel.
+
+    ``estimate_tokens`` walks the payload's text and ignores the ``inline_data``
+    part entirely (trap 9), so the file's cost has to be added after it. Without
+    that, the router reserves a two-figure estimate for a document that will be
+    billed in five.
+    """
+    gemini = GeminiAdapter(
+        client=fx.client_raising(httpx.ConnectError("render does not make requests")),
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+    )
+    gemini_spec = replace(spec, provider="gemini", model="gemini-3.6-flash", supports_pdf=True)
+    attachment = ResolvedAttachment(
+        file_hash="abc123",
+        filename="q3.pdf",
+        mime="application/pdf",
+        size_bytes=8192,
+        mode="native",
+        data=b"%PDF-1.7",
+        tier="native",
+        token_cost=10_320,
+        pages=40,
+    )
+    history = [
+        _message(
+            0,
+            "user",
+            [
+                text_block("Summarise this."),
+                file_ref_block(
+                    file_hash="abc123", filename="q3.pdf", mime="application/pdf", bytes=8192
+                ),
+            ],
+        )
+    ]
+
+    payload, report = await render(
+        history, gemini_spec, _params(), gemini, resolver=StubResolver(attachment)
+    )
+
+    assert report.attachments_native == 1
+    assert report.extraction_tier == "native"
+    assert report.estimated_tokens == gemini.estimate_tokens(payload) + 10_320
+    assert report.estimated_tokens > 10_000
+
+
+async def test_an_injected_attachment_adds_no_cost_beyond_its_own_text(
+    adapter: GroqAdapter, spec: ModelSpec
+) -> None:
+    """Trap 8's other half, at the report level: the extracted text is in the
+    payload and the estimator already counted every character of it."""
+    attachment = ResolvedAttachment(
+        file_hash="abc123",
+        filename="q3.pdf",
+        mime="application/pdf",
+        size_bytes=8192,
+        mode="injected",
+        text="Revenue rose 12%.",
+        confidence="high",
+        tier="llm",
+    )
+    history = [
+        _message(
+            0,
+            "user",
+            [
+                text_block("Summarise this."),
+                file_ref_block(
+                    file_hash="abc123", filename="q3.pdf", mime="application/pdf", bytes=8192
+                ),
+            ],
+        )
+    ]
+
+    payload, report = await render(
+        history, spec, _params(), adapter, resolver=StubResolver(attachment)
+    )
+
+    assert report.estimated_tokens == adapter.estimate_tokens(payload)
 
 
 async def test_an_empty_history_renders_without_touching_the_resolver(

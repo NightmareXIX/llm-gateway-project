@@ -99,7 +99,7 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 4 — Perception Lane, Step 8 of 12 done
+## Current phase: Phase 4 — Perception Lane, Step 9 of 12 done
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), and Phase 3
 (quota-aware routing, below) are done and merged. Phase 4 (file/image understanding via a dedicated
@@ -314,8 +314,40 @@ answered "4.2 million euros" through a Groq model that cannot open a PDF (`extra
 in the lane, a Gemini-only fleet answered a fresh document `native` — spending `rpd` and **not**
 `lane:perception`, which is trap 7 proven on live counters — `PERCEPTION_LOCAL_ONLY` still answered
 correctly at tier `local` with zero Gemini calls, and a PNG with OCR disabled was a 422
-`file_unreadable`. Step 9 (native passthrough's token cost, `fitting.py`, the attachment golden) is
-next; `ResolvedAttachment` still has no `token_cost`/`pages`.
+`file_unreadable`. Step 9 gives that native path a price.
+
+**Step 9 (what a natively attached file costs) is in — Milestone B is done.** The last gap in
+D27's arithmetic: a 40-page PDF riding in Gemini's payload was invisible to `estimate_tokens`
+(base64, ignored on purpose — trap 9) and measured as the 30-character placeholder
+`materialize` produces, so the fitting step thought it was free and the reservation under-counted
+it by four orders of magnitude. `ResolvedAttachment` gained `token_cost` and `pages`, and the
+number now reaches all three consumers the decision names. **The rate table is in
+`perception/lane.py`** (`TOKENS_PER_TILE = 258`, Google's published per-tile rate with the date it
+was read, a PDF page billed as an image, and Google's own tile geometry for a larger one) with a
+documented fallback for each thing the measurement can fail to learn — never zero, because an
+attachment that measures as free is exactly the failure D27 exists to end. **The measurement is in
+`perception/local.py`** (`Measurement`/`measure` — page count for a PDF, pixel dimensions for an
+image), because that is where PyMuPDF and Pillow already live and because measuring is not
+reading; it runs in `asyncio.to_thread` like everything else in that module (trap 4) and returns
+an empty `Measurement` rather than raising on a file it cannot open. **`fitting.py` charges the
+cost per message rather than per turn** — `_cost` adds `native_tokens()` for the file_refs on
+*that* message — so a document leaves the budget with the message that carried it, and an
+`injected` attachment contributes nothing because its text is already in what the projector
+produced (trap 8). `render.py` adds the same sum to `RenderReport.estimated_tokens` after
+`adapter.estimate_tokens`. `extractors._estimated_tokens` deliberately keeps its own coarse
+size heuristic: `lane.py` imports `extractors`, so reaching back for the table would close an
+import loop for a number that a commit reconciles against reported usage seconds later.
+The second golden payload, `tests/fixtures/golden_payloads/gemini_attachment.json`, is the fixed
+canonical history plus one native attachment — a committed 200-byte 96x96 PNG
+(`tests/fixtures/files/tile.png`, one tile at the published rate, so the test's arithmetic is
+checkable by hand), with `canonical_history_with_attachment()` in `tests/provider_fixtures.py`
+so Phase 5 can extend the case to the other two providers. Verified end to end against live
+Gemini, live Supabase (Postgres + Auth + Storage) and live Upstash, not only the fixture suite: a
+real 40-page PyMuPDF-built PDF uploaded, answered `native` on a Gemini-only `general` — "4.2
+million euros", correct — with `rpd` +1 and **`lane:perception` untouched** (trap 7 still true),
+and Gemini reported **21,297 prompt tokens** for the turn: five figures, against the eight the
+placeholder used to measure it at, and the same order of magnitude as the 10,320 the rate table
+now reserves.
 
 ## Phase 3 — Quota-Aware Routing (§4) — complete
 

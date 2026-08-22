@@ -193,6 +193,29 @@ class ResolvedAttachment:
     resolved, which in practice means a test double.
     """
 
+    token_cost: int = 0
+    """D27: what this attachment costs the model that receives it, in tokens.
+
+    **For ``mode="native"`` only.** An injected attachment's cost is already
+    inside the text ``materialize`` produced and the estimator has counted it;
+    adding it again would double-count one document (trap 8). Native bytes are
+    the opposite case — they are invisible to a character-based estimator
+    (trap 9), so their cost has to travel beside the payload rather than in it.
+
+    Computed at resolve time from the published per-modality rate in
+    ``app/perception/lane.py``, never from the base64 blob's length. Zero on an
+    attachment nobody resolved, and on every injected one.
+    """
+
+    pages: int | None = None
+    """Page count, for a paginated native attachment.
+
+    Native cost is charged per page, so the number has to be known *before* the
+    payload is built — which is why it lives on the attachment rather than
+    being recovered from the extraction afterwards. Carried on an injected
+    attachment too when the reading knew it, because a reading that says how
+    many pages it covered is worth more than one that does not."""
+
 
 @dataclass(frozen=True, slots=True)
 class KeyValidation:

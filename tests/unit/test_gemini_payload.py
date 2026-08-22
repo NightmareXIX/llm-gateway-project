@@ -32,6 +32,7 @@ from app.providers.types import GenParams, ModelSpec, ResolvedAttachment
 from tests import provider_fixtures as fx
 
 GOLDEN_NAME = "gemini_general"
+ATTACHMENT_GOLDEN_NAME = "gemini_attachment"
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 MODEL = "gemini-3.6-flash"
 
@@ -75,6 +76,24 @@ def test_the_fixed_history_renders_to_the_committed_payload(
     payload = adapter.build_payload(fx.canonical_history(), spec, _params(), [])
 
     assert payload == fx.read_golden(GOLDEN_NAME)
+
+
+def test_the_fixed_history_plus_a_native_file_renders_to_the_committed_payload(
+    adapter: GeminiAdapter, spec: ModelSpec
+) -> None:
+    """The attachment golden (Phase 4 Step 9).
+
+    The same six-message history as the golden above, with one natively
+    resolved image on the final question — so the diff between the two files is
+    exactly what an attachment does to a payload, and nothing else. Phase 5
+    extends this case to the other two providers, which is why the history
+    lives in ``provider_fixtures`` rather than here.
+    """
+    payload = adapter.build_payload(
+        fx.canonical_history_with_attachment(), spec, _params(), [_native_attachment()]
+    )
+
+    assert payload == fx.read_golden(ATTACHMENT_GOLDEN_NAME)
 
 
 def test_build_payload_is_pure(adapter: GeminiAdapter, spec: ModelSpec) -> None:
@@ -235,6 +254,25 @@ def test_the_model_travels_out_of_band_and_comes_from_the_spec(
 # --------------------------------------------------------------------------- #
 # Attachments (Phase 4's seam, exercised now)
 # --------------------------------------------------------------------------- #
+def _native_attachment() -> ResolvedAttachment:
+    """The fixture image, resolved the way the perception lane's tier 1 would.
+
+    ``token_cost`` is the published single-tile rate rather than anything
+    derived from the bytes: 96x96 is under Gemini's 384px threshold, so the
+    whole image is one tile (D27)."""
+    data = fx.attachment_bytes()
+    return ResolvedAttachment(
+        file_hash=fx.ATTACHMENT_HASH,
+        filename=fx.ATTACHMENT_NAME,
+        mime="image/png",
+        size_bytes=len(data),
+        mode="native",
+        data=data,
+        tier="native",
+        token_cost=258,
+    )
+
+
 def _history_with_file(file_hash: str) -> list[CanonicalMessage]:
     from datetime import UTC, datetime
     from uuid import UUID
@@ -368,13 +406,19 @@ def test_a_native_attachment_without_its_bytes_is_a_loud_failure(
 # Regeneration
 # --------------------------------------------------------------------------- #
 def _bless() -> None:
-    """Rewrite the golden file from the current implementation."""
+    """Rewrite both golden files from the current implementation."""
     adapter = GeminiAdapter(client=httpx.AsyncClient(), base_url=BASE_URL)
-    payload = adapter.build_payload(fx.canonical_history(), _spec(), _params(), [])
-    path = fx.GOLDEN_ROOT / f"{GOLDEN_NAME}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(fx.dump_golden(payload), encoding="utf-8")
-    print(f"wrote {path}")
+    cases = {
+        GOLDEN_NAME: adapter.build_payload(fx.canonical_history(), _spec(), _params(), []),
+        ATTACHMENT_GOLDEN_NAME: adapter.build_payload(
+            fx.canonical_history_with_attachment(), _spec(), _params(), [_native_attachment()]
+        ),
+    }
+    for name, payload in cases.items():
+        path = fx.GOLDEN_ROOT / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(fx.dump_golden(payload), encoding="utf-8")
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

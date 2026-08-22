@@ -90,6 +90,83 @@ TIER_LLM: Final[ExtractionTier] = "llm"
 TIER_LOCAL: Final[ExtractionTier] = "local"
 
 
+# --------------------------------------------------------------------------- #
+# D27 — what a natively attached file costs, in tokens
+#
+# Google's published multimodal rates, read 2026-08-22. They live here rather
+# than in `config/limits.yaml` for the reason that file's own header gives in
+# the other direction: `limits.yaml` holds the numbers an *operator* tunes per
+# environment, and these are facts about a provider's billing that no operator
+# gets to choose. What both have in common is the thing that matters — a free
+# tier's arithmetic changes, so the number lives in exactly one place and is
+# dated, rather than being open-coded at the two call sites that need it.
+#
+# Never derived from the payload. A 6MB PDF is ~8M base64 characters, and a
+# characters-over-four estimator turns that into a two-million-token
+# reservation that fails closed on every candidate (trap 9).
+# --------------------------------------------------------------------------- #
+TOKENS_PER_TILE: Final = 258
+"""Gemini charges one flat rate per image tile, and bills a PDF page as an
+image. The whole rate table is this one number plus the geometry below."""
+
+IMAGE_SINGLE_TILE_EDGE: Final = 384
+"""An image with both dimensions at or under this is one tile, undivided."""
+
+TILE_EDGE_MIN: Final = 256
+TILE_EDGE_MAX: Final = 768
+"""A larger image is cropped into tiles whose edge is the shorter dimension
+over 1.5, clamped into this range."""
+
+TILE_EDGE_DIVISOR: Final = 1.5
+
+UNMEASURED_PDF_BYTES_PER_PAGE: Final = 50_000
+"""Fallback when a PDF's page count could not be read: pages are guessed from
+the file's size. Coarse on purpose and never zero — a native attachment that
+measures as free is the exact failure D27 exists to end, and guessing high
+costs a slightly early failover while guessing low costs a 429."""
+
+UNMEASURED_IMAGE_TILES: Final = 4
+"""Fallback when an image's dimensions could not be read. Four tiles is a
+mid-sized photograph; the alternative — assuming one — would under-count every
+image the sniffer accepted and Pillow could not open."""
+
+
+def native_token_cost(*, mime: str, size_bytes: int, measurement: local.Measurement) -> int:
+    """What handing these bytes to a model costs it, per the table above.
+
+    Charged per page for a PDF and per tile for an image, from the file's own
+    geometry rather than from the encoded payload — which is the whole of D27.
+    Always at least one tile: a zero here would tell the fitting step a
+    document is free and the reservation that a request costs nothing.
+    """
+    if mime == "application/pdf":
+        pages = measurement.pages
+        if pages is None:
+            pages = max(1, -(-size_bytes // UNMEASURED_PDF_BYTES_PER_PAGE))
+        return max(1, pages) * TOKENS_PER_TILE
+
+    width, height = measurement.width, measurement.height
+    if width is None or height is None:
+        return UNMEASURED_IMAGE_TILES * TOKENS_PER_TILE
+    return _image_tiles(width, height) * TOKENS_PER_TILE
+
+
+def _image_tiles(width: int, height: int) -> int:
+    """Google's tiling rule, transcribed.
+
+    Small images are one tile. Anything larger is cropped on a grid whose cell
+    edge is ``min(width, height) / 1.5`` clamped to [256, 768], and every crop
+    is billed at the flat per-tile rate.
+    """
+    if width <= 0 or height <= 0:
+        return UNMEASURED_IMAGE_TILES
+    if width <= IMAGE_SINGLE_TILE_EDGE and height <= IMAGE_SINGLE_TILE_EDGE:
+        return 1
+
+    edge = min(TILE_EDGE_MAX, max(TILE_EDGE_MIN, int(min(width, height) / TILE_EDGE_DIVISOR)))
+    return (-(-width // edge)) * (-(-height // edge))
+
+
 @dataclass(frozen=True, slots=True)
 class _MemoKey:
     """``(file_hash, native_wanted)`` — D22's memo identity."""
@@ -202,8 +279,14 @@ class PerceptionResolver:
             if native_data is not None:
                 # No perception reservation (trap 7). These bytes ride in the
                 # answering model's own payload and are already counted by the
-                # reservation the router makes for that attempt.
-                return _native(ref, native_data)
+                # reservation the router makes for that attempt — which is only
+                # true because `token_cost` below makes them *visible* to it.
+                measurement = await self._guarded(
+                    TIER_NATIVE,
+                    file_hash,
+                    lambda: local.measure(mime=ref["mime"], data=native_data),
+                )
+                return _native(ref, native_data, measurement or local.Measurement())
 
         # --- tier 2 -----------------------------------------------------------
         if not local_only:
@@ -369,7 +452,13 @@ def _native_wanted(ref: FileRefBlock, spec: ModelSpec) -> bool:
     return spec.max_file_bytes is None or ref["bytes"] <= spec.max_file_bytes
 
 
-def _native(ref: FileRefBlock, data: bytes) -> ResolvedAttachment:
+def _native(ref: FileRefBlock, data: bytes, measurement: local.Measurement) -> ResolvedAttachment:
+    """Bytes for the payload, and the one number that keeps them honest.
+
+    ``token_cost`` is what the fitting step budgets against and what the
+    router reserves; without it a forty-page PDF measures as the thirty
+    characters of ``materialize``'s placeholder (D27).
+    """
     return ResolvedAttachment(
         file_hash=ref["file_hash"],
         filename=ref["filename"],
@@ -378,6 +467,10 @@ def _native(ref: FileRefBlock, data: bytes) -> ResolvedAttachment:
         mode="native",
         data=data,
         tier=TIER_NATIVE,
+        token_cost=native_token_cost(
+            mime=ref["mime"], size_bytes=ref["bytes"], measurement=measurement
+        ),
+        pages=measurement.pages,
     )
 
 
@@ -390,6 +483,11 @@ def _injected(
     and nowhere else — this module never formats a prompt, because every
     provider must wrap extracted text identically and ``memory/render.py`` owns
     that envelope (trap 11).
+
+    No ``token_cost``, deliberately: this reading's cost is already inside the
+    text the estimator is about to measure, and charging it again would
+    double-count one document (trap 8). ``pages`` is carried anyway when the
+    reading knew it — it is a fact about the document, not about the billing.
     """
     return ResolvedAttachment(
         file_hash=ref["file_hash"],
@@ -400,6 +498,7 @@ def _injected(
         text=extraction.text,
         confidence=extraction.confidence,
         tier=tier,
+        pages=extraction.pages,
     )
 
 
@@ -408,5 +507,7 @@ __all__ = [
     "TIER_LLM",
     "TIER_LOCAL",
     "TIER_NATIVE",
+    "TOKENS_PER_TILE",
     "PerceptionResolver",
+    "native_token_cost",
 ]

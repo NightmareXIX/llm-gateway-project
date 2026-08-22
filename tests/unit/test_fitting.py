@@ -14,6 +14,7 @@ written now.
 from __future__ import annotations
 
 import itertools
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -382,6 +383,72 @@ def test_a_native_attachment_is_never_truncated() -> None:
         _fit(history, [native], budget=1)
 
     assert native.data == b"%PDF-1.7"
+
+
+# --------------------------------------------------------------------------- #
+# D27 — a native attachment's token cost
+# --------------------------------------------------------------------------- #
+def _native(file_hash: str, *, token_cost: int) -> ResolvedAttachment:
+    return ResolvedAttachment(
+        file_hash=file_hash,
+        filename="q3.pdf",
+        mime="application/pdf",
+        size_bytes=8192,
+        mode="native",
+        data=b"%PDF-1.7",
+        tier="native",
+        token_cost=token_cost,
+        pages=40,
+    )
+
+
+def test_a_native_attachments_token_cost_is_part_of_the_measured_total() -> None:
+    """Until D27 the placeholder ``materialize`` produces measured a 40-page PDF
+    at about eight tokens, so the fitting step believed it was free."""
+    history = _history_with_documents("aaa")
+
+    without = _fit(history, [], budget=1_000_000)
+    with_file = _fit(history, [_native("aaa", token_cost=10_320)], budget=1_000_000)
+
+    assert with_file.input_tokens - without.input_tokens >= 10_000
+
+
+def test_an_injected_documents_cost_is_not_counted_twice() -> None:
+    """Trap 8. Its text is already in what the projector produced, so a
+    ``token_cost`` on an injected attachment must contribute nothing."""
+    history = _history_with_documents("aaa")
+    document = _document("aaa", chars=4_000)
+
+    honest = _fit(history, [document], budget=1_000_000)
+    mislabelled = _fit(history, [replace(document, token_cost=10_320)], budget=1_000_000)
+
+    assert mislabelled.input_tokens == honest.input_tokens
+
+
+def test_dropping_the_message_drops_its_attachments_cost_with_it() -> None:
+    """Charged per message rather than per turn: a budget still paying for a
+    document nobody can see any more would truncate history that fits."""
+    history = [
+        _message(0, "system", [text_block("Be terse.")]),
+        _message(
+            1,
+            "user",
+            [
+                file_ref_block(
+                    file_hash="aaa", filename="q3.pdf", mime="application/pdf", bytes=8192
+                ),
+                text_block("Summarise this."),
+            ],
+        ),
+        _message(2, "assistant", [text_block("Revenue rose.")]),
+        _message(3, "user", [text_block("And the outlook?")]),
+    ]
+
+    result = _fit(history, [_native("aaa", token_cost=10_320)], budget=200)
+
+    assert result.messages_dropped == 2
+    assert all(not message.file_refs() for message in result.messages)
+    assert result.input_tokens < 200
 
 
 # --------------------------------------------------------------------------- #

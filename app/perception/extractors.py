@@ -557,14 +557,18 @@ def _extraction_message(*, file_hash: str, filename: str, mime: str, size: int) 
 
 
 def _estimated_tokens(adapter: ProviderAdapter, payload: dict[str, Any], *, size: int) -> int:
-    """What to reserve for an extraction, before D27's rate table exists.
+    """What to reserve for an extraction: the prompt, plus the file's share.
 
     ``adapter.estimate_tokens`` measures the payload's *text* and ignores every
     non-``text`` part (trap 9), so on its own it reports the prompt and calls a
-    six-megabyte PDF free. Until Step 9 gives ``ResolvedAttachment`` a real
-    ``token_cost`` from the published per-modality rate, the file's share is
-    approximated from its size — coarse, deliberately generous, and reconciled
-    against reported usage at commit time the moment the call returns.
+    six-megabyte PDF free.
+
+    The file's share stays a size heuristic rather than D27's per-page rate,
+    which ``perception/lane.py`` owns: this module is imported *by* the lane,
+    so reaching back for that table would close an import loop for a number
+    that is reconciled against reported usage at commit time the moment the
+    call returns. Coarse and deliberately generous is the right shape for an
+    estimate with a correction thirty seconds behind it.
     """
     return adapter.estimate_tokens(payload) + max(1, size // 1024)
 

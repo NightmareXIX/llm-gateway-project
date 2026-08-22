@@ -32,7 +32,7 @@ part of something they attached. The spec puts messages first, so this does too.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -414,10 +414,43 @@ def _largest_truncatable(attachments: list[ResolvedAttachment], exhausted: set[i
 # --------------------------------------------------------------------------- #
 # Measurement
 # --------------------------------------------------------------------------- #
+def native_tokens(attachments: Iterable[ResolvedAttachment]) -> int:
+    """D27: what the native attachments among these cost, in tokens.
+
+    **Native only, and that is trap 8.** An injected attachment's cost is
+    already inside the text ``project`` produced and the estimator has counted
+    it; adding ``token_cost`` on top would charge one document twice. Native
+    bytes are the opposite case — a character-based estimator cannot see them
+    at all (trap 9), so this is the only place their size enters the
+    arithmetic.
+
+    Public because :mod:`app.memory.render` needs the same sum for
+    ``RenderReport.estimated_tokens``, and two implementations of "which
+    attachments cost extra" is one implementation that eventually disagrees.
+    """
+    return sum(attachment.token_cost for attachment in attachments if attachment.mode == "native")
+
+
 def _cost(
     message: CanonicalMessage,
     by_hash: Mapping[str, ResolvedAttachment],
     project: Projector,
     estimator: TokenEstimator,
 ) -> int:
-    return estimator(project(message, by_hash)) + PER_MESSAGE_TOKEN_OVERHEAD
+    """One message's share of the budget: its text, plus any bytes riding on it.
+
+    Charged per message rather than per turn so the attachment's cost leaves
+    the total when the message carrying it is dropped — a forty-page PDF the
+    fitting step just discarded is not still occupying ten thousand tokens of
+    a budget it no longer touches.
+    """
+    attachments = (
+        by_hash[block["file_hash"]]
+        for block in message.content
+        if block["type"] == "file_ref" and block["file_hash"] in by_hash
+    )
+    return (
+        estimator(project(message, by_hash))
+        + PER_MESSAGE_TOKEN_OVERHEAD
+        + native_tokens(attachments)
+    )

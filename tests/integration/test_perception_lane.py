@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
+import pymupdf
 import pytesseract
 import pytest
 from fastapi import Depends, FastAPI
@@ -49,7 +50,7 @@ from app.deps import (
 )
 from app.memory.render import AttachmentResolver
 from app.perception import local as local_tier
-from app.perception.lane import PerceptionResolver
+from app.perception.lane import TOKENS_PER_TILE, PerceptionResolver
 from app.perception.storage import MemoryStore
 from app.providers.registry import ProviderRegistry, build_registry
 from app.quota.tracker import QuotaTracker
@@ -71,6 +72,21 @@ EXTRACTION_MARKER = "document reader for another model"
 """A phrase from ``EXTRACTION_PROMPT``, used to tell an extraction request from
 an answer request on the wire. Counting requests that carry it is a stronger
 statement than counting requests to a host, because both lanes reach Gemini."""
+
+
+def _pdf_of(pages: int) -> bytes:
+    """A synthetic PDF of a given length, for the cost arithmetic (D27).
+
+    Built here rather than committed: the only thing the assertion cares about
+    is the page count, and a forty-page fixture in the repo would be forty
+    pages of nothing.
+    """
+    doc = pymupdf.open()
+    for index in range(pages):
+        doc.new_page().insert_text((72, 72), f"page {index + 1}", fontsize=11)
+    data: bytes = doc.tobytes()
+    doc.close()
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -233,12 +249,19 @@ def perception(app: FastAPI) -> Callable[..., None]:
     return configure
 
 
-def _resolver_override(settings: Settings) -> Callable[..., AttachmentResolver | None]:
+def _resolver_override(
+    settings: Settings, sink: list[PerceptionResolver] | None = None
+) -> Callable[..., AttachmentResolver | None]:
     """``deps.get_resolver`` with a substituted ``Settings``.
 
     The same six sub-dependencies as the real one — in particular
     ``get_session_factory``, which ``conftest``'s ``app`` fixture overrides to
     hand back the test's transactional session — so only the settings differ.
+
+    ``sink`` collects the resolvers actually built, which is the only way to
+    read a per-request object after the request that owned it has returned —
+    and the resolver's memo is where D27's ``token_cost`` can be observed
+    without asserting on a reservation that has already been reconciled away.
     """
 
     def _get_resolver(
@@ -251,7 +274,7 @@ def _resolver_override(settings: Settings) -> Callable[..., AttachmentResolver |
     ) -> AttachmentResolver | None:
         if not settings.PERCEPTION_ENABLED:
             return None
-        return PerceptionResolver(
+        resolver = PerceptionResolver(
             store=store,
             session_factory=session_factory,
             registry=registry,
@@ -260,6 +283,9 @@ def _resolver_override(settings: Settings) -> Callable[..., AttachmentResolver |
             redis=redis,
             settings=settings,
         )
+        if sink is not None:
+            sink.append(resolver)
+        return resolver
 
     return _get_resolver
 
@@ -421,6 +447,41 @@ async def test_a_model_that_reads_pdfs_is_handed_the_bytes(
     parts = sent["contents"][-1]["parts"]
     assert any("inline_data" in part for part in parts)
     assert any("text" in part for part in parts)
+
+
+async def test_a_native_forty_page_pdf_carries_a_five_figure_token_cost(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+) -> None:
+    """D27, end to end through real storage (Step 9).
+
+    Forty pages of base64 are invisible to ``estimate_tokens`` (trap 9) and
+    thirty characters to ``materialize``'s placeholder, so before this step a
+    document billed in five figures measured as two. The resolved attachment is
+    where the honest number is attached, and it is read off the lane's own memo
+    rather than off a counter — the reservation this number feeds has already
+    been reconciled against reported usage by the time the response arrives.
+    """
+    fleet(general=("gemini",), gemini=["success"])
+    resolvers: list[PerceptionResolver] = []
+    app.dependency_overrides[get_resolver] = _resolver_override(get_settings(), resolvers)
+    headers = _headers(make_jwt)
+    file_hash = await _upload(client, headers, content=_pdf_of(40))
+
+    response = await _ask(client, headers, file_hash=file_hash)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["extraction_tier"] == "native"
+
+    resolved = list(resolvers[0]._memo.values())
+    assert [attachment.mode for attachment in resolved] == ["native"]
+    assert resolved[0].file_hash == file_hash
+    assert resolved[0].pages == 40
+    assert resolved[0].token_cost == 40 * TOKENS_PER_TILE
+    assert resolved[0].token_cost >= 10_000
 
 
 async def test_a_file_over_the_models_cap_never_reaches_tier_one(

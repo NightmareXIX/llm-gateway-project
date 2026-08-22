@@ -1,0 +1,66 @@
+{
+  "_model": "gemini-3.6-flash",
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "[4 earlier messages omitted]\n\nRecap: what did we decide about mid-stream failover?"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "parts": [
+        {
+          "text": "Restart the stream on a new provider and discard the partial."
+        }
+      ],
+      "role": "model"
+    },
+    {
+      "parts": [
+        {
+          "text": "And if the third attempt also fails?"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "parts": [
+        {
+          "text": "The stream ends with status \"failed\" and the longest partial."
+        }
+      ],
+      "role": "model"
+    },
+    {
+      "parts": [
+        {
+          "text": "Good. Now summarise that for the README."
+        },
+        {
+          "inline_data": {
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAIAAABt+uBvAAAAj0lEQVR42u3QQQ0AIAwAsYPMv2YU7MezSRX0VNNlN7dYCRIkSJAgQYIECUKQIEGCBAkSJAhBggQJEiRIkCAECRIkSJAgQYIEIUiQIEGCBAkShCBBggQJEiRIEIIECRIkSJAgQYIQJEiQIEGCBAlCkCBBggQJEiQIQYIECRIkSJAgQQgSJEiQIEGCBCFI0E8PEkNMdKCXgGsAAAAASUVORK5CYII=",
+            "mime_type": "image/png"
+          }
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 512,
+    "stopSequences": [
+      "</done>"
+    ],
+    "temperature": 0.2,
+    "topP": 0.9
+  },
+  "system_instruction": {
+    "parts": [
+      {
+        "text": "You are a terse assistant. Answer in one sentence."
+      }
+    ]
+  }
+}

@@ -101,7 +101,12 @@ class RenderReport:
     Not the number the fitting step made its decisions with. Fitting measures
     canonical text before a payload exists; this measures the payload that will
     actually be sent, so it is the one worth reserving quota against and the one
-    worth comparing to reported usage afterwards."""
+    worth comparing to reported usage afterwards.
+
+    Plus D27's native attachment cost, which no adapter's estimator can see:
+    the bytes reach the model as base64 that a character-based estimate must
+    ignore (trap 9), so their published per-page/per-tile rate is added on top
+    rather than measured off the payload."""
 
     attachments_native: int = 0
     attachments_injected: int = 0
@@ -211,8 +216,11 @@ def materialize(message: CanonicalMessage, attachments: Mapping[str, ResolvedAtt
                 parts.append(document_envelope(attachment))
             else:
                 # Native bytes are not prompt text, and base64 length is not a
-                # token count. Providers bill multimodal input on their own terms;
-                # Phase 4 gives `ResolvedAttachment` a token cost to use here.
+                # token count — so this stays a short placeholder and the real
+                # cost travels *beside* it, on `ResolvedAttachment.token_cost`
+                # (D27). `fitting.native_tokens` is what adds it back; a
+                # projection whose length pretended to be the cost would have to
+                # be wrong by four orders of magnitude to do so.
                 parts.append(f"[{attachment.mime} attachment: {attachment.filename}]")
 
     return "\n\n".join(parts)
@@ -279,10 +287,17 @@ async def render(
     payload = adapter.build_payload(result.messages, spec, params, result.attachments)
 
     # Step 6 — report.
+    #
+    # `estimate_tokens` measures the payload's *text* and ignores every other
+    # part on purpose (trap 9), so a natively attached file is invisible to it.
+    # D27's per-modality cost is added back here rather than inside the
+    # estimator, because the number is a fact about the file and the estimator
+    # only ever sees what the file turned into on the wire.
     report = RenderReport(
         messages_dropped=result.messages_dropped,
         documents_truncated=result.documents_truncated,
-        estimated_tokens=adapter.estimate_tokens(payload),
+        estimated_tokens=adapter.estimate_tokens(payload)
+        + fitting.native_tokens(result.attachments),
         attachments_native=native,
         attachments_injected=injected,
         degraded=degraded,

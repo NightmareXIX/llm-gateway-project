@@ -27,12 +27,14 @@ from app.memory.canonical import (
     ContentBlock,
     MessageMeta,
     Role,
+    file_ref_block,
     omission_marker,
     text_block,
 )
 
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "provider_responses"
 GOLDEN_ROOT = REPO_ROOT / "tests" / "fixtures" / "golden_payloads"
+FILES_ROOT = REPO_ROOT / "tests" / "fixtures" / "files"
 
 
 @dataclass(frozen=True)
@@ -319,6 +321,56 @@ def canonical_history() -> list[CanonicalMessage]:
         ),
         message(5, "user", [text_block("Good. Now summarise that for the README.")]),
     ]
+
+
+ATTACHMENT_HASH = "c0161dcdfde3e5b1b1898d993d0860533f590a2a6ba12104d795b30b50ade9a0"
+"""The sha256 of :func:`attachment_bytes` — the hash a real upload would give
+it, written out rather than computed so a fixture that changes underneath the
+golden file changes the golden file too."""
+
+ATTACHMENT_NAME = "tile.png"
+
+
+def attachment_bytes() -> bytes:
+    """The 200-byte fixture image every attachment payload test attaches.
+
+    An image rather than a PDF, and 200 bytes rather than a realistic
+    document, for one reason: the golden file carries its base64 inline, and a
+    golden nobody can read in a diff is a golden everybody re-blesses without
+    reading. 96x96 also happens to be one tile at Gemini's published rate,
+    which keeps the token arithmetic in the test checkable by hand.
+    """
+    return (FILES_ROOT / ATTACHMENT_NAME).read_bytes()
+
+
+def canonical_history_with_attachment() -> list[CanonicalMessage]:
+    """:func:`canonical_history` with a file attached to its final question.
+
+    The same fixed six messages, so an attachment golden diffs against the
+    text-only one as *one added part* rather than as a whole new conversation.
+    The ``file_ref`` block sits after the text, which is the order
+    ``api/v1/chat.py`` writes a turn in: what I asked, then what I attached.
+    """
+    history = canonical_history()
+    last = history[-1]
+    history[-1] = CanonicalMessage(
+        id=last.id,
+        conversation_id=last.conversation_id,
+        role=last.role,
+        content=[
+            *last.content,
+            file_ref_block(
+                file_hash=ATTACHMENT_HASH,
+                filename=ATTACHMENT_NAME,
+                mime="image/png",
+                bytes=len(attachment_bytes()),
+            ),
+        ],
+        meta=last.meta,
+        created_at=last.created_at,
+        seq=last.seq,
+    )
+    return history
 
 
 def read_golden(name: str) -> dict[str, Any]:
