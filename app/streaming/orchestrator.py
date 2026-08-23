@@ -236,6 +236,9 @@ async def stream_cached_completion(
             # Nothing was rendered this turn (trap 3) — the original turn's own
             # row carries whatever it dropped, not this one.
             messages_dropped=0,
+            # A replay never re-resolves the pin either — no candidate chain
+            # was walked, so there is nothing this turn overrode.
+            warning=None,
             status="ok",
         )
     )
@@ -316,7 +319,9 @@ async def stream_completion(
         clock=clock,
     )
 
-    state = _Turn(conversation_id=conversation_id, message_id=message_id, requested=requested)
+    state = _Turn(
+        conversation_id=conversation_id, message_id=message_id, requested=requested, pinned=pinned
+    )
     pending: asyncio.Task[routing.RouteStreamEvent] | None = None
 
     try:
@@ -445,6 +450,13 @@ class _Turn:
     conversation_id: UUID
     message_id: UUID
     requested: str
+    pinned: str | None
+    """``conversations.pinned_model`` as it stood before this turn (D3/D32) —
+    threaded straight through from :func:`stream_completion`'s own ``pinned``
+    argument, which already decided the candidate chain via
+    ``selection.candidates(pinned=...)``. Carried here only so
+    :meth:`done_event` can build the same disclosure the non-streaming path
+    builds, off the same fact routing already used."""
 
     buffer: list[str]
     """The current attempt's text. **Cleared on every restart**, never spliced:
@@ -475,10 +487,18 @@ class _Turn:
     extraction_tier: ExtractionTier | None
     messages_dropped: int
 
-    def __init__(self, *, conversation_id: UUID, message_id: UUID, requested: str) -> None:
+    def __init__(
+        self,
+        *,
+        conversation_id: UUID,
+        message_id: UUID,
+        requested: str,
+        pinned: str | None = None,
+    ) -> None:
         self.conversation_id = conversation_id
         self.message_id = message_id
         self.requested = requested
+        self.pinned = pinned
         self.buffer = []
         self.longest_partial = ""
         self.committed = False
@@ -588,6 +608,7 @@ class _Turn:
             degraded=self.degraded,
             extraction_tier=self.extraction_tier,
             messages_dropped=self.messages_dropped,
+            warning=selection.pin_warning(self.pinned, self.requested, spec.slot),
             status=self.status,
             partial_content=self.partial_content(),
         )

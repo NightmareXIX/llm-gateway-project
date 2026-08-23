@@ -195,6 +195,10 @@ class DoneEvent(BaseModel):
     Zero on a replayed cache hit (:func:`stream_cached_completion`) — nothing was
     rendered this turn."""
 
+    warning: str | None = None
+    """D32's streaming twin of :attr:`~app.schemas.chat.ChatCompletionResponse.warning`.
+    ``None`` on a replayed cache hit — a replay never reruns pin resolution."""
+
     status: Literal["ok", "failed"]
     partial_content: str | None = None
     """Set only when ``status == "failed"`` and the longest discarded buffer is

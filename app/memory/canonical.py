@@ -313,6 +313,51 @@ def with_content(message: CanonicalMessage, content: list[ContentBlock]) -> Cano
 
 
 # --------------------------------------------------------------------------- #
+# D32 — the pin's trigger (D3)
+# --------------------------------------------------------------------------- #
+_TOOL_BLOCK_TYPES = frozenset({"tool_call", "tool_result"})
+"""The two-thirds of :data:`RESERVED_BLOCK_TYPES` that D3's pin cares about.
+
+Deliberately not all of it: ``summary`` is reserved for a *different* future
+feature (§2.2.7's seam), and a message carrying one has nothing to do with a
+tool call locking the conversation to one model. Testing against the wider
+set would make :func:`pin_target` fire on the wrong feature landing first.
+"""
+
+
+def pin_target(history: list[CanonicalMessage]) -> str | None:
+    """D32's trigger for D3's pin: which model does this history lock to?
+
+    Returns ``"{provider}/{model}"`` off the first message whose content
+    carries a ``tool_call`` or ``tool_result`` block, else ``None``. Runs
+    against the *stored* history, never the request body (trap 4) — D3 pins a
+    conversation permanently, from the first tool call anywhere in it, not
+    from what one particular turn happened to ask, so a predicate reading
+    ``body.messages`` would be answering a different question than the one
+    D3 poses.
+
+    **Always ``None`` for every history v1 can actually store.**
+    ``parse_block`` rejects ``tool_call``/``tool_result`` at the database
+    boundary (``RESERVED_BLOCK_TYPES``), so no row a live code path ever
+    writes will carry one — that is v1's *storage* rule keeping this branch
+    cold, not a gap in this function. The branch is real code over a real
+    input domain, and is exercised directly by a unit test that hand-builds a
+    :class:`CanonicalMessage` no database write could ever produce — a plain
+    Python list is not the JSONB boundary ``parse_block`` guards, so nothing
+    stops a test constructing what a future phase would need to accept before
+    this branch could ever run against a real request. Unfreezing
+    ``RESERVED_BLOCK_TYPES`` to store tool content is D3's job, not this
+    function's — see the module docstring's remark on that column, and D32 in
+    ``doc/reference/phase5.md`` for why a complete, reachable mechanism with
+    one deferred trigger was chosen over a pure seam.
+    """
+    for message in history:
+        if any(block["type"] in _TOOL_BLOCK_TYPES for block in message.content):
+            return f"{message.meta.provider_used}/{message.meta.model_used}"
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Violations
 # --------------------------------------------------------------------------- #
 class InvariantViolation(Exception):

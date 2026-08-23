@@ -223,6 +223,17 @@ class ChatCompletionResponse(BaseModel):
     cache hit (D19) always reports ``0`` here — nothing was rendered this
     turn, and the original turn's own row carries the number it recorded."""
 
+    warning: str | None = None
+    """D3/D32: set when this conversation is pinned (``conversations.pinned_model``)
+    and the pin overrode what this turn actually asked for — including a
+    request for ``auto``, which a pin overrides just as much as a named slot.
+    ``None`` on every unpinned conversation, and on a pinned one whose request
+    already named the slot the pin resolves to (nothing was overridden).
+
+    Rides on a 200 with a real answer already in it — this is not an error
+    field (trap 6): it must never be routed through ``to_app_error``, never
+    set a non-2xx status, and the frontend must not render it as a failure."""
+
     # ---- gateway state ----------------------------------------------------- #
     conversation_id: UUID
     message_id: UUID

@@ -156,6 +156,45 @@ async def touch(
     return result.rowcount > 0
 
 
+async def set_pinned(
+    session: AsyncSession, *, conversation_id: UUID, user_id: UUID, model: str
+) -> bool:
+    """D3/D32's write side: lock a conversation to one model. Ownership-scoped
+    in the SQL like every sibling. Returns ``False`` when it is not theirs, or
+    when it is already pinned to a *different* model.
+
+    ``model`` is ``"{provider}/{model}"`` — :func:`~app.memory.canonical.pin_target`'s
+    own return shape, and what ``selection._resolve_pin`` expects back out. A
+    slot name here would be wrong: a slot's primary candidate moves with a
+    ``providers.yaml`` edit, and a pin that silently followed it is the one
+    thing pinning exists to prevent.
+
+    Idempotent when re-pinning to the same model — a retried request, or a
+    caller that recomputes the trigger on every turn once a conversation is
+    already pinned, must not fail on that account. A re-pin to a *different*
+    model is refused by the WHERE clause instead of raising: ``pinned_model IS
+    NULL OR pinned_model = :model`` means an UPDATE that would *move* an
+    existing pin matches zero rows. A pin exists precisely because that
+    conversation's tool-call history cannot safely follow a different model's
+    schema — an UPDATE that relocated one anyway would defeat the feature it
+    implements, so "no rows matched" is the correct outcome, not a bug to work
+    around with a second query.
+    """
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            update(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+                (Conversation.pinned_model.is_(None)) | (Conversation.pinned_model == model),
+            )
+            .values(pinned_model=model, updated_at=func.clock_timestamp())
+        ),
+    )
+    return result.rowcount > 0
+
+
 async def rename(
     session: AsyncSession, *, conversation_id: UUID, user_id: UUID, title: str | None
 ) -> bool:

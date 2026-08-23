@@ -905,7 +905,7 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
     """D3's read side. Nothing writes ``pinned_model`` until tool calls land, so
     the test sets it the way that code eventually will — and the router honours it
     over ``auto``, which would otherwise have picked ``general``."""
-    handler = groq_script("success", "success")
+    handler = groq_script("success", "success", "success")
     headers = _headers(make_jwt)
 
     first = await client.post(
@@ -913,6 +913,8 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
     )
     conversation_id = UUID(first.json()["conversation_id"])
     assert first.json()["served_by"]["model"] == "openai/gpt-oss-120b"
+    # Unpinned: no disclosure to make.
+    assert first.json()["warning"] is None
 
     conversation = await db_session.get(Conversation, conversation_id)
     assert conversation is not None
@@ -931,6 +933,26 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
 
     assert second.json()["served_by"]["model"] == "openai/gpt-oss-20b"
     assert handler.models()[-1] == "openai/gpt-oss-20b"
+    # D32: `auto` never named a slot the pin could have agreed with, so it was
+    # overridden exactly as much as a named slot would have been.
+    assert (
+        second.json()["warning"]
+        == "conversation pinned to groq/openai/gpt-oss-20b due to prior tool use"
+    )
+
+    # A third turn that asks for exactly the slot the pin resolves to has
+    # nothing to disclose — the pin agreed with the request.
+    third = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "fast",
+            "conversation_id": str(conversation_id),
+            "messages": [{"role": "user", "content": "once more"}],
+        },
+        headers=headers,
+    )
+    assert third.json()["served_by"]["model"] == "openai/gpt-oss-20b"
+    assert third.json()["warning"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -975,6 +997,71 @@ async def test_a_pinned_conversations_preferred_slot_still_tracks_the_request(
     assert second.json()["served_by"]["model"] == "openai/gpt-oss-20b"
     await db_session.refresh(conversation)
     assert conversation.preferred_slot == "general"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 Step 6 — D3's write path: pinning and the `warning` field
+# --------------------------------------------------------------------------- #
+async def test_an_unpinned_turn_carries_no_warning(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+) -> None:
+    """The negative case, named directly rather than only inferred from the
+    pinned test's first turn."""
+    response = await client.post(
+        COMPLETIONS,
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers=_headers(make_jwt),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["warning"] is None
+
+
+async def test_a_pinned_conversations_done_event_carries_the_warning_too(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """D32's streaming twin: the `done` event discloses the same pin warning
+    the non-streaming response would carry, for an equivalent turn."""
+    headers = _headers(make_jwt)
+
+    first = await client.post(
+        COMPLETIONS, json={"messages": [{"role": "user", "content": "hi"}]}, headers=headers
+    )
+    assert first.json()["served_by"]["model"] == "openai/gpt-oss-120b"
+    conversation_id = UUID(first.json()["conversation_id"])
+
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    conversation.pinned_model = "groq/openai/gpt-oss-20b"
+    await db_session.flush()
+
+    upstream = provider_fixtures.client_streaming(
+        [provider_fixtures.read_sse("groq", "stream_success").encode("utf-8")]
+    )
+    app.state.provider_registry = build_registry(client=upstream, config=_groq_only())
+    try:
+        second = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "auto",
+                "conversation_id": str(conversation_id),
+                "messages": [{"role": "user", "content": "and again"}],
+                "stream": True,
+            },
+            headers=headers,
+        )
+    finally:
+        await upstream.aclose()
+
+    assert second.status_code == 200, second.text
+    done = _sse_event(second.text, "done")
+    assert done["served_by"]["model"] == "openai/gpt-oss-20b"
+    assert done["warning"] == "conversation pinned to groq/openai/gpt-oss-20b due to prior tool use"
 
 
 # --------------------------------------------------------------------------- #

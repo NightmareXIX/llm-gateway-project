@@ -13,7 +13,7 @@ raised" would still pass if the wrong rule fired.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -30,6 +30,7 @@ from app.memory.canonical import (
     parse_content,
     parse_meta,
     parse_role,
+    pin_target,
     text_block,
     validate,
     with_content,
@@ -444,3 +445,61 @@ def test_with_content_leaves_the_original_untouched() -> None:
 
 def test_schema_version_defaults_to_the_current_one() -> None:
     assert message(seq=0, role="user").schema_version == SCHEMA_VERSION
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 Step 6 — D32's pin trigger
+# --------------------------------------------------------------------------- #
+def _tool_block(block_type: str = "tool_call") -> ContentBlock:
+    """A block ``parse_block`` would refuse — exactly the seam ``pin_target``
+    is meant to be tested against. ``content`` is a plain Python list, not the
+    JSONB boundary that guard sits at, so nothing here stops a test building
+    what only a future, tool-call-storing phase could ever write for real."""
+    return cast(ContentBlock, {"type": block_type, "name": "get_weather"})
+
+
+def test_pin_target_returns_none_for_every_history_v1_can_store() -> None:
+    """The whole of D32: no request or stored row can carry a tool block
+    (``parse_block`` rejects it at the database boundary), so this is the
+    only outcome ``pin_target`` will ever produce in production."""
+    assert pin_target(well_formed_history()) is None
+    assert pin_target([]) is None
+
+
+def test_pin_target_finds_a_hand_built_tool_call_block() -> None:
+    history = well_formed_history()
+    history[2] = message(seq=2, role="assistant", content=[_tool_block("tool_call")])
+    assert pin_target(history) == f"{ASSISTANT_META.provider_used}/{ASSISTANT_META.model_used}"
+
+
+def test_pin_target_finds_a_hand_built_tool_result_block_too() -> None:
+    history = well_formed_history()
+    history[2] = message(seq=2, role="assistant", content=[_tool_block("tool_result")])
+    assert pin_target(history) == f"{ASSISTANT_META.provider_used}/{ASSISTANT_META.model_used}"
+
+
+def test_pin_target_returns_the_first_match_when_several_exist() -> None:
+    history = [
+        message(seq=0, role="user"),
+        message(
+            seq=1,
+            role="assistant",
+            content=[_tool_block()],
+            meta=MessageMeta(provider_used="groq", model_used="first-model"),
+        ),
+        message(seq=2, role="user"),
+        message(
+            seq=3,
+            role="assistant",
+            content=[_tool_block()],
+            meta=MessageMeta(provider_used="gemini", model_used="second-model"),
+        ),
+    ]
+    assert pin_target(history) == "groq/first-model"
+
+
+def test_pin_target_ignores_a_summary_block() -> None:
+    """``summary`` is reserved too, but for a different, unrelated future
+    feature (§2.2.7) — it must not trip D3's tool-call trigger."""
+    history = [message(seq=0, role="assistant", content=[_tool_block("summary")])]
+    assert pin_target(history) is None

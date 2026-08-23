@@ -217,6 +217,67 @@ async def test_touch_rejects_another_users_conversation_and_writes_nothing(
     assert conversation.preferred_slot == "auto"
 
 
+async def test_set_pinned_writes_the_model(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    user = await user_factory()
+    conversation = await repo.create(db_session, user_id=user.id)
+
+    assert await repo.set_pinned(
+        db_session, conversation_id=conversation.id, user_id=user.id, model="groq/model-a"
+    )
+    await db_session.refresh(conversation)
+    assert conversation.pinned_model == "groq/model-a"
+
+
+async def test_set_pinned_is_idempotent_for_the_same_model(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    user = await user_factory()
+    conversation = await repo.create(db_session, user_id=user.id)
+    await repo.set_pinned(
+        db_session, conversation_id=conversation.id, user_id=user.id, model="groq/model-a"
+    )
+
+    assert await repo.set_pinned(
+        db_session, conversation_id=conversation.id, user_id=user.id, model="groq/model-a"
+    )
+    await db_session.refresh(conversation)
+    assert conversation.pinned_model == "groq/model-a"
+
+
+async def test_set_pinned_refuses_to_move_an_existing_pin(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    """A pin exists precisely because that history cannot safely follow a
+    different model; an UPDATE that moved one anyway would defeat it."""
+    user = await user_factory()
+    conversation = await repo.create(db_session, user_id=user.id)
+    await repo.set_pinned(
+        db_session, conversation_id=conversation.id, user_id=user.id, model="groq/model-a"
+    )
+
+    assert not await repo.set_pinned(
+        db_session, conversation_id=conversation.id, user_id=user.id, model="groq/model-b"
+    )
+    await db_session.refresh(conversation)
+    assert conversation.pinned_model == "groq/model-a"
+
+
+async def test_set_pinned_rejects_another_users_conversation(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    owner = await user_factory()
+    intruder = await user_factory()
+    conversation = await repo.create(db_session, user_id=owner.id)
+
+    assert not await repo.set_pinned(
+        db_session, conversation_id=conversation.id, user_id=intruder.id, model="groq/model-a"
+    )
+    await db_session.refresh(conversation)
+    assert conversation.pinned_model is None
+
+
 async def test_rename_sets_and_clears_the_title(
     db_session: AsyncSession, user_factory: Callable[..., Any]
 ) -> None:

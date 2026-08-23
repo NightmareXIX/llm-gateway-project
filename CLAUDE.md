@@ -109,7 +109,7 @@ Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streami
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestone A complete, Milestone B underway — Steps 1–5 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: Milestones A and B complete, Milestone C underway — Steps 1–6 of 8 committed.** Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -231,6 +231,44 @@ extends the existing pin test to assert `preferred_slot` keeps recording what wa
 (`general`) even while the pin silently serves a different model — proving D33 and D3 stay two distinct
 facts rather than converging under a pin. No frontend change — `ConversationView`'s seeding from
 `preferred_slot` is Step 7. `make test`, `ruff check`, `ruff format --check`, and `mypy` are green.
+
+Step 6 (D32: D3's write path — pinning and the `warning` field) touched exactly the files `phase5.md`
+names — `db/repo/conversations.py`, `memory/canonical.py`, `schemas/chat.py`, `streaming/sse.py`,
+`streaming/orchestrator.py`, `api/v1/chat.py` — plus tests. `conversations_repo.set_pinned` is
+ownership-scoped like every sibling and idempotent for a re-pin to the same model; a re-pin to a
+*different* model is refused by the WHERE clause itself (`pinned_model IS NULL OR pinned_model =
+:model`) rather than by raising, so an UPDATE that would have moved an existing pin matches zero rows
+instead. `canonical.pin_target(history) -> str | None` is D32's pure trigger predicate: the first
+message carrying a `tool_call`/`tool_result` block, off a new `_TOOL_BLOCK_TYPES` subset of
+`RESERVED_BLOCK_TYPES` that deliberately excludes `summary` — that type is reserved for the unrelated
+§2.2.7 seam, and folding it in would fire D3's pin on the wrong feature landing first. Per D32(c), this
+is a complete, reachable mechanism whose only deferred part is the trigger: `parse_block` rejects
+`tool_call`/`tool_result` at the database boundary, so `pin_target` returns `None` for every history v1
+can actually store, and the branch that returns otherwise is exercised only by a hand-built
+`CanonicalMessage` in a unit test — content is a plain list, not the JSONB boundary that guard sits at.
+The `warning` field (`ChatCompletionResponse` and `DoneEvent`) is built by one shared helper,
+`selection.pin_warning(pinned_model, requested_slot, served_slot)`, read by both the non-streaming path
+and — via a new `pinned` field threaded onto `orchestrator._Turn`, off `stream_completion`'s existing
+`pinned` argument — the streaming `done` event. It is deliberately not `is_substitution` reused under a
+new name: that predicate excuses `auto` because ordinary routing choosing on the client's behalf is not
+an override, but a *pin* overriding `auto` very much is one — `auto`'s whole promise is "you choose",
+and the pin took that choice away too — so `pin_warning` fires whenever the served slot differs from
+what was requested, `auto` included, and stays silent only when the request already named the slot the
+pin resolves to. `chat.py`'s main success path calls `pin_target([*history, assistant])` and, on a
+non-`None` result with `conversation.pinned_model is None`, calls `set_pinned` in the same transaction as
+the assistant row — unreachable today for the same reason `pin_target` is, but wired rather than left a
+seam. The D19 cache-hit path also discloses `warning`, off a new `pinned_model` parameter on
+`_serve_cache_hit`: a hit never re-routes, but a pinned conversation can still have a cached answer sitting
+on a different slot than the pin would now enforce, and that is exactly the case the disclosure exists
+for. New tests: `test_canonical.py` covers `pin_target` returning `None` for every history v1 can store,
+finding a hand-built `tool_call` block, a `tool_result` block, the first match among several, and ignoring
+a `summary` block; `test_repo_conversations.py` covers `set_pinned` writing the model, idempotent re-pins,
+refusing to move an existing pin, and ownership scoping; `test_chat_endpoint.py` extends
+`test_a_pinned_conversation_ignores_the_requested_slot` to assert `warning` is null when unpinned, carries
+the disclosure when a pin overrides `auto`, and is null again once a later turn asks for the slot the pin
+already resolves to, plus new `test_an_unpinned_turn_carries_no_warning` and
+`test_a_pinned_conversations_done_event_carries_the_warning_too` for the streaming twin. No frontend
+change — Step 7. `make test`, `ruff check`, `ruff format --check`, and `mypy` are green.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,

@@ -64,6 +64,7 @@ from app.memory.canonical import (
     ContentBlock,
     MessageMeta,
     file_ref_block,
+    pin_target,
     text_block,
 )
 from app.memory.render import AttachmentResolver
@@ -232,6 +233,7 @@ async def create_chat_completion(
                 principal=principal,
                 body=body,
                 conversation_id=conversation_id,
+                pinned_model=conversation.pinned_model,
                 cached=cached,
                 started=started,
             )
@@ -287,6 +289,10 @@ async def create_chat_completion(
     spec = outcome.spec
     completion = outcome.completion
     substituted = _is_substitution(body.model, spec.slot)
+    # D32: the disclosure half of D3. Read off the pin this turn was actually
+    # routed under — set before `routing.route` was called above — not
+    # whatever `pin_target` below might establish for the *next* turn.
+    warning = selection.pin_warning(conversation.pinned_model, body.model, spec.slot)
 
     # Note what is *not* handled here: an empty generation. The adapter raises
     # `EmptyResponse` for a 200-with-nothing, so it leaves through the branch
@@ -322,6 +328,23 @@ async def create_chat_completion(
             messages_dropped=outcome.report.messages_dropped,
         ),
     )
+    # D32(c): a complete, reachable pin mechanism whose only deferred part is
+    # the trigger — `pin_target` returns `None` for every history v1 can
+    # actually store (no request or stored row can carry a tool_call block),
+    # so this is unreachable today and stays that way until a future phase
+    # unfreezes `RESERVED_BLOCK_TYPES`. Checked against this turn's own reply
+    # too, in the same transaction as the row that would have triggered it,
+    # and only when nothing has pinned this conversation yet — D3 pins once,
+    # from the *first* tool call, not the most recent one.
+    if conversation.pinned_model is None:
+        target = pin_target([*history, assistant])
+        if target is not None:
+            await conversations_repo.set_pinned(
+                session,
+                conversation_id=conversation_id,
+                user_id=principal.user_id,
+                model=target,
+            )
     await usage_logger.record_success(
         session,
         principal=principal,
@@ -375,6 +398,7 @@ async def create_chat_completion(
         degraded=outcome.report.degraded,
         extraction_tier=outcome.report.extraction_tier,
         messages_dropped=outcome.report.messages_dropped,
+        warning=warning,
         attempts=outcome.attempts,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -391,6 +415,7 @@ async def _serve_cache_hit(
     principal: Principal,
     body: ChatCompletionRequest,
     conversation_id: UUID,
+    pinned_model: str | None,
     cached: exact.CachedResponse,
     started: float,
 ) -> ChatCompletionResponse:
@@ -400,6 +425,13 @@ async def _serve_cache_hit(
     those words, even though nothing was attempted this turn.
     """
     substituted = selection.is_substitution(body.model, cached.slot)
+    # D32: a hit never routes, so it never re-resolves the pin — but the pin
+    # still constrains what a *live* request would have gotten, and a cached
+    # answer from a different slot is exactly the case the disclosure exists
+    # for. Computed the same way the live path computes it, off the same two
+    # facts: the conversation's pin as it stands now, and the slot this turn
+    # is actually being served from.
+    warning = selection.pin_warning(pinned_model, body.model, cached.slot)
 
     assistant = await messages_repo.append(
         session,
@@ -448,6 +480,7 @@ async def _serve_cache_hit(
         # Nothing was rendered this turn (trap 3) — the original turn's own row
         # carries whatever it dropped, not this one.
         messages_dropped=0,
+        warning=warning,
         attempts=0,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -739,6 +772,7 @@ def _to_response(
     degraded: bool,
     extraction_tier: ExtractionTier | None,
     messages_dropped: int,
+    warning: str | None,
     attempts: int,
     conversation_id: UUID,
     assistant: CanonicalMessage,
@@ -776,6 +810,7 @@ def _to_response(
         degraded=degraded,
         extraction_tier=extraction_tier,
         messages_dropped=messages_dropped,
+        warning=warning,
         conversation_id=conversation_id,
         message_id=assistant.id,
     )

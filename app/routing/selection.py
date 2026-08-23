@@ -48,6 +48,31 @@ def is_substitution(requested_slot: str, served_slot: str) -> bool:
     return requested_slot != AUTO and requested_slot != served_slot
 
 
+def pin_warning(pinned_model: str | None, requested_slot: str, served_slot: str) -> str | None:
+    """D32's disclosure text, built once and read by both response shapes.
+
+    Fires whenever a pin is in effect *and* it moved the answer away from
+    what the client actually asked for — including a request for ``auto``. A
+    pin's whole point is that the client does not get a say, and ``auto``'s
+    whole point is "you choose"; a pin overriding ``auto`` is exactly as much
+    an override as a pin overriding a named slot; only a request that
+    already named the slot the pin resolves to has nothing to disclose.
+
+    **Not :func:`is_substitution` under a new name.** That predicate
+    deliberately excuses ``auto`` because ordinary routing choosing on the
+    client's behalf is not a substitution — nothing was overridden, the
+    client asked the gateway to choose. A pin is a different kind of
+    override: the client's choice, whatever it was, was replaced by a fact
+    about the conversation's own history that the client cannot see or undo.
+    Collapsing the two into one predicate would silently drop the disclosure
+    for exactly the pinned-``auto`` case ``test_a_pinned_conversation_ignores_the_requested_slot``
+    exists to catch.
+    """
+    if pinned_model is None or requested_slot == served_slot:
+        return None
+    return f"conversation pinned to {pinned_model} due to prior tool use"
+
+
 def resolve_slot(registry: ProviderRegistry, requested: str) -> ModelSpec:
     """The one model Phase 1 will attempt.
 
