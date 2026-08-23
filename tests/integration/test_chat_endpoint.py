@@ -13,6 +13,7 @@ response mid-test and inspect the payload that was sent.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ProvidersConfig, get_providers_config
-from app.db.models import Conversation, Message, Request
+from app.db.models import Conversation, File, Message, Request
 from app.deps import get_resolver
 from app.perception.storage import MemoryStore
 from app.providers.registry import build_registry
@@ -145,6 +146,50 @@ async def fleet_script(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHand
         client = handler.client()
         installed.append(client)
         app.state.provider_registry = build_registry(client=client)
+        return handler
+
+    try:
+        yield install
+    finally:
+        for client in installed:
+            await client.aclose()
+
+
+def _narrow_slot(config: ProvidersConfig, slot: str, providers: tuple[str, ...]) -> ProvidersConfig:
+    """Restrict one slot's candidate list to the named providers, leaving every
+    other slot — in particular ``perception`` — exactly as
+    ``config/providers.yaml`` declares it.
+
+    Phase 5 Step 2's file-ref-across-a-switch test needs a *deterministic*
+    answering provider per slot (``fast`` -> Groq, so the text-only candidate
+    forces an extraction; ``general`` -> Gemini, so the second turn is answered
+    by the one provider that could have read the file natively) without
+    disabling either provider outright — Groq must stay enabled for ``fast`` to
+    answer, so ``_groq_only``'s whole-provider toggle above cannot express
+    this.
+    """
+    declared = config.slots[slot]
+    candidates = tuple(c for c in declared.candidates if c.provider in providers)
+    narrowed = declared.model_copy(update={"candidates": candidates})
+    return config.model_copy(update={"slots": {**config.slots, slot: narrowed}})
+
+
+@pytest.fixture
+async def attachment_fleet(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHandler]]:
+    """``fleet_script``'s sibling for the one test that needs a deterministic
+    answering provider per slot rather than the committed failover order:
+    ``fast`` narrowed to Groq, ``general`` narrowed to Gemini.
+    """
+    installed: list[httpx.AsyncClient] = []
+
+    def install(*specs: str) -> ScriptedHandler:
+        handler = ScriptedHandler(*(provider_fixtures.load(*spec.split("/", 1)) for spec in specs))
+        client = handler.client()
+        installed.append(client)
+        config = get_providers_config()
+        config = _narrow_slot(config, "fast", ("groq",))
+        config = _narrow_slot(config, "general", ("gemini",))
+        app.state.provider_registry = build_registry(client=client, config=config)
         return handler
 
     try:
@@ -828,6 +873,369 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
 
     assert second.json()["served_by"]["model"] == "openai/gpt-oss-20b"
     assert handler.models()[-1] == "openai/gpt-oss-20b"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 Step 2 — continuity across a provider switch, end to end
+#
+# development-plan.md's exit criterion for this phase, and the one no existing
+# test performs: `test_a_second_turn_sends_the_whole_history` above never
+# switches provider, and `test_failover_crosses_providers` never sends a second
+# turn. Everything below proves both at once, against genuinely different
+# providers within one conversation.
+# --------------------------------------------------------------------------- #
+async def test_a_thread_survives_a_provider_switch(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    fleet_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """Three turns, one conversation, three providers.
+
+    Turn one requests ``fast`` and Groq answers outright. Turn two requests
+    ``general`` — a deliberate switch — and Groq (``general``'s own first
+    candidate, a different model than ``fast``'s) is scripted to fail, so the
+    turn actually reaches Gemini by the same in-slot failover Milestone A
+    already proved, only now on top of real history. Turn three asks ``general``
+    a third time with *both* of its first two candidates scripted to fail, so it
+    spills all the way to OpenRouter — the third provider, reached without a
+    third slot name exactly as the design note under Step 2 requires.
+
+    `auth_failed` for every scripted failure, deliberately not `rate_limited` or
+    `server_error_html`: an `AuthFailed` is failover-eligible with no
+    same-candidate retry (`retryable_same_provider` is `False`, unlike
+    `Unavailable`'s one built-in retry in `router.py`, which would silently
+    spend two of D1's three attempts on a single candidate) and needs
+    `FAILURE_THRESHOLD` consecutive failures to open the breaker, not one
+    (unlike `RateLimited`, which opens it immediately and would turn turn
+    three's repeat attempt on Groq's `general` model into a breaker-skip
+    instead of the second real failure this test is scripting). One scripted
+    fixture per real attempt is what that combination buys.
+    """
+    handler = fleet_script(
+        "groq/success",
+        "groq/auth_failed",
+        "gemini/success",
+        "groq/auth_failed",
+        "gemini/auth_failed",
+        "openrouter/success",
+    )
+    headers = _headers(make_jwt)
+    first_text = "Remember this launch phrase: violet horizon."
+
+    # `max_tokens` set explicitly on every turn: `fitting.input_budget` reserves
+    # the *whole* configured output ceiling when a request omits it, and
+    # OpenRouter's `general` candidate is declared with `max_output_tokens`
+    # equal to its own `context_window` — no `max_tokens` would make turn
+    # three's real destination raise `ContextTooLong` out of `render()` before
+    # a single byte reached the mock transport, for a reason that has nothing
+    # to do with what this test is proving.
+    first = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "fast",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": first_text}],
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    conversation_id = first.json()["conversation_id"]
+    assert first.json()["served_by"] == {
+        "slot": "fast",
+        "provider": "groq",
+        "model": "openai/gpt-oss-20b",
+    }
+
+    second = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "general",
+            "max_tokens": 512,
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "Switching models. What did I say first?"}],
+        },
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    body2 = second.json()
+    assert body2["served_by"] == {
+        "slot": "general",
+        "provider": "gemini",
+        "model": "gemini-3.6-flash",
+    }
+    # In-slot failover, not a substitution: nothing named a slot the router
+    # then overrode.
+    assert body2["substituted"] is False
+    assert body2["attempts"] == 2
+
+    third = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "general",
+            "max_tokens": 512,
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "One more time: what was the launch phrase?"}],
+        },
+        headers=headers,
+    )
+    assert third.status_code == 200, third.text
+    body3 = third.json()
+    assert body3["served_by"] == {
+        "slot": "general",
+        "provider": "openrouter",
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+    }
+    assert body3["substituted"] is False
+    assert body3["attempts"] == 3
+
+    # The chain as the wire saw it, across all three turns.
+    assert handler.models() == [
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "gemini-3.6-flash",
+        "openai/gpt-oss-120b",
+        "gemini-3.6-flash",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+    ]
+
+    # The three provider shapes, on the three requests that actually answered.
+    groq_sent = json.loads(handler.requests[0].content)
+    gemini_sent = json.loads(handler.requests[2].content)
+    openrouter_sent = json.loads(handler.requests[5].content)
+    assert "messages" in groq_sent and "contents" not in groq_sent
+    assert "contents" in gemini_sent and "messages" not in gemini_sent
+    assert "messages" in openrouter_sent and "contents" not in openrouter_sent
+
+    # Turn one's user text survived two switches and reached turn three's payload
+    # — proof the render pipeline, not just the router, carried history across
+    # providers.
+    assert first_text in json.dumps(openrouter_sent)
+
+    stored = await _messages(db_session, conversation_id)
+    assert [(m.seq, m.role) for m in stored] == [
+        (0, "user"),
+        (1, "assistant"),
+        (2, "user"),
+        (3, "assistant"),
+        (4, "user"),
+        (5, "assistant"),
+    ]
+    assert stored[1].meta["provider_used"] == "groq"
+    assert stored[3].meta["provider_used"] == "gemini"
+    assert stored[5].meta["provider_used"] == "openrouter"
+
+
+async def test_a_file_ref_survives_a_provider_switch_from_cache(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    attachment_fleet: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """Phase 4's handoff, cashed: one uploaded file, one stored ``file_ref``
+    block, and one conversation that switches providers mid-thread without a
+    second extraction.
+
+    Turn one asks about it under ``fast`` (Groq, text-only), which forces a
+    real Gemini extraction. Turn two asks a follow-up under ``general``
+    (Gemini, which *can* read the file natively) *without* repeating
+    ``file_refs`` — the stored block from turn one is already in history, and
+    ``render``'s step 1 scans the whole history for ``file_ref`` blocks, not
+    just the current turn's message.
+
+    The tier on turn two is ``cache``, not ``native``: ``lane.py``'s tier 0
+    check runs *before* tier 1's native check and returns a stored ``llm``
+    reading unconditionally (``_run_chain``, "tier 0" — the same ordering
+    ``docs/limitations.md`` names as "cache-beats-native on layout
+    questions"). That is why §1's own definition of done hedges with
+    "``extraction_tier`` goes ``llm`` → ``cache`` *or* ``native``" rather than
+    promising native outright — this is the ``fast``-then-``general``
+    ordering, and cache wins it every time. What both turns share, and what
+    this test actually exists to prove, is that one upload and one extraction
+    answer two different providers in one thread with no second round trip to
+    the perception lane at all.
+    """
+    handler = attachment_fleet("gemini/extraction_complete", "groq/success", "gemini/success")
+    headers = _headers(make_jwt)
+    file_hash = await _upload(client, headers)
+
+    first = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "fast",
+            "messages": [
+                {"role": "user", "content": "what does this say?", "file_refs": [file_hash]}
+            ],
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    body1 = first.json()
+    assert body1["extraction_tier"] == "llm"
+    assert body1["degraded"] is False
+    conversation_id = body1["conversation_id"]
+
+    second = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "general",
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "and what does it say about the appendix?"}],
+        },
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    body2 = second.json()
+    assert body2["extraction_tier"] == "cache"
+    assert body2["degraded"] is False
+
+    # Exactly the three scripted calls ran: the extraction, Groq's answer, and
+    # Gemini's answer. A second extraction would have been a fourth, unscripted
+    # request, which `ScriptedHandler` would have raised on — this just names
+    # the count so a future regression fails here with a clear message instead.
+    assert handler.calls == 3
+
+    # One upload, one stored `file_ref` block — turn two never sent one.
+    files = (await db_session.execute(select(File))).scalars().all()
+    assert len(files) == 1
+    assert files[0].file_hash == file_hash
+
+    stored = await _messages(db_session, conversation_id)
+    file_ref_blocks = [
+        block
+        for message in stored
+        if message.role == "user"
+        for block in message.content
+        if block["type"] == "file_ref"
+    ]
+    assert len(file_ref_blocks) == 1
+    assert file_ref_blocks[0]["file_hash"] == file_hash
+
+    # Groq cannot read the file, so it was handed the extracted text, wrapped in
+    # the same envelope every adapter shares.
+    groq_sent = json.dumps(json.loads(handler.requests[1].content))
+    assert "<document" in groq_sent
+    assert "quarterly report" in groq_sent.lower()
+
+    # Gemini's second answer replays the same cached reading, in its own
+    # ``parts`` shape but through the identical envelope — not `inline_data`,
+    # because the cache hit above is what tier the resolver actually returned.
+    gemini_sent = json.dumps(json.loads(handler.requests[2].content))
+    assert "<document" in gemini_sent
+    assert "quarterly report" in gemini_sent.lower()
+    assert "inline_data" not in gemini_sent
+
+
+async def test_streaming_and_non_streaming_agree_on_a_switched_thread(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """The same switch, twice: once fully non-streaming, once with the second
+    turn streamed. Both paths render through the same ``render()`` call, and
+    this is the test that keeps that true — the streamed twin's ``done`` event
+    and persisted history must agree with the plain twin's response and rows.
+
+    Two independent conversations rather than one, since streaming and
+    non-streaming are different requests and cannot both be "turn two" of the
+    same thread; what has to agree is the *shape* each path produces for an
+    equivalent switch, not a shared conversation id.
+    """
+    headers = _headers(make_jwt)
+    config = _narrow_slot(get_providers_config(), "fast", ("groq",))
+    config = _narrow_slot(config, "general", ("gemini",))
+
+    # Twin A — fully non-streaming.
+    client_a = ScriptedHandler(
+        provider_fixtures.load("groq", "success"), provider_fixtures.load("gemini", "success")
+    ).client()
+    app.state.provider_registry = build_registry(client=client_a, config=config)
+    try:
+        first_a = await client.post(
+            COMPLETIONS,
+            json={"model": "fast", "messages": [{"role": "user", "content": "hello there"}]},
+            headers=headers,
+        )
+        conversation_a = first_a.json()["conversation_id"]
+        second_a = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "general",
+                "conversation_id": conversation_a,
+                "messages": [{"role": "user", "content": "what did I say first?"}],
+            },
+            headers=headers,
+        )
+    finally:
+        await client_a.aclose()
+
+    assert second_a.status_code == 200, second_a.text
+    served_by_a = second_a.json()["served_by"]
+    rows_a = await _messages(db_session, conversation_a)
+
+    # Twin B — the same switch, second turn streamed.
+    client_b1 = provider_fixtures.RecordingHandler(
+        provider_fixtures.load("groq", "success")
+    ).client()
+    app.state.provider_registry = build_registry(client=client_b1, config=config)
+    try:
+        first_b = await client.post(
+            COMPLETIONS,
+            json={"model": "fast", "messages": [{"role": "user", "content": "hello there"}]},
+            headers=headers,
+        )
+    finally:
+        await client_b1.aclose()
+    conversation_b = first_b.json()["conversation_id"]
+
+    client_b2 = provider_fixtures.client_streaming(
+        [provider_fixtures.read_sse("gemini", "stream_success").encode("utf-8")]
+    )
+    app.state.provider_registry = build_registry(client=client_b2, config=config)
+    try:
+        second_b = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "general",
+                "conversation_id": conversation_b,
+                "messages": [{"role": "user", "content": "what did I say first?"}],
+                "stream": True,
+            },
+            headers=headers,
+        )
+    finally:
+        await client_b2.aclose()
+
+    assert second_b.status_code == 200, second_b.text
+    done = _sse_event(second_b.text, "done")
+    assert done["served_by"] == served_by_a
+    rows_b = await _messages(db_session, conversation_b)
+
+    # Same shape, not the same words: the two twins hit two different recorded
+    # fixtures (a JSON completion and an SSE stream), so their assistant text
+    # legitimately differs. What has to agree is *how* each turn was served —
+    # same roles, same provider per turn — and the user's own words, which this
+    # test controls and both twins sent identically.
+    def _shape(rows: list[Message]) -> list[tuple[str, str | None]]:
+        return [(row.role, row.meta.get("provider_used")) for row in rows]
+
+    assert _shape(rows_a) == _shape(rows_b)
+    user_a = [row.content for row in rows_a if row.role == "user"]
+    user_b = [row.content for row in rows_b if row.role == "user"]
+    assert user_a == user_b
+
+
+def _sse_event(body: str, name: str) -> dict[str, Any]:
+    """The JSON payload of one named SSE event — ``streaming/sse.py``'s
+    ``f"event: {name}\\ndata: {body}\\n\\n"`` framing, read back."""
+    for block in body.split("\n\n"):
+        if block.startswith(f"event: {name}\n"):
+            data_line = block.split("\n", 1)[1]
+            parsed: dict[str, Any] = json.loads(data_line.removeprefix("data: "))
+            return parsed
+    raise AssertionError(f"no {name!r} event found in stream:\n{body}")
 
 
 # --------------------------------------------------------------------------- #

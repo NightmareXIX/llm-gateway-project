@@ -360,11 +360,18 @@ never sends a second turn.
    provider shapes (Gemini `contents`/`parts` on turn two, OpenAI-shaped `messages` on turns one and three);
    each assistant row's `meta.provider_used` names its own provider; and the conversation holds exactly six
    messages in gap-free `seq` order.
-2. **`test_a_file_ref_renders_differently_for_each_provider_in_one_thread`** — Phase 4's handoff, cashed.
-   Upload once, reference the hash on turn one under `fast`, ask about it again on turn two under `general`.
-   Assert: one `files` row, one stored `file_ref` block, Groq's payload carries the `<document …>` envelope,
-   Gemini's carries `inline_data`, and the second turn ran no extraction (assert on the tier: `llm` then
-   `native`, and no second call to the perception slot).
+2. **`test_a_file_ref_survives_a_provider_switch_from_cache`** — Phase 4's handoff, cashed. Upload once,
+   reference the hash on turn one under `fast`, ask about it again on turn two under `general` *without*
+   repeating `file_refs` (render step 1 scans the whole history for `file_ref` blocks, not only the current
+   turn's message). Assert: one `files` row, one stored `file_ref` block, Groq's payload carries the
+   `<document …>` envelope, and the second turn ran no extraction (assert on the tier: `llm` then — the
+   finding this test surfaced, corrected here rather than swept away — `cache`, not `native`: `lane.py`'s
+   tier 0 check returns a stored `llm` reading unconditionally, *before* tier 1 ever asks whether the second
+   candidate could have read the file natively, so Gemini's second answer also carries the envelope rather
+   than `inline_data`. That is exactly §1's own DoD item 3, which already hedges with "`extraction_tier` goes
+   `llm` → `cache` *or* `native`" rather than promising native outright — this is the `cache` half of that
+   hedge, and it is `docs/limitations.md`'s "cache-beats-native on layout questions" line, exercised rather
+   than only documented. No second call to the perception slot, either way.
 3. **`test_streaming_and_non_streaming_agree_on_a_switched_thread`** — the same switch with `stream: true`
    on the second turn, asserting the `done` event's `served_by` and the persisted history match the
    non-streaming twin. The two paths render through the same `render()` call, and this is the test that

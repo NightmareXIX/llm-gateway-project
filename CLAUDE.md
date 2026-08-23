@@ -109,7 +109,7 @@ Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streami
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestone A in progress — Step 1 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: Milestone A complete — Steps 1–2 of 8 committed.** Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -128,6 +128,40 @@ to `\r\n` on write, which had left three of the four pre-existing goldens carryi
 `.gitattributes`' own `-text` byte-exactness contract; `provider_fixtures.py::write_golden` is now
 the one place any bless script writes a file, forcing `\n`. `make test`, `ruff check`, `ruff format
 --check`, and `mypy` are green.
+
+Step 2 (continuity across a provider switch, end to end) touched only
+`tests/integration/test_chat_endpoint.py` — the file it names as its sole allowed target — adding
+three tests plus a `_narrow_slot` config helper and an `attachment_fleet` fixture (Groq-only `fast`,
+Gemini-only `general`) beside the module's existing `_groq_only`/`fleet_script`.
+`test_a_thread_survives_a_provider_switch` drives one conversation through three turns and three
+genuinely different providers — `fast`/Groq, then `general`/Gemini reached by an in-slot failover,
+then `general`/OpenRouter reached by a second failover after Gemini also fails — and asserts turn
+one's user text survives into turn three's payload, the three provider shapes differ exactly where
+expected (Gemini's top-level `contents`/`parts` on turn two, OpenAI-shaped `messages` on turns one
+and three), and the conversation holds six messages in gap-free `seq` order. Every scripted failure
+uses `AuthFailed` (not `RateLimited` or `Unavailable`): the router retries an `Unavailable` once on
+the same candidate before failing over (`router.py`'s `MAX_SAME_PROVIDER_RETRIES`), which would
+have starved D1's 3-attempt cap before OpenRouter was ever reached, and a single `RateLimited`
+opens the breaker immediately (`circuit_breaker.py`), which would have turned turn three's second
+Groq attempt into a breaker-skip instead of the real failure the test is asserting on — `AuthFailed`
+is failover-eligible with neither property, so one scripted fixture buys exactly one real attempt.
+`test_a_file_ref_survives_a_provider_switch_from_cache` uploads once, asks about it on `fast` (an
+extraction), then asks a follow-up on `general` *without* repeating `file_refs` (render step 1 scans
+the whole stored history for `file_ref` blocks). Writing it surfaced a real finding, corrected in
+`phase5.md` rather than swept away: the second turn's tier is `cache`, not `native` — `lane.py`'s
+tier 0 check returns a stored `llm` reading unconditionally, before tier 1 ever asks whether Gemini
+could have read the file itself, so Gemini's second answer also carries the `<document>` envelope
+rather than `inline_data`. That is `docs/limitations.md`'s already-documented "cache-beats-native on
+layout questions" trade-off, exercised by a test for the first time, and exactly the `cache`-or-
+`native` hedge §1's own definition of done already carries.
+`test_streaming_and_non_streaming_agree_on_a_switched_thread` runs the same two-turn switch twice —
+non-streaming and with the second turn streamed — as two independent conversations (a JSON fixture
+and an SSE fixture legitimately differ in wording, so the assertion is on role/provider shape and
+the user's own words, not exact assistant text) and checks the `done` event's `served_by` against
+the non-streaming twin's. Per the step's own acceptance
+criterion, all three were confirmed to keep passing with `pinned=` temporarily deleted from both of
+`chat.py`'s `routing.route`/`route_stream` calls — they test memory, not pinning — before that
+change was reverted. `make test`, `ruff check`, `ruff format --check`, and `mypy` are green.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,
