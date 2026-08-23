@@ -934,6 +934,50 @@ async def test_a_pinned_conversation_ignores_the_requested_slot(
 
 
 # --------------------------------------------------------------------------- #
+# Phase 5 Step 5 — `preferred_slot`: the thread remembers what you picked
+# --------------------------------------------------------------------------- #
+async def test_a_pinned_conversations_preferred_slot_still_tracks_the_request(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq_script: Callable[..., ScriptedHandler],
+    db_session: AsyncSession,
+) -> None:
+    """D33 vs D3: two different facts about one conversation. The pin decides
+    who *serves* the turn; ``preferred_slot`` only ever records what the user
+    *asked* for, and a pin overriding the former must not silently move the
+    latter — the composer should reopen on ``general``, not on the model the
+    pin happened to substitute in."""
+    groq_script("success", "success")
+    headers = _headers(make_jwt)
+
+    first = await client.post(
+        COMPLETIONS,
+        json={"model": "general", "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+    conversation_id = UUID(first.json()["conversation_id"])
+
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    conversation.pinned_model = "groq/openai/gpt-oss-20b"
+    await db_session.flush()
+
+    second = await client.post(
+        COMPLETIONS,
+        json={
+            "model": "general",
+            "conversation_id": str(conversation_id),
+            "messages": [{"role": "user", "content": "and again"}],
+        },
+        headers=headers,
+    )
+
+    assert second.json()["served_by"]["model"] == "openai/gpt-oss-20b"
+    await db_session.refresh(conversation)
+    assert conversation.preferred_slot == "general"
+
+
+# --------------------------------------------------------------------------- #
 # Phase 5 Step 2 — continuity across a provider switch, end to end
 #
 # development-plan.md's exit criterion for this phase, and the one no existing

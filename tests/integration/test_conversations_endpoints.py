@@ -225,6 +225,71 @@ async def test_deleting_removes_the_thread(
     assert (await client.get(CONVERSATIONS, headers=headers)).json() == []
 
 
+async def test_preferred_slot_follows_the_last_requested_slot(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+) -> None:
+    """D33: a display preference, updated on every turn regardless of what
+    actually served it — both candidates here are Groq, so this is purely
+    about the column tracking the request, not the routing outcome."""
+    headers = _headers(make_jwt)
+    created = await client.post(
+        "/v1/chat/completions",
+        json={"model": "general", "messages": [{"role": "user", "content": "first"}]},
+        headers=headers,
+    )
+    conversation_id = created.json()["conversation_id"]
+    assert (await client.get(f"{CONVERSATIONS}/{conversation_id}", headers=headers)).json()[
+        "preferred_slot"
+    ] == "general"
+
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fast",
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "second"}],
+        },
+        headers=headers,
+    )
+
+    detail = await client.get(f"{CONVERSATIONS}/{conversation_id}", headers=headers)
+    assert detail.json()["preferred_slot"] == "fast"
+
+
+async def test_someone_elses_failed_turn_does_not_move_preferred_slot(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+) -> None:
+    """A 404'd turn never reaches ``touch`` at all — the preference stays
+    exactly what its owner last set it to."""
+    alice = _headers(make_jwt, sub=uuid4(), email="alice@example.com")
+    bob = _headers(make_jwt, sub=uuid4(), email="bob@example.com")
+
+    created = await client.post(
+        "/v1/chat/completions",
+        json={"model": "general", "messages": [{"role": "user", "content": "mine"}]},
+        headers=alice,
+    )
+    conversation_id = created.json()["conversation_id"]
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fast",
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "not yours"}],
+        },
+        headers=bob,
+    )
+    assert response.status_code == 404
+
+    detail = await client.get(f"{CONVERSATIONS}/{conversation_id}", headers=alice)
+    assert detail.json()["preferred_slot"] == "general"
+
+
 @pytest.mark.parametrize(
     "method,payload", [("get", None), ("patch", {"title": "x"}), ("delete", None)]
 )

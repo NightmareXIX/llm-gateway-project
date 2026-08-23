@@ -163,8 +163,16 @@ async def create_chat_completion(
             role=message.role,
             content=content,
         )
+    # D33: `preferred_slot` is a display preference the gateway happens to own,
+    # not a routing input — `body.model` is written back every turn regardless
+    # of what it was last time, but it never changes what gets routed to. That
+    # is `pinned_model`'s job, and only `routing.route`'s `pinned=` argument
+    # below reads it; the two columns must never be confused for each other.
     await conversations_repo.touch(
-        session, conversation_id=conversation_id, user_id=principal.user_id
+        session,
+        conversation_id=conversation_id,
+        user_id=principal.user_id,
+        preferred_slot=body.model,
     )
     await session.commit()
 

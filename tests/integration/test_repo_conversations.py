@@ -170,6 +170,53 @@ async def test_touch_rejects_another_users_conversation(
     )
 
 
+async def test_touch_updates_preferred_slot_when_given_one(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    """D33: the activity bump and the preference update are one UPDATE."""
+    user = await user_factory()
+    conversation = await repo.create(db_session, user_id=user.id, preferred_slot="auto")
+
+    assert await repo.touch(
+        db_session, conversation_id=conversation.id, user_id=user.id, preferred_slot="fast"
+    )
+    await db_session.refresh(conversation)
+    assert conversation.preferred_slot == "fast"
+
+
+async def test_touch_leaves_preferred_slot_alone_when_none_is_given(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    """The Phase 1 caller — and any future caller that only wants the activity
+    bump — has no opinion on the slot, and the column must not move under it."""
+    user = await user_factory()
+    conversation = await repo.create(db_session, user_id=user.id, preferred_slot="fast")
+
+    assert await repo.touch(db_session, conversation_id=conversation.id, user_id=user.id)
+    await db_session.refresh(conversation)
+    assert conversation.preferred_slot == "fast"
+
+
+async def test_touch_rejects_another_users_conversation_and_writes_nothing(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    owner = await user_factory()
+    intruder = await user_factory()
+    conversation = await repo.create(db_session, user_id=owner.id, preferred_slot="auto")
+
+    assert (
+        await repo.touch(
+            db_session,
+            conversation_id=conversation.id,
+            user_id=intruder.id,
+            preferred_slot="fast",
+        )
+        is False
+    )
+    await db_session.refresh(conversation)
+    assert conversation.preferred_slot == "auto"
+
+
 async def test_rename_sets_and_clears_the_title(
     db_session: AsyncSession, user_factory: Callable[..., Any]
 ) -> None:

@@ -105,7 +105,13 @@ async def list_for_user(
     return result.scalars().all()
 
 
-async def touch(session: AsyncSession, *, conversation_id: UUID, user_id: UUID) -> bool:
+async def touch(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    user_id: UUID,
+    preferred_slot: str | None = None,
+) -> bool:
     """Mark the conversation as active now. Returns False when it is not theirs.
 
     ``updated_at`` is set explicitly rather than left to the column's
@@ -124,13 +130,27 @@ async def touch(session: AsyncSession, *, conversation_id: UUID, user_id: UUID) 
     transaction it stops hiding: ``create`` and ``touch`` stamp byte-identical
     times, ``list_for_user``'s ``updated_at DESC`` tie-breaks on a random UUID,
     and the sidebar order becomes a coin flip.
+
+    ``preferred_slot`` (D33) rides the same UPDATE rather than a second round
+    trip — the activity bump and the preference update are one unit of work
+    every turn already pays for. It is a **display preference**, not a routing
+    input: the caller passes whatever slot the request named (even ``"auto"``),
+    and this function does not compare it against anything or decide whether it
+    "changed" — the WHERE clause already limits the statement to one row, so
+    writing the same value back costs nothing beyond the UPDATE that was
+    happening anyway. Left ``None``, the column is untouched — the caller from
+    Phase 1's create path, and any future caller that only wants the activity
+    bump, do not have an opinion on the slot.
     """
+    values: dict[str, Any] = {"updated_at": func.clock_timestamp()}
+    if preferred_slot is not None:
+        values["preferred_slot"] = preferred_slot
     result = cast(
         CursorResult[Any],
         await session.execute(
             update(Conversation)
             .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
-            .values(updated_at=func.clock_timestamp())
+            .values(**values)
         ),
     )
     return result.rowcount > 0

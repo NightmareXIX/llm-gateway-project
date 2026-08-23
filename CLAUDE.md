@@ -109,7 +109,7 @@ Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streami
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestone A complete, Milestone B underway — Steps 1–4 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: Milestone A complete, Milestone B underway — Steps 1–5 of 8 committed.** Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -210,6 +210,27 @@ MISS` with two real provider calls; the second leaves the window at its real, la
 is dropped and the pair still produces a `MISS` then a `HIT` — the gate refusing a truncated write
 without breaking caching in general. `make test`, `ruff check`, `ruff format --check`, and `mypy` are
 green.
+
+Step 5 (D33's server half: the thread remembers what you picked) touched exactly the two files
+`phase5.md` names — `db/repo/conversations.py`, `api/v1/chat.py` — plus tests. `conversations_repo.touch`
+gained a fourth keyword, `preferred_slot: str | None = None`, folded into the same `UPDATE` as the
+`updated_at` bump rather than a second round trip; passing `None` (Phase 1's create path, and any future
+caller that only wants the activity bump) leaves the column untouched, and the function does not compare
+the new value against the old one — the WHERE clause already limits the statement to one row, so writing
+the same value back costs nothing beyond the UPDATE that was already happening. `chat.py`'s call site now
+passes `preferred_slot=body.model` on every turn, with a comment on the D33 distinction at the call site:
+a **preference** is what the composer seeds from next time and the user overrides in one click, a **pin**
+is what `routing.route`'s `pinned=` argument enforces and the client cannot override at all — the same
+column must never carry both facts. New tests: `test_repo_conversations.py` covers `touch` writing the
+slot, leaving it alone when `None`, and refusing to move it for a non-owner;
+`test_conversations_endpoints.py::test_preferred_slot_follows_the_last_requested_slot` drives two turns
+under different slots and asserts `GET /v1/conversations/{id}` reflects the second, and
+`test_someone_elses_failed_turn_does_not_move_preferred_slot` confirms a 404'd cross-user turn never
+reaches `touch` at all; `test_chat_endpoint.py::test_a_pinned_conversations_preferred_slot_still_tracks_the_request`
+extends the existing pin test to assert `preferred_slot` keeps recording what was *asked* for
+(`general`) even while the pin silently serves a different model — proving D33 and D3 stay two distinct
+facts rather than converging under a pin. No frontend change — `ConversationView`'s seeding from
+`preferred_slot` is Step 7. `make test`, `ruff check`, `ruff format --check`, and `mypy` are green.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,
