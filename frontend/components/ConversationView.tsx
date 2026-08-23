@@ -18,11 +18,43 @@ import { MessageList, MessageListSkeleton } from "./MessageList";
  * scoped inside the SQL, and a 403 would confirm that the id names something
  * real. So this renders one honest message for both, with a way back, rather
  * than an error that speculates about which it was.
+ *
+ * The picker's starting value is the thread's own `preferred_slot` (D33): pick
+ * `fast` on turn nine, reload, and you come back on `fast` rather than
+ * silently on `auto`. See `modelSlot` below for why that is a derivation and
+ * not a `useEffect`.
  */
 export function ConversationView({ conversationId }: { conversationId: string }) {
   const { conversation, error, isLoading, mutate } = useConversation(conversationId);
   const { models } = useModels();
-  const [modelSlot, setModelSlot] = useState(DEFAULT_SLOT);
+
+  /**
+   * The slot this composer sends on, and the load race it has to survive.
+   *
+   * The conversation arrives *after* first paint, so the two obvious shapes
+   * both break: `useState(conversation?.preferred_slot ?? DEFAULT_SLOT)`
+   * captures `undefined` on the first render and never updates, and a
+   * `useEffect` that syncs on every change stomps a slot the user picked while
+   * the fetch was still in flight.
+   *
+   * So the value is *derived* rather than synchronised. An explicit pick wins
+   * for the thread it was made on; otherwise the stored preference wins once it
+   * loads; otherwise `DEFAULT_SLOT`. There is no effect, nothing to adopt
+   * "once", and navigating to another thread resets it for free, because the
+   * pick is stored against the id it was made under.
+   *
+   * A **preference**, not a pin: this seeds the control and the user overrides
+   * it in one click. `conversations.pinned_model` is the other kind of fact —
+   * a constraint the router enforces and the client cannot override at all —
+   * and it never reaches this state.
+   */
+  const [pick, setPick] = useState<{ conversationId: string; slot: string } | null>(null);
+  const modelSlot =
+    (pick?.conversationId === conversationId ? pick.slot : null) ??
+    conversation?.preferred_slot ??
+    DEFAULT_SLOT;
+  const setModelSlot = (slot: string) => setPick({ conversationId, slot });
+
   const { pending, send, stop, retry, keepPartial, dismiss } = useSendMessage(
     conversationId,
     modelSlot,

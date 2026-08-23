@@ -40,6 +40,13 @@ describe("fromDoneEvent", () => {
       substituted: false,
       attempts: 1,
       degraded: false,
+      // Phase 5's two additions live in `facts` rather than in one of the two
+      // literals below, because that is what makes this test catch trap 8: a
+      // field added to `DoneEvent` and forgotten on the response (or the
+      // reverse) fails here rather than showing up as a streamed answer that
+      // silently discloses less.
+      messages_dropped: 148,
+      warning: "conversation pinned to gemini/gemini-3.6-flash due to prior tool use",
     };
 
     const done: DoneEvent = {
@@ -63,6 +70,29 @@ describe("fromDoneEvent", () => {
     // Same answer, two transports, one render. If this ever diverges, the
     // indicator is showing a streamed answer less than it shows a stored one.
     expect(fromDoneEvent(done)).toEqual({ ...fromCompletion(response), attemptTrail: undefined });
+    // And the two new fields really arrived, rather than both defaulting to
+    // the same nothing and agreeing vacuously.
+    expect(fromDoneEvent(done).messagesDropped).toBe(148);
+    expect(fromDoneEvent(done).warning).toBe(facts.warning);
+  });
+
+  it("defaults both Phase 5 fields when a `done` event omits them", () => {
+    // The gateway always writes them, but they are optional on the wire type
+    // for the same reason `extraction_tier` is: a response from before the
+    // field existed must render as "nothing to disclose", not as `undefined`
+    // reaching the indicator.
+    const done: DoneEvent = {
+      served_by: { slot: "general", provider: "groq", model: "openai/gpt-oss-120b" },
+      requested_slot: "auto",
+      substituted: false,
+      attempts: 1,
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, estimated: false },
+      degraded: false,
+      status: "ok",
+    };
+
+    expect(fromDoneEvent(done).messagesDropped).toBe(0);
+    expect(fromDoneEvent(done).warning).toBeNull();
   });
 
   it("carries the tokens a discarded attempt really spent", () => {

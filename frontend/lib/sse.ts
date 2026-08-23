@@ -56,6 +56,12 @@ export type DoneEvent = {
   /** How the turn's attachments reached the model (Phase 4): the worst tier of
    * `cache` | `native` | `llm` | `local`, or null when it carried none. */
   extraction_tier?: ExtractionTier | null;
+  /** D34's streaming twin of the completion response's own field: how many
+   *  older turns D4's fitting dropped to build this answer. */
+  messages_dropped?: number;
+  /** D32's streaming twin: the pin disclosure. Rides on a successful stream —
+   *  it is not an error, and must not be rendered as one (trap 6). */
+  warning?: string | null;
   status: "ok" | "failed";
   /** Present only on `status: "failed"` with a non-trivial partial buffer. */
   partial_content?: string;

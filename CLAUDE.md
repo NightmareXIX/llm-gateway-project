@@ -109,7 +109,7 @@ Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streami
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestones A and B complete, Milestone C underway — Steps 1–6 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: Milestones A and B complete, Milestone C underway — Steps 1–7 of 8 committed.** Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -269,6 +269,47 @@ the disclosure when a pin overrides `auto`, and is null again once a later turn 
 already resolves to, plus new `test_an_unpinned_turn_carries_no_warning` and
 `test_a_pinned_conversations_done_event_carries_the_warning_too` for the streaming twin. No frontend
 change — Step 7. `make test`, `ruff check`, `ruff format --check`, and `mypy` are green.
+
+Step 7 (the frontend: truncation, pinning, and the remembered slot) touched exactly the files
+`phase5.md` names — `frontend/lib/types.ts`, `frontend/lib/sse.ts`, `frontend/lib/provenance.ts`,
+`frontend/components/ModelIndicator.tsx`, `frontend/components/ConversationView.tsx`,
+`frontend/lib/hooks.ts` — plus `frontend/tests/`. `MessageMeta` gained a required
+`messages_dropped: number` (every reader already takes it as `Partial<MessageMeta>`, so an absent key
+on a pre-Phase-5 row reads back as `0` — trap 7's client half); `ChatCompletionResponse` and
+`DoneEvent` gained `messages_dropped?`/`warning?` as *optional* fields, the same shape
+`extraction_tier` already has, so a response written before the field existed renders as "nothing to
+disclose" rather than putting `undefined` in front of the indicator. `Provenance` gained
+`messagesDropped: number` and `warning: string | null`, populated in all four constructors:
+`fromCompletion`/`fromDoneEvent` read them off the wire, `fromMetaEvent` reports `0`/`null` because
+the `meta` event carries neither, and `fromMessageMeta` reads the count off the row but hard-codes
+`warning: null` — the warning is about *this request* (which slot it asked for, and what the pin did
+to that) and a stored row has no request to disclose against, so there is no key to read and nothing
+to invent. `ModelIndicator` gained rules 5 and 6 beside the four §1.1 froze, both in the *disclosure*
+register the degraded notice already occupies rather than as errors (trap 6): `messagesDropped > 0`
+renders "N earlier messages omitted" — the integer D34 argued for, with `truncationLabel`/
+`truncationDetail` keeping the singular case from reading "1 earlier messages" — and `warning`
+renders the gateway's own wording verbatim, since `selection.pin_warning` builds it in one place
+precisely so the model name in it is the real one. `ConversationView` now opens on the thread's
+stored `preferred_slot` (D33). Trap 10's race is handled by *deriving* the value rather than
+synchronising it — `pick?.conversationId === conversationId ? pick.slot : null` ?? `preferred_slot`
+?? `DEFAULT_SLOT` — so an explicit choice wins for the thread it was made on, the stored preference
+wins once it loads, there is no `useEffect` to stomp a pick made while the fetch was in flight, and
+navigating to another thread resets it for free because the pick is held against the id it was made
+under. `NewConversation` keeps `DEFAULT_SLOT`; there is no thread to remember yet. `hooks.ts`'s
+optimistic turn now also mirrors `messages_dropped` onto the local `meta` (for the same reason it
+already mirrors `extraction_tier`: an answer built on two thirds of a thread must not look
+whole-history for the second before the refetch lands), and the optimistic `preferred_slot` write
+kept its value and gained a comment saying it now mirrors a persisted column rather than inventing
+one. New tests: `ModelIndicator.test.tsx` gained truncation and pin-warning cases (including the
+singular, the zero case, and both fields arriving off `done`) plus adapter cases for an absent
+`messages_dropped` reading `0` and a stored row never carrying a warning; `provenance.test.ts` moved
+both new fields into the shared `facts` object of the two-transport agreement test, so a field added
+to `DoneEvent` and forgotten on the response fails there rather than showing up as a streamed answer
+that silently discloses less (trap 8's client half); new `frontend/tests/ConversationView.test.tsx`
+covers the six slot-seeding states, asserting both what the picker shows and which slot
+`useSendMessage` was actually handed. `make frontend-test` (99 passing), `make frontend-lint`,
+`next build`, `make test`, `ruff check`, `ruff format --check` and `mypy` are green; the
+definition-of-done's live-browser confirmation of steps 4 and 5 is not something this pass ran.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,

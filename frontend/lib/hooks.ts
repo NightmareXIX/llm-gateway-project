@@ -585,6 +585,10 @@ async function applyOptimisticTurn({
           // answer that says "read by local OCR" must not lose that label for
           // the second between `done` and the revalidation.
           extraction_tier: done.extraction_tier ?? null,
+          // And the truncation one (D34), for exactly the same reason: an
+          // answer built on two thirds of the thread must not look like a
+          // whole-history answer for the second before the refetch lands.
+          messages_dropped: done.messages_dropped ?? 0,
         } satisfies Partial<MessageMeta>,
         created_at: now,
       };
@@ -596,6 +600,12 @@ async function applyOptimisticTurn({
         : {
             id: conversationId,
             title: null,
+            // No longer a guess. Phase 5 (D33) made `preferred_slot` a column
+            // the gateway updates on every turn from the request's own `model`,
+            // so this optimistic value now *mirrors* what the revalidation will
+            // return rather than inventing something the server never stored.
+            // Kept rather than dropped: the refetch is a round trip away, and
+            // the composer reads this to decide which slot it opens on.
             preferred_slot: done.requested_slot,
             pinned_model: null,
             created_at: now,

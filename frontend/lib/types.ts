@@ -89,6 +89,14 @@ export type MessageMeta = {
   wasted_tokens_out: number;
   degraded: boolean;
   extraction_tier: ExtractionTier | null;
+  /**
+   * How many older turns D4's fitting step dropped to build this answer
+   * (Phase 5, D34). Absent on a row written before the field existed, and
+   * `Partial<MessageMeta>` is how every reader here already takes it — an
+   * absent key reads as `0`, which asserts the default rather than asserting
+   * that nothing was dropped.
+   */
+  messages_dropped: number;
 };
 
 export type MessageRole = "system" | "user" | "assistant";
@@ -199,6 +207,13 @@ export type ChatCompletionResponse = {
   degraded: boolean;
   /** Field-for-field with the `done` event's own, per §1.1. */
   extraction_tier?: ExtractionTier | null;
+  /** How many older turns D4's fitting dropped to build this answer (D34).
+   *  Always `0` on a cache hit — nothing was rendered that turn. */
+  messages_dropped?: number;
+  /** D3/D32: set when the conversation is pinned and the pin overrode what
+   *  this turn asked for. A disclosure riding on a 200, never an error — it
+   *  must not render as a failure (trap 6). */
+  warning?: string | null;
 
   conversation_id: string;
   message_id: string;

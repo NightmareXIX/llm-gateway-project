@@ -31,6 +31,23 @@ import { VisuallyHidden } from "./ui/VisuallyHidden";
  *      disclosed whenever there is one, degraded or not — the same reasoning
  *      that makes `served_by` unconditional.
  *
+ * Phase 5 adds two more, both of them the same rule 4 applied to two more
+ * facts the gateway knows and the user cannot see:
+ *
+ *   5. `messagesDropped > 0` → say how much of the conversation the model was
+ *      *not* shown. D4 chose truncation over summarization because truncation
+ *      is testable; the price it accepted is an answer built on part of a
+ *      thread, and D34 says that price is disclosed rather than absorbed. The
+ *      count, not a boolean — "148 earlier messages omitted" is worth reading
+ *      and "some earlier messages were omitted" is not.
+ *   6. `warning` → render it. D3's pin is a constraint the client cannot see
+ *      and cannot override, so the one turn it silently redirects is exactly
+ *      the turn that has to say so.
+ *
+ * Both are **disclosures on a successful answer**, not errors (trap 6). They
+ * ride on a 200 with real content under them and belong in the register the
+ * degraded notice already occupies — never a `TurnErrorCard`.
+ *
  * Everything it needs arrives as one `Provenance` object, built by an adapter in
  * `lib/provenance.ts`. That indirection is what lets a stored message, a
  * completion response and (in Phase 2) a `done` event all render through the
@@ -50,6 +67,8 @@ export function ModelIndicator({
     attempts,
     degraded,
     extractionTier,
+    messagesDropped,
+    warning,
     tokensIn,
     tokensOut,
   } = provenance;
@@ -145,6 +164,29 @@ export function ModelIndicator({
         )
       )}
 
+      {/* Rule 5 — how much of the conversation the model never saw (D4/D34). */}
+      {messagesDropped > 0 && (
+        <>
+          <Separator />
+          <Tooltip content={<span>{truncationDetail(messagesDropped)}</span>}>
+            <span
+              tabIndex={0}
+              className="cursor-help rounded border-b border-dotted border-warn font-medium text-warn"
+            >
+              {truncationLabel(messagesDropped)}
+            </span>
+          </Tooltip>
+        </>
+      )}
+
+      {/* Rule 6 — the pin (D3/D32). A disclosure on a real answer, not an error. */}
+      {warning && (
+        <>
+          <Separator />
+          <span className="font-medium text-warn">{warning}</span>
+        </>
+      )}
+
       {(tokensIn !== null || tokensOut !== null) && (
         <>
           <Separator />
@@ -157,6 +199,26 @@ export function ModelIndicator({
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * D4's omission, said in one line.
+ *
+ * The count is in the label rather than behind the tooltip because it is the
+ * part worth reading: "148 earlier messages omitted" tells a user their thread
+ * effectively restarted, and "some earlier messages were omitted" does not.
+ */
+function truncationLabel(dropped: number): string {
+  return dropped === 1 ? "1 earlier message omitted" : `${dropped} earlier messages omitted`;
+}
+
+/** Why it happened, and what survived — the part that only matters on demand. */
+function truncationDetail(dropped: number): string {
+  const subject = dropped === 1 ? "the oldest message was" : `the ${dropped} oldest messages were`;
+  return (
+    `This conversation is longer than the answering model's context window, so ${subject} ` +
+    "left out of what it was shown. The system prompt and the most recent turns were kept."
   );
 }
 

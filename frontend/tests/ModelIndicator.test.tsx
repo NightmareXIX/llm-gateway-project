@@ -32,6 +32,8 @@ const BASE: Provenance = {
   attempts: 1,
   degraded: false,
   extractionTier: null,
+  messagesDropped: 0,
+  warning: null,
   tokensIn: 812,
   tokensOut: 340,
   wastedTokensOut: 0,
@@ -68,6 +70,8 @@ describe("rule 1 — served_by is always rendered", () => {
     expect(screen.queryByText(/was unavailable/)).not.toBeInTheDocument();
     expect(screen.queryByText(/attempts/)).not.toBeInTheDocument();
     expect(screen.queryByText(/local extraction/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/omitted/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/pinned/)).not.toBeInTheDocument();
   });
 });
 
@@ -173,6 +177,70 @@ describe("rule 4 — degraded says so, and says why", () => {
   });
 });
 
+describe("rule 5 — truncation says how much was dropped", () => {
+  it("names the number of omitted messages, not just that some were", () => {
+    // D34's whole argument in one assertion: an integer on the wire because
+    // "148 earlier messages omitted" is a sentence worth reading and "some
+    // earlier messages were omitted" is not.
+    render(<ModelIndicator provenance={{ ...BASE, messagesDropped: 148 }} />);
+
+    expect(screen.getByText("148 earlier messages omitted")).toBeInTheDocument();
+  });
+
+  it("says nothing when the whole history reached the model", () => {
+    render(<ModelIndicator provenance={{ ...BASE, messagesDropped: 0 }} />);
+
+    expect(screen.queryByText(/omitted/)).not.toBeInTheDocument();
+  });
+
+  it("does not say '1 earlier messages'", () => {
+    render(<ModelIndicator provenance={{ ...BASE, messagesDropped: 1 }} />);
+
+    expect(screen.getByText("1 earlier message omitted")).toBeInTheDocument();
+  });
+
+  it("discloses truncation on a turn that is otherwise perfectly ordinary", () => {
+    // The case that matters: nothing failed, nothing was substituted, no
+    // attachment was involved — the answer just wasn't built on the whole
+    // thread, and that is the only thing wrong with it.
+    render(<ModelIndicator provenance={{ ...BASE, messagesDropped: 12 }} />);
+
+    expect(screen.getByText("GPT-OSS 120B")).toBeInTheDocument();
+    expect(screen.getByText("12 earlier messages omitted")).toBeInTheDocument();
+    expect(screen.queryByText(/was unavailable/)).not.toBeInTheDocument();
+  });
+});
+
+describe("rule 6 — a pinned conversation discloses its pin", () => {
+  const WARNING = "conversation pinned to gemini/gemini-3.6-flash due to prior tool use";
+
+  it("renders the gateway's own wording verbatim", () => {
+    // Deliberately not reworded here. The server builds this string in one
+    // place (`selection.pin_warning`) precisely so the model name in it is the
+    // real one; a client that paraphrased would have to know the pin's shape.
+    render(<ModelIndicator provenance={{ ...BASE, warning: WARNING }} />);
+
+    expect(screen.getByText(WARNING)).toBeInTheDocument();
+  });
+
+  it("says nothing on an unpinned turn", () => {
+    render(<ModelIndicator provenance={{ ...BASE, warning: null }} />);
+
+    expect(screen.queryByText(/pinned/)).not.toBeInTheDocument();
+  });
+
+  it("is a disclosure on a real answer, not an error (trap 6)", () => {
+    // The indicator still renders everything it renders for a normal turn.
+    // A pinned answer is a *served* answer; the warning sits beside the
+    // provenance, in the same register as the degraded notice.
+    render(<ModelIndicator provenance={{ ...BASE, warning: WARNING }} />);
+
+    expect(screen.getByText("GPT-OSS 120B")).toBeInTheDocument();
+    expect(screen.getByText("Groq")).toBeInTheDocument();
+    expect(screen.getByText(WARNING)).toBeInTheDocument();
+  });
+});
+
 describe("provenance adapters", () => {
   const meta: MessageMeta = {
     provider_used: "groq",
@@ -186,6 +254,7 @@ describe("provenance adapters", () => {
     wasted_tokens_out: 0,
     degraded: false,
     extraction_tier: null,
+    messages_dropped: 0,
   };
 
   it("builds provenance from a stored message's meta", () => {
@@ -194,6 +263,26 @@ describe("provenance adapters", () => {
 
   it("carries the extraction tier off a stored row", () => {
     expect(fromMessageMeta({ ...meta, extraction_tier: "llm" })?.extractionTier).toBe("llm");
+  });
+
+  it("carries a stored truncation count off the row", () => {
+    expect(fromMessageMeta({ ...meta, messages_dropped: 148 })?.messagesDropped).toBe(148);
+  });
+
+  it("reads a pre-Phase-5 row's missing truncation count as 0, not as unknown", () => {
+    // Trap 7: nobody knows whether a row written before the field existed was
+    // truncated, and there is no backfill. The default is the honest reading.
+    const withoutCount: Partial<MessageMeta> = { ...meta };
+    delete withoutCount.messages_dropped;
+
+    expect(fromMessageMeta(withoutCount)?.messagesDropped).toBe(0);
+  });
+
+  it("never reads a pin warning off a stored row", () => {
+    // The warning is about *this request* — which slot it asked for, and what
+    // the pin did to that. A stored row has no request to disclose against, so
+    // there is no key to read and nothing to invent.
+    expect(fromMessageMeta(meta)?.warning).toBeNull();
   });
 
   it("reads a pre-Phase-4 row's missing tier as no attachment, not as unknown", () => {
@@ -297,5 +386,26 @@ describe("a restarted stream, end to end", () => {
     );
 
     expect(screen.getByText("read by another model")).toBeInTheDocument();
+  });
+
+  it("carries the truncation count and the pin warning off `done` too", () => {
+    // Trap 8's client-side half: `DoneEvent` gained two fields, and a streamed
+    // answer must disclose exactly what the non-streaming one does. If this
+    // ever renders less than `fromCompletion`'s twin, the streaming path is
+    // quietly the less honest of the two.
+    render(
+      <ModelIndicator
+        provenance={fromDoneEvent({
+          ...done,
+          messages_dropped: 148,
+          warning: "conversation pinned to gemini/gemini-3.6-flash due to prior tool use",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("148 earlier messages omitted")).toBeInTheDocument();
+    expect(
+      screen.getByText("conversation pinned to gemini/gemini-3.6-flash due to prior tool use"),
+    ).toBeInTheDocument();
   });
 });
