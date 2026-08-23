@@ -100,16 +100,30 @@ docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ hol
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 5 — Memory & Cross-Provider Translation
+## Current phase: Phase 6 — BYOK Settings
+
+Not started. Per `development-plan.md` §3 Phase 6 (§9 implemented end to end): `provider_keys` and
+`user_quota_allocations` migrations, encryption at rest for a user's own provider keys,
+`resolve_provider_key(user_id, provider)` called on every request (no caching at login), quota
+branching between the shared pool and a user's private cap, a rate-limited key-validation endpoint, and
+`/v1/models` personalization so a private key surfaces a slot others don't see. No `phase6.md` has been
+written yet — Phase 5 left `keys_resolution/resolver.py` as the empty package this phase's first file
+goes into, and `scope` as the one constant (`keys.SYSTEM_SCOPE`) every call site in both lanes still
+passes, per `phase5.md` §9.
+
+## Phase 5 — Memory & Cross-Provider Translation — complete
 
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), Phase 3
 (quota-aware routing), and Phase 4 (the perception lane, below) are done and merged. Phase 5
 (conversations surviving a provider switch, per `project-overview.md` §4.7 and
-`development-plan.md` §3 Phase 5) is next per the phased build plan. Full step-by-step account,
+`development-plan.md` §3 Phase 5) is also done and merged. Full step-by-step account,
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestones A and B complete, Milestone C underway — Steps 1–7 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: all three milestones complete — Steps 1–8 of 8 committed.** **Milestone A** (Steps 1–2, one
+history proved across every provider), **Milestone B** (Steps 3–5, the thread remembers and says what it
+forgot), and **Milestone C** (Steps 6–8, the pin's write path, the frontend, and the documentation
+explaining why the hard case is not solved). Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -310,6 +324,26 @@ covers the six slot-seeding states, asserting both what the picker shows and whi
 `useSendMessage` was actually handed. `make frontend-test` (99 passing), `make frontend-lint`,
 `next build`, `make test`, `ruff check`, `ruff format --check` and `mypy` are green; the
 definition-of-done's live-browser confirmation of steps 4 and 5 is not something this pass ran.
+
+Step 8 (ADRs, docs, and the limitations entry) touched no application code, per the step's own scope —
+`tests/`, `app/`, and `frontend/` are all untouched by this commit. Three ADRs landed:
+[ADR-031](docs/decisions/ADR-031-cross-provider-golden-matrix.md) (D31 — why the golden matrix renders
+through `render()` instead of asserting `build_payload` directly, and why the per-adapter suites stay
+rather than fold in), [ADR-032](docs/decisions/ADR-032-pinning-without-tool-calls.md) (D32 — the
+circular problem of a pin whose trigger no history v1 can store, and why a complete, reachable mechanism
+with one deferred trigger beat both a pure seam and unfreezing `RESERVED_BLOCK_TYPES`), and
+[ADR-033](docs/decisions/ADR-033-truncation-disclosed-and-uncached.md) (D34 + D35 together, argued as one
+fact reaching two destinations — the wire disclosure and the cache's write-side gate). D33
+(`preferred_slot`) gets no ADR of its own, by design — ADR-032's consequences section says why:
+it is a bug fix with a comment, not a decision with live alternatives. `docs/limitations.md`'s
+"Explicitly out of scope for v1" tool-call paragraph was promoted to its own section carrying the actual
+reasoning (incompatible per-provider schemas, no lossless answer for *parallel* calls specifically, what
+production gateways do instead), and a new section documents truncation-as-disclosed-degradation
+alongside D35's cache gate. `docs/architecture.md` gained a "Phase 5: one history, three shapes" section
+— a diagram of one canonical history rendering into three provider-specific payload shapes, with the
+system message's two positions (Gemini's top-level `system_instruction` vs. the OpenAI-shaped in-array
+`role: "system"`) as the one divergence the canonical schema exists to absorb. `README.md` gained a
+cross-provider continuity section framed around the same demo the phase's definition of done names.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,

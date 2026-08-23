@@ -222,3 +222,59 @@ and third renders of one turn mostly hit the in-memory memo before this flowchar
 the common case, a second turn about an already-read document, never calls `ObjectStore.get` at all.
 A chain that falls from tier 1 through to tier 3 still only downloads once, held by `_Lazy` across the
 tiers that share the need.
+
+## Phase 5: one history, three shapes
+
+Everything above this section describes how one attempt gets from a candidate to an answer. This
+section is about the input side of that same attempt: one stored `CanonicalMessage` list, rendered
+fresh for whichever provider the failover loop is about to try — never a second copy stored per
+provider, never a translation cached from a previous attempt.
+
+```mermaid
+flowchart TD
+    History[("Canonical history\none row per message\nDB, ordered by seq")]
+    History --> Render["render() -- six steps\n(Contract B, memory/render.py)"]
+
+    Render --> Gemini["Gemini adapter"]
+    Render --> Groq["Groq adapter"]
+    Render --> OpenRouter["OpenRouter adapter"]
+
+    Gemini --> GP["contents / parts\ntop-level system_instruction\nno role:\"system\" entry anywhere"]
+    Groq --> GrP["messages[]\nmessages[0].role == \"system\"\nno top-level system field"]
+    OpenRouter --> OP["messages[]\nmessages[0].role == \"system\"\nno top-level system field"]
+
+    classDef shape fill:#2f6f4f,color:#fff,stroke:none;
+    class GP,GrP,OP shape;
+```
+
+**The system message's two positions are the one divergence the canonical schema exists to absorb.**
+Contract B stores exactly one system message, always `seq = 0`, with no opinion on where a provider
+wants it — Gemini lifts it out of the message list entirely into a top-level `system_instruction`
+field; Groq and OpenRouter, both OpenAI-shaped, leave it in place as `messages[0]`. Nothing about the
+stored row changes between the two; `render()`'s adapter step is the only place that decision is made,
+and it is made fresh on every single attempt — never cached, never decided once and reused, because the
+provider about to be tried can change mid-request under D1/D2 and the shape has to follow it.
+
+**A `file_ref` has no shape at all until render step 1 resolves it — proven by the golden matrix
+(D31, [ADR-031](decisions/ADR-031-cross-provider-golden-matrix.md)).** The same stored block renders as
+Gemini's `inline_data` when the file is native to that model, and as an injected `<document>` envelope
+in the text of a provider that cannot read it — `tests/contract/test_cross_provider_matrix.py` asserts
+that envelope is byte-identical across Groq and OpenRouter, the two providers it is injected for, which
+is the concrete form of "one history, three shapes" this section is named after.
+
+**The omission marker (D4) is the same story with no native representation on any provider.** A
+history too long for the candidate's context window loses its oldest non-system messages and gains one
+`[N earlier messages omitted]` line rendered into the surviving text — the exact line
+`test_the_omission_marker_survives_into_every_providers_payload_text` finds identically in all three
+payloads, because there is no `omitted_messages` field on any provider's wire format for `render()` to
+target instead. `RenderReport.messages_dropped` carries the same count out of `render()` and off the wire
+to the client (D34, [ADR-033](decisions/ADR-033-truncation-disclosed-and-uncached.md)) — the same
+mechanism, read twice: once to build the marker a model reads, once to build the number a user reads.
+
+**Continuity across a provider switch is a consequence of this diagram, not a separate mechanism.**
+`api/v1/chat.py` loads the full stored history once per turn and calls `render()` once per attempt;
+switching from `fast` to `general` mid-conversation, or failing over from Gemini to OpenRouter inside
+one attempt, changes only which box on the right the same boxed history flows into. Nothing about the
+history itself is provider-shaped at rest, which is the property `tests/integration/test_chat_endpoint.py`'s
+`test_a_thread_survives_a_provider_switch` exercises end to end: three turns, three different served
+providers, turn one's own words still present in what turn three's payload carries.

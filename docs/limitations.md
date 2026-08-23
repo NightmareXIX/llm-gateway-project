@@ -212,18 +212,62 @@ visible disclosure in the UI once that lane exists rather than a line buried her
 
 ---
 
+## Tool calls across providers
+
+**Not a formality — a genuinely unsolved problem this project scopes around rather than pretends to
+solve.** OpenAI, Gemini, and Groq/OpenRouter's OpenAI-compatible surface each represent a tool call, a
+tool result, and — the specific case with no lossless answer — *parallel* tool calls in one turn with
+incompatible shapes: different fields for call IDs, different rules for how a result correlates back to
+its call, different (or absent) support for more than one call per turn at all. Translating losslessly
+between them is not a gap in this gateway's effort; production multi-provider gateways solve the same
+problem the same way this one does, by picking one provider per conversation once tool use starts rather
+than by inventing a canonical tool-call schema every provider's wire format can round-trip through.
+
+**What the gateway does instead: pin, disclose, never translate.** D3 (`contracts-and-phase1.md` §1) is
+locked: the first message in a conversation's history carrying tool-call content pins
+`conversations.pinned_model` to whichever model produced it, and every later turn in that conversation
+ignores slot selection — `auto` included — until the conversation ends. `routing/selection.py` has
+honoured a pin since Phase 2; Phase 5 (D32, [ADR-032](decisions/ADR-032-pinning-without-tool-calls.md))
+built the write side — `canonical.pin_target`, `conversations_repo.set_pinned`, and the `warning` field
+disclosing *why* a request for a different slot was silently overridden. No later turn is ever asked to
+carry tool-call history across a provider boundary, because no later turn is ever routed to a different
+provider in the first place.
+
+**The trigger has never fired outside a unit test, and that is by design, not an oversight.** `parse_block`
+rejects `tool_call` and `tool_result` at the database boundary — `RESERVED_BLOCK_TYPES` — and
+`ChatCompletionRequest` accepts no `tools` field, so no history v1 can store and no request v1 can accept
+will ever carry the content `pin_target` looks for. The pin's write path is complete and reachable code
+today; only the condition that would trigger it is unbuilt, because D3 and this phase's own scope both say
+tool calls are not v1's problem to solve. ADR-032 has the full reasoning for why a complete mechanism with
+one deferred trigger was chosen over either leaving the whole feature as a seam or unfreezing the reserved
+block types to build tool calls as a side effect of finishing this one.
+
+## Truncation is disclosed, and a truncated answer is never cached
+
+**D4 chose truncation over summarization, and the honest cost of that choice used to be invisible.**
+Dropping the oldest non-system messages and inserting a visible omission marker is testable in a way
+summarizing them never would be — but before Phase 5 (D34,
+[ADR-033](decisions/ADR-033-truncation-disclosed-and-uncached.md)), the only place that cost was recorded
+was a log line. A user reading a coherent-sounding answer had no way to know it was built on two thirds of
+what they actually said. `messages_dropped` now takes the same three-hop path `extraction_tier` already
+took in Phase 4 — the stored `meta`, both response shapes, the `done` event, and the frontend indicator —
+so "148 earlier messages omitted" is something the client can read, not just something the gateway once
+computed and forgot. `app/memory/summarize.py` stays the unbuilt §2.2.7 seam this disclosure exists in
+place of, not instead of solving.
+
+**A truncated answer can no longer poison the cache for a differently-truncated request that looks
+identical.** Two byte-identical `temperature: 0` requests under `auto` can resolve to two different
+servers with two different context windows — Gemini's 1M tokens versus Groq's 128k — and one can be built
+on a whole thread while the other is built on its last twenty turns. `cache/exact.py`'s `request_hash`
+folds in the requested slot and the full history, deliberately (ADR-023), and cannot tell those two
+requests apart on that basis alone. D35 closes the gap on the write side: `is_cacheable` now refuses to
+cache a turn whose `RenderReport.truncated` was true, the same shape `degraded` already had — so a partial
+answer cannot be replayed for up to `EXACT_CACHE_TTL_S` to a request that might have gotten the whole
+history. The read side gets no equivalent gate — a stored entry is by construction a whole-history answer,
+since the write side already refused anything else — and ADR-033 explains why that asymmetry is correct
+rather than an inconsistency.
+
 ## Explicitly out of scope for v1
-
-**Tool-call history across providers.** Incompatible schemas between providers make lossless
-translation of tool/function-call history a genuinely unsolved problem in production gateways, not just
-this one. D3's answer — the first tool call pins `conversations.pinned_model`, and every later turn in
-that conversation ignores slot selection — is a documented limitation rather than a broken translation
-attempt. Being able to say *why* this was scoped out, not just that it was, is the stronger position.
-
-**Context-window mismatches are truncated, not summarized.** D4 drops the oldest non-system messages and
-inserts a visible omission marker. Summarizing older turns into a compact system message instead is
-designed as a seam (`app/memory/summarize.py`) but deliberately not built — it costs quota on every
-switch to a smaller-context model and adds a failure mode (a bad summary) that truncation does not have.
 
 **No file management UI, no summarization, no BYOK, no audio/video/office formats, no async
 extraction.** The perception lane (Phase 4) deliberately stops short of a file browser or a delete

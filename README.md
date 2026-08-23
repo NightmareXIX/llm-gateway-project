@@ -12,7 +12,7 @@ Full design docs live in [`doc/reference/`](doc/reference/) — start with
 everything else is built against. Decision records are in [`docs/decisions/`](docs/decisions/);
 the honest-edges document is [`docs/limitations.md`](docs/limitations.md).
 
-*(This README covers two interview questions in depth for now — the architecture diagrams, full
+*(This README covers three interview questions in depth for now — the architecture diagrams, full
 request-flow walkthrough, and "Design Decisions" index it will eventually carry are Phase 7 work,
 tracked in [`doc/reference/development-plan.md`](doc/reference/development-plan.md).)*
 
@@ -76,6 +76,42 @@ A unit test exercises the claim directly rather than taking it on faith: fifty c
 `reserve()` calls against a limit of ten grant exactly ten (`tests/unit/test_quota_tracker.py`).
 That test is the actual point of the Lua script, and it is the test that would fail first if the
 atomicity were ever accidentally lost to a refactor.
+
+## Why does the same history come out looking different for every provider?
+
+The gateway stores one shape of conversation — a canonical schema (Contract B) that is deliberately
+provider-agnostic — and never a provider's own request body. Every payload any provider ever receives is
+built fresh, per attempt, from that one stored history, through a single six-step pipeline
+(`app/memory/render.py`). That is what makes switching providers mid-conversation, whether by a user
+picking a different slot or by D1/D2's own failover firing mid-request, a non-event for the data: the
+history a Gemini attempt sees and the history a Groq attempt sees three messages later are the same rows,
+rendered twice.
+
+The interesting part is what "rendered" has to mean once the shapes genuinely disagree. Gemini lifts the
+system message out of the message list into a top-level `system_instruction` field; Groq and OpenRouter,
+both OpenAI-shaped, leave it as `messages[0]`. A `file_ref` has no shape at all until render decides
+whether the candidate about to be tried can read the bytes natively or needs them injected as text — the
+same stored block becomes Gemini's `inline_data` for one attempt and a `<document>`-wrapped extraction in
+the next provider's prompt text a moment later, with no second upload and no second extraction call.
+Context-window overflow gets the same treatment: the oldest messages are dropped and a plain-text
+omission marker takes their place, because none of the three wire formats has a field for "some of this
+was cut" — the marker is prose because prose is the one representation every provider actually reads.
+
+A single test asserts the claim directly rather than trusting each adapter's own unit tests to add up to
+it: `tests/contract/test_cross_provider_matrix.py` renders one fixed history through `render()` against
+all three adapters, with and without an attachment, and pins six golden payloads plus three structural
+properties — where the system message lands, that the omission marker survives into all three payload
+texts identically, and that the extracted-document envelope is byte-for-byte identical between the two
+providers it gets injected for. The reasoning for testing at the render boundary rather than at each
+adapter's `build_payload` is in
+[ADR-031](docs/decisions/ADR-031-cross-provider-golden-matrix.md); the "one history, three shapes"
+diagram is in [`docs/architecture.md`](docs/architecture.md).
+
+The demo this proves: start a conversation on `fast` (Groq), ask something, get an answer. Switch to
+`general` and ask what you said first — the answer quotes it, and `served_by` names a different provider
+than the one that answered turn one. Attach a PDF on the first turn and ask about it on the second — the
+same uploaded bytes render natively for one model and as extracted text for the other, with one upload
+and one extraction between them.
 
 ## Running it
 
