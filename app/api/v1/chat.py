@@ -328,13 +328,16 @@ async def create_chat_completion(
     await session.commit()
 
     # D19's write: only when the pre-call check passed *and* this particular
-    # answer turned out non-degraded — the one half of `is_cacheable` that
-    # could not be known until now.
+    # answer turned out non-degraded and non-truncated (D35) — the two halves
+    # of `is_cacheable` that could not be known until now.
     if (
         cache is not None
         and cache_key is not None
         and exact.is_cacheable(
-            temperature=body.temperature, history=history, degraded=outcome.report.degraded
+            temperature=body.temperature,
+            history=history,
+            degraded=outcome.report.degraded,
+            truncated=outcome.report.truncated,
         )
     ):
         await cache.put(

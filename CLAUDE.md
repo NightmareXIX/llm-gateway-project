@@ -109,7 +109,7 @@ Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streami
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestone A complete, Milestone B underway — Steps 1–3 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: Milestone A complete, Milestone B underway — Steps 1–4 of 8 committed.** Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -186,6 +186,30 @@ agree), `test_streaming_done_event_discloses_the_same_truncation` (the `done` ev
 criterion, named literally. Two new unit tests in `tests/unit/test_canonical.py` cover the
 `MessageMeta` round trip and the absent-key default. `make test`, `ruff check`, `ruff format --check`,
 and `mypy` are green.
+
+Step 4 (D35: truncation and the exact cache) touched exactly the three files `phase5.md` names —
+`cache/exact.py`, `api/v1/chat.py`, `streaming/collector.py` — plus tests. `is_cacheable` gained a third
+parameter, `truncated: bool = False`, refusing to cache whenever it is `True`; the read side at both
+call sites in `chat.py` still supplies neither `degraded` nor `truncated` and defaults permissive on
+both, since a stored entry is by construction a whole-history answer and a second gate on the read side
+would be dead code. The non-streaming write side now passes `truncated=outcome.report.truncated`
+alongside the existing `degraded=`. The streaming write side has no parallel `StreamResult.truncated`
+field — `Collector._persist_success`'s cache-write gate was extended to `not result.degraded and
+result.messages_dropped == 0`, reusing the field Step 3 already threaded onto `StreamResult` rather than
+adding a second one carrying the same fact. Two new unit tests in `tests/unit/test_exact_cache.py` cover
+`truncated=True` refusing on its own and the two axes (`degraded`/`truncated`) refusing independently.
+Two new integration tests in `tests/integration/test_chat_cache.py` —
+`test_a_truncated_turn_is_never_cached` and `test_an_untruncated_turn_over_a_long_history_still_caches`
+— drive the same seeded-long-history shape Step 3's tests built, but as two separately-seeded
+conversations rather than one growing thread: `request_hash` keys on content and never on
+`conversation_id` (D19), so two conversations built from the same deterministic `_seed_history` shape
+hash identically, which is what lets "the same question asked twice" be asserted without a growing
+history changing the hash out from under the test. The first test shrinks the slot's context window
+(`_shrink_context`) so the fitting step drops messages on both requests and both come back `X-Cache:
+MISS` with two real provider calls; the second leaves the window at its real, large default so nothing
+is dropped and the pair still produces a `MISS` then a `HIT` — the gate refusing a truncated write
+without breaking caching in general. `make test`, `ruff check`, `ruff format --check`, and `mypy` are
+green.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,

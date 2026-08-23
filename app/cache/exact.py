@@ -20,10 +20,10 @@ here worth an outage over.
 
 **Read and write share :func:`is_cacheable`.** A predicate that disagreed with
 itself between the two call sites would produce a cache that writes things it can
-never hit, or hits things it should have bypassed. ``degraded`` is the one
-dimension only the write side can know — nothing is knowable about a response
-before it exists — so it defaults to ``False`` and the read side simply never
-supplies it.
+never hit, or hits things it should have bypassed. ``degraded`` and ``truncated``
+are the two dimensions only the write side can know — nothing is knowable about a
+response before it exists — so both default to ``False`` and the read side simply
+never supplies either.
 
 **D29 — a turn carrying a file is cacheable.** Phase 3 refused any history with a
 ``file_ref`` in it, deliberately, so that Phase 4 would have to decide rather than
@@ -39,6 +39,17 @@ for up to ``EXACT_CACHE_TTL_S`` an answer cached from an ``llm`` extraction is
 replayed even where a ``native`` passthrough would now be available. The answer
 was not degraded, the window is an hour, and the alternative is a cache that
 never hits on the one feature Phase 4 exists to build.
+
+**D35 — a turn whose history was truncated is cacheable, but never cached.**
+``request_hash`` folds in the *requested* slot and the full history, not the
+served model (ADR-023) — the served model is an accident of a failover race,
+not part of the question asked. But under ``auto`` the served model decides the
+context window, and the context window decides how much of that history the
+model actually saw. Two byte-identical requests can be one answer built on the
+whole thread and one built on its last twenty turns, and the hash cannot tell
+them apart. ``truncated=True`` is the write side's own gate against replaying
+the partial one — see :func:`is_cacheable` for why this is deliberately
+asymmetric with the read side.
 """
 
 from __future__ import annotations
@@ -106,10 +117,11 @@ def is_cacheable(
     temperature: float,
     history: Sequence[CanonicalMessage],
     degraded: bool = False,
+    truncated: bool = False,
 ) -> bool:
     """D19's single cacheability predicate. Read and write both call this.
 
-    Two dimensions, and ``history`` is deliberately not one of them any more.
+    Three dimensions, and ``history`` is deliberately not one of them any more.
 
     ``temperature > 0`` means identical inputs will not reliably reproduce a
     high-value output, and a cached creative answer is worse than a fresh one.
@@ -123,13 +135,34 @@ def is_cacheable(
     exclusion Phase 3 wrote here is gone and :func:`request_hash` covers the
     hashes instead.
 
+    ``truncated`` (D35) is the same shape as ``degraded``, for the same reason:
+    it defaults to ``False`` and only the write side ever supplies the real
+    value, from ``RenderReport.truncated``. ``request_hash`` folds in the
+    *requested* slot and the full history, not the model that ends up serving
+    it (ADR-023) — but under ``auto`` the served model decides the context
+    window, and the context window decides how much of that history actually
+    reached the model. Two byte-identical requests can be one answer built on
+    the whole thread and one built on its last twenty turns, and the hash
+    cannot tell them apart. So a turn whose history was truncated must not be
+    written, or it would be replayed for up to an hour to a caller who might
+    have gotten the complete-history answer.
+
+    This is **not** symmetric with ``degraded``, on purpose, and only in one
+    direction: the read side still never supplies ``truncated`` (nor
+    ``degraded``) — it cannot know whether a hit *would* have been truncated
+    without rendering against a candidate it has not chosen yet, and if the
+    entry exists at all, it was written by a turn that was not truncated
+    (this predicate refused it otherwise). A stored entry is by construction a
+    whole-history answer, so one gate on the write side is sufficient; a
+    second on the read side would be dead code.
+
     ``history`` stays in the signature because the predicate is shared verbatim
     by both call sites and the read side has nothing else to key on; it is the
     argument :func:`request_hash` needs one line later either way.
     """
     if temperature > 0:
         return False
-    return not degraded
+    return not degraded and not truncated
 
 
 def _identity_of(block: ContentBlock) -> object:

@@ -121,6 +121,28 @@ def test_a_degraded_answer_over_an_attachment_is_still_refused() -> None:
     assert is_cacheable(temperature=0.0, history=_with_attachment(), degraded=True) is False
 
 
+def test_a_truncated_response_is_never_cacheable() -> None:
+    """D35 — the other dimension only the write side can supply. Two
+    byte-identical requests can differ in how much history actually reached
+    the served model under ``auto``, and the hash cannot tell them apart."""
+    assert is_cacheable(temperature=0.0, history=[_message()], truncated=True) is False
+    # The read side never passes it either, so it defaults to permissive here too.
+    assert is_cacheable(temperature=0.0, history=[_message()]) is True
+
+
+def test_truncated_and_degraded_are_independent_axes() -> None:
+    """Either one alone is enough to refuse; neither implies the other."""
+    assert is_cacheable(temperature=0.0, history=[_message()], degraded=True, truncated=False) is (
+        False
+    )
+    assert is_cacheable(temperature=0.0, history=[_message()], degraded=False, truncated=True) is (
+        False
+    )
+    assert (
+        is_cacheable(temperature=0.0, history=[_message()], degraded=False, truncated=False) is True
+    )
+
+
 # --------------------------------------------------------------------------- #
 # request_hash
 # --------------------------------------------------------------------------- #

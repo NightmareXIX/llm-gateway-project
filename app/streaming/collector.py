@@ -142,11 +142,18 @@ class Collector:
         )
 
         # D5/D19's streaming write, exactly where this docstring promised it
-        # would land. `result.degraded` is the one half of `is_cacheable` the
-        # endpoint could not have checked before the turn existed; the other
-        # half is why `self._cache_key` is `None` at all whenever it does not
-        # hold.
-        if self._cache is not None and self._cache_key is not None and not result.degraded:
+        # would land. `result.degraded` and `result.messages_dropped` (D35) are
+        # the two halves of `is_cacheable` the endpoint could not have checked
+        # before the turn existed; the rest is why `self._cache_key` is `None`
+        # at all whenever it does not hold. Routed through the same field
+        # `messages_dropped` already carries (Step 3) rather than a second,
+        # parallel `truncated` flag on `StreamResult`.
+        if (
+            self._cache is not None
+            and self._cache_key is not None
+            and not result.degraded
+            and result.messages_dropped == 0
+        ):
             await self._cache.put(
                 self._cache_key,
                 CachedResponse(

@@ -21,7 +21,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ProvidersConfig, get_providers_config
-from app.db.models import Message, Request
+from app.db.models import Conversation, Message, Request
+from app.db.repo import messages as messages_repo
+from app.memory.canonical import MessageMeta, text_block
 from app.providers.registry import build_registry
 from tests import provider_fixtures
 from tests.conftest import TokenFactory
@@ -123,6 +125,72 @@ def _body(
     if temperature is not None:
         payload["temperature"] = temperature
     return payload
+
+
+def _narrow_slot(config: ProvidersConfig, slot: str, providers: tuple[str, ...]) -> ProvidersConfig:
+    """``test_chat_endpoint.py``'s helper, duplicated rather than imported —
+    these are two independent test modules and neither is the other's private
+    API. Restricts one slot's candidate list to the named providers."""
+    declared = config.slots[slot]
+    narrowed = declared.model_copy(
+        update={
+            "candidates": tuple(
+                candidate for candidate in declared.candidates if candidate.provider in providers
+            )
+        }
+    )
+    return config.model_copy(update={"slots": {**config.slots, slot: narrowed}})
+
+
+def _shrink_context(
+    config: ProvidersConfig, slot: str, *, provider: str, context_tokens: int
+) -> ProvidersConfig:
+    """Phase 5 Step 3's helper, duplicated for the same reason as
+    ``_narrow_slot`` above: narrow a slot to one deterministic provider and
+    shrink its context window small enough that a real multi-turn history
+    forces D4 truncation, without touching ``config/providers.yaml`` or the
+    fitting algorithm itself."""
+    narrowed = _narrow_slot(config, slot, (provider,))
+    declared = narrowed.slots[slot]
+    candidates = tuple(
+        candidate.model_copy(update={"context_tokens": context_tokens})
+        for candidate in declared.candidates
+    )
+    shrunk = declared.model_copy(update={"candidates": candidates})
+    return narrowed.model_copy(update={"slots": {**narrowed.slots, slot: shrunk}})
+
+
+async def _seed_history(
+    session: AsyncSession, *, conversation_id: UUID, user_id: UUID, turns: int
+) -> None:
+    """Append ``turns`` user/assistant pairs directly through the repo,
+    bypassing HTTP — the same shortcut ``test_chat_endpoint.py`` uses to build
+    a long history without ``turns`` real round trips."""
+    for n in range(turns):
+        await messages_repo.append(
+            session,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role="user",
+            content=[text_block(f"Synthetic turn {n}: filling the history to force truncation.")],
+        )
+        await messages_repo.append(
+            session,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role="assistant",
+            content=[text_block(f"Synthetic reply {n}.")],
+            meta=MessageMeta(
+                provider_used="groq",
+                model_used="synthetic",
+                slot_used="fast",
+                requested_slot="fast",
+                attempts=1,
+                tokens_in=5,
+                tokens_out=5,
+            ),
+        )
+    await session.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -305,3 +373,119 @@ async def test_a_streamed_replay_carries_the_same_text_as_the_original(
 
     assert original_text == replayed_text
     assert first_response.status_code == second_response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 Step 4 — D35: a truncated turn is never cached
+# --------------------------------------------------------------------------- #
+async def _seeded_conversation(
+    client: httpx.AsyncClient, headers: dict[str, str], db_session: AsyncSession
+) -> Conversation:
+    """A fresh conversation, opened on ``fast`` and grown to the same seeded
+    shape ``test_chat_endpoint.py``'s truncation tests use. Two conversations
+    built this way carry byte-identical history — everything in
+    ``_seed_history`` is a deterministic function of the turn index — so a
+    later question over either one produces the same ``request_hash`` (D19
+    keys on content, never on ``conversation_id``), which is what lets two
+    *separate* conversations stand in for "the same question asked twice"
+    without a growing history breaking the hash match a same-conversation
+    repeat would.
+    """
+    opener = await client.post(
+        COMPLETIONS,
+        json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+    assert opener.status_code == 200, opener.text
+    conversation_id = UUID(opener.json()["conversation_id"])
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    await _seed_history(
+        db_session, conversation_id=conversation.id, user_id=conversation.user_id, turns=6
+    )
+    return conversation
+
+
+def _followup_question(conversation: Conversation) -> dict[str, Any]:
+    return {
+        "model": "fast",
+        "temperature": 0,
+        "max_tokens": 50,
+        "conversation_id": str(conversation.id),
+        "messages": [{"role": "user", "content": "what did I say first?"}],
+    }
+
+
+async def test_a_truncated_turn_is_never_cached(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """D35: two identical, deterministic requests whose history the fitting
+    step had to truncate must both cost a provider call — an entry written by
+    a truncated turn would let ``auto``'s partial-history answer be replayed
+    for up to an hour to a caller who might have gotten the whole thing.
+    """
+    headers = _headers(make_jwt)
+    first_conversation = await _seeded_conversation(client, headers, db_session)
+    second_conversation = await _seeded_conversation(client, headers, db_session)
+
+    config = _shrink_context(get_providers_config(), "fast", provider="groq", context_tokens=200)
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=config)
+    try:
+        first = await client.post(
+            COMPLETIONS, json=_followup_question(first_conversation), headers=headers
+        )
+        second = await client.post(
+            COMPLETIONS, json=_followup_question(second_conversation), headers=headers
+        )
+    finally:
+        await upstream.aclose()
+
+    assert first.status_code == second.status_code == 200, (first.text, second.text)
+    assert first.json()["messages_dropped"] > 0
+    assert second.json()["messages_dropped"] > 0
+    assert first.headers["x-cache"] == "MISS"
+    assert second.headers["x-cache"] == "MISS"
+    assert len(handler.requests) == 2  # the second call was a real attempt, never a replay
+
+
+async def test_an_untruncated_turn_over_a_long_history_still_caches(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """The D35 gate must not have broken caching generally: the same long,
+    identical pair of questions still produces a hit once nothing about the
+    history had to be dropped to answer it.
+    """
+    headers = _headers(make_jwt)
+    first_conversation = await _seeded_conversation(client, headers, db_session)
+    second_conversation = await _seeded_conversation(client, headers, db_session)
+
+    config = _narrow_slot(get_providers_config(), "fast", ("groq",))
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=config)
+    try:
+        first = await client.post(
+            COMPLETIONS, json=_followup_question(first_conversation), headers=headers
+        )
+        second = await client.post(
+            COMPLETIONS, json=_followup_question(second_conversation), headers=headers
+        )
+    finally:
+        await upstream.aclose()
+
+    assert first.status_code == second.status_code == 200, (first.text, second.text)
+    assert first.json()["messages_dropped"] == 0
+    assert second.json()["messages_dropped"] == 0
+    assert first.headers["x-cache"] == "MISS"
+    assert second.headers["x-cache"] == "HIT"
+    assert len(handler.requests) == 1  # the second call was a genuine replay
