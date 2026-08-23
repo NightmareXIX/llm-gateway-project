@@ -33,23 +33,14 @@ def adapter() -> GroqAdapter:
 
 @pytest.fixture
 def spec() -> ModelSpec:
-    return ModelSpec(
-        slot="general",
-        provider="groq",
-        model="openai/gpt-oss-120b",
-        context_window=131072,
-        max_output_tokens=32768,
-        supports_streaming=True,
-        supports_vision=False,
-        supports_pdf=False,
-        supports_system_field=False,
-        max_file_bytes=None,
-        priority=0,
-    )
+    """The gateway's one Groq spec — lifted to ``provider_fixtures.py`` (Phase 5
+    Step 1) so this suite and the cross-provider matrix compare apples to
+    apples."""
+    return fx.groq_spec()
 
 
 def _params() -> GenParams:
-    return GenParams(temperature=0.2, max_tokens=512, top_p=0.9, stop=["</done>"])
+    return fx.general_params()
 
 
 # --------------------------------------------------------------------------- #
@@ -231,28 +222,8 @@ def test_groq_refuses_to_embed_a_file_natively(adapter: GroqAdapter, spec: Model
 def _bless() -> None:
     """Rewrite the golden file from the current implementation."""
     adapter = GroqAdapter(client=httpx.AsyncClient(), base_url="https://api.groq.com/openai/v1")
-    payload = adapter.build_payload(
-        fx.canonical_history(),
-        ModelSpec(
-            slot="general",
-            provider="groq",
-            model="openai/gpt-oss-120b",
-            context_window=131072,
-            max_output_tokens=32768,
-            supports_streaming=True,
-            supports_vision=False,
-            supports_pdf=False,
-            supports_system_field=False,
-            max_file_bytes=None,
-            priority=0,
-        ),
-        _params(),
-        [],
-    )
-    path = fx.GOLDEN_ROOT / f"{GOLDEN_NAME}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(fx.dump_golden(payload), encoding="utf-8")
-    print(f"wrote {path}")
+    payload = adapter.build_payload(fx.canonical_history(), fx.groq_spec(), _params(), [])
+    fx.write_golden(GOLDEN_NAME, payload)
 
 
 if __name__ == "__main__":  # pragma: no cover

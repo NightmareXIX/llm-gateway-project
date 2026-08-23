@@ -38,19 +38,10 @@ MODEL = "gemini-3.6-flash"
 
 
 def _spec() -> ModelSpec:
-    return ModelSpec(
-        slot="general",
-        provider="gemini",
-        model=MODEL,
-        context_window=1048576,
-        max_output_tokens=65536,
-        supports_streaming=True,
-        supports_vision=True,
-        supports_pdf=True,
-        supports_system_field=True,
-        max_file_bytes=20000000,
-        priority=1,
-    )
+    """The gateway's one Gemini spec — lifted to ``provider_fixtures.py`` (Phase
+    5 Step 1) so this suite and the cross-provider matrix compare apples to
+    apples."""
+    return fx.gemini_spec()
 
 
 @pytest.fixture
@@ -64,7 +55,7 @@ def spec() -> ModelSpec:
 
 
 def _params() -> GenParams:
-    return GenParams(temperature=0.2, max_tokens=512, top_p=0.9, stop=["</done>"])
+    return fx.general_params()
 
 
 # --------------------------------------------------------------------------- #
@@ -415,10 +406,7 @@ def _bless() -> None:
         ),
     }
     for name, payload in cases.items():
-        path = fx.GOLDEN_ROOT / f"{name}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(fx.dump_golden(payload), encoding="utf-8")
-        print(f"wrote {path}")
+        fx.write_golden(name, payload)
 
 
 if __name__ == "__main__":  # pragma: no cover

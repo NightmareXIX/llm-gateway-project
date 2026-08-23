@@ -6,7 +6,8 @@ when a free tier runs out, tracks heterogeneous quota (RPM/RPD/TPM) in Redis, an
 through a separate "perception lane" even when the answering model can't. Portfolio/learning project, runs
 entirely on free tiers. Full specs: [contracts-and-phase1.md](doc/reference/contracts-and-phase1.md),
 [project-overview.md](doc/reference/project-overview.md), [development-plan.md](doc/reference/development-plan.md),
-[phase2.md](doc/reference/phase2.md), [phase3.md](doc/reference/phase3.md), [phase4.md](doc/reference/phase4.md).
+[phase2.md](doc/reference/phase2.md), [phase3.md](doc/reference/phase3.md), [phase4.md](doc/reference/phase4.md),
+[phase5.md](doc/reference/phase5.md).
 Where the overview and the contracts doc disagree, the contracts doc wins.
 
 ## Locked decisions (§1) — do not relitigate
@@ -104,9 +105,29 @@ README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.exampl
 Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streaming), Phase 3
 (quota-aware routing), and Phase 4 (the perception lane, below) are done and merged. Phase 5
 (conversations surviving a provider switch, per `project-overview.md` §4.7 and
-`development-plan.md` §3 Phase 5) is next per the phased build plan; it has no dedicated
-step-by-step doc yet the way Phases 2–4 do — `development-plan.md`'s own Phase 5 section is the
-current source until one is written.
+`development-plan.md` §3 Phase 5) is next per the phased build plan. Full step-by-step account,
+including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
+[phase5.md](doc/reference/phase5.md).
+
+**Status: Milestone A in progress — Step 1 of 8 committed.** Step 1 (D31, the cross-provider
+golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
+already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
+disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
+`ScriptedResolver` (a `render.AttachmentResolver` test double answering only "native, or injected
+with a fixed extraction text?" — no database, no Redis, no `PerceptionResolver` import) and the
+`gemini_spec()`/`groq_spec()`/`openrouter_spec()`/`general_params()` builders the three per-adapter
+payload suites now import rather than redefine. `tests/contract/test_cross_provider_matrix.py`
+renders one fixed history through `render()` against all three adapters, with and without an
+attachment, and asserts six goldens — the three `*_general` ones and `gemini_attachment` reused
+byte-for-byte from the existing per-adapter suites, `groq_attachment` and `openrouter_attachment`
+newly committed — plus three structural properties: the system message's position per provider,
+the omission marker surviving into all three payload texts identically, and the extracted-document
+envelope being byte-identical across the two injected providers. Fixing this step also surfaced
+(and fixed) a latent Windows-only bug in every `--bless` script: `Path.write_text` translates `\n`
+to `\r\n` on write, which had left three of the four pre-existing goldens carrying CRLF against
+`.gitattributes`' own `-text` byte-exactness contract; `provider_fixtures.py::write_golden` is now
+the one place any bless script writes a file, forcing `\n`. `make test`, `ruff check`, `ruff format
+--check`, and `mypy` are green.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,

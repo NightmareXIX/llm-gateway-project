@@ -35,19 +35,10 @@ MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 
 def _spec() -> ModelSpec:
-    return ModelSpec(
-        slot="general",
-        provider="openrouter",
-        model=MODEL,
-        context_window=262144,
-        max_output_tokens=262144,
-        supports_streaming=True,
-        supports_vision=False,
-        supports_pdf=False,
-        supports_system_field=False,
-        max_file_bytes=None,
-        priority=2,
-    )
+    """The gateway's one OpenRouter spec — lifted to ``provider_fixtures.py``
+    (Phase 5 Step 1) so this suite and the cross-provider matrix compare apples
+    to apples."""
+    return fx.openrouter_spec()
 
 
 @pytest.fixture
@@ -61,7 +52,7 @@ def spec() -> ModelSpec:
 
 
 def _params() -> GenParams:
-    return GenParams(temperature=0.2, max_tokens=512, top_p=0.9, stop=["</done>"])
+    return fx.general_params()
 
 
 # --------------------------------------------------------------------------- #
@@ -266,10 +257,7 @@ def _bless() -> None:
     """Rewrite the golden file from the current implementation."""
     adapter = OpenRouterAdapter(client=httpx.AsyncClient(), base_url=BASE_URL)
     payload = adapter.build_payload(fx.canonical_history(), _spec(), _params(), [])
-    path = fx.GOLDEN_ROOT / f"{GOLDEN_NAME}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(fx.dump_golden(payload), encoding="utf-8")
-    print(f"wrote {path}")
+    fx.write_golden(GOLDEN_NAME, payload)
 
 
 if __name__ == "__main__":  # pragma: no cover

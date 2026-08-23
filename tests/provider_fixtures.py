@@ -25,12 +25,14 @@ from app.config import REPO_ROOT
 from app.memory.canonical import (
     CanonicalMessage,
     ContentBlock,
+    FileRefBlock,
     MessageMeta,
     Role,
     file_ref_block,
     omission_marker,
     text_block,
 )
+from app.providers.types import GenParams, ModelSpec, ResolvedAttachment
 
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "provider_responses"
 GOLDEN_ROOT = REPO_ROOT / "tests" / "fixtures" / "golden_payloads"
@@ -255,6 +257,63 @@ def _target_model(request: httpx.Request) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# Model specs and gen params (§2.2.6 — shared by the per-adapter payload tests
+# and the cross-provider matrix, so the two suites compare apples to apples)
+# --------------------------------------------------------------------------- #
+def gemini_spec() -> ModelSpec:
+    return ModelSpec(
+        slot="general",
+        provider="gemini",
+        model="gemini-3.6-flash",
+        context_window=1048576,
+        max_output_tokens=65536,
+        supports_streaming=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_system_field=True,
+        max_file_bytes=20000000,
+        priority=1,
+    )
+
+
+def groq_spec() -> ModelSpec:
+    return ModelSpec(
+        slot="general",
+        provider="groq",
+        model="openai/gpt-oss-120b",
+        context_window=131072,
+        max_output_tokens=32768,
+        supports_streaming=True,
+        supports_vision=False,
+        supports_pdf=False,
+        supports_system_field=False,
+        max_file_bytes=None,
+        priority=0,
+    )
+
+
+def openrouter_spec() -> ModelSpec:
+    return ModelSpec(
+        slot="general",
+        provider="openrouter",
+        model="nvidia/nemotron-3-super-120b-a12b:free",
+        context_window=262144,
+        max_output_tokens=262144,
+        supports_streaming=True,
+        supports_vision=False,
+        supports_pdf=False,
+        supports_system_field=False,
+        max_file_bytes=None,
+        priority=2,
+    )
+
+
+def general_params() -> GenParams:
+    """The knobs every §2.1.5 case 1 payload test renders with."""
+    return GenParams(temperature=0.2, max_tokens=512, top_p=0.9, stop=["</done>"])
+
+
 def canonical_history() -> list[CanonicalMessage]:
     """The fixed six-message history every payload test renders (§2.1.5 case 1).
 
@@ -373,6 +432,68 @@ def canonical_history_with_attachment() -> list[CanonicalMessage]:
     return history
 
 
+SCRIPTED_EXTRACTION_TEXT = (
+    "Summary: a single solid-color test tile, used across the payload fixtures.\n"
+    "Verbatim text: none — this is a raster image with no text layer."
+)
+"""The fixed extraction the scripted resolver returns for an injected attachment.
+
+Multi-line and short on purpose (D31, phase5.md Step 1): it appears verbatim
+inside :func:`app.memory.render.document_envelope` in two committed goldens
+(``groq_attachment``, ``openrouter_attachment``), and a golden nobody can read
+in a diff is a golden everybody re-blesses without reading.
+"""
+
+
+class ScriptedResolver:
+    """A :class:`~app.memory.render.AttachmentResolver` double for §2.2.6's matrix.
+
+    Answers tier 1's question — native or injected? — and nothing else: no
+    cache, no database, no Redis, no ``PerceptionResolver`` import. That
+    restriction is deliberate (trap 9, phase5.md): a golden that needs Postgres
+    and object storage to produce a diff is a golden nobody runs on a red
+    build, and ``PerceptionResolver``'s own tier logic already has its own
+    integration suite.
+
+    ``mode="native"`` with the real fixture bytes and D27's published tile rate
+    when the target spec can read this mime within its file-size limit;
+    otherwise ``mode="injected"`` with :data:`SCRIPTED_EXTRACTION_TEXT`. No
+    clock, no randomness — a fixed history in, a fixed resolution out.
+    """
+
+    async def resolve(self, refs: list[FileRefBlock], spec: ModelSpec) -> list[ResolvedAttachment]:
+        resolved: dict[str, ResolvedAttachment] = {}
+        for ref in refs:
+            if ref["file_hash"] not in resolved:
+                resolved[ref["file_hash"]] = self._resolve_one(ref, spec)
+        return list(resolved.values())
+
+    @staticmethod
+    def _resolve_one(ref: FileRefBlock, spec: ModelSpec) -> ResolvedAttachment:
+        within_limit = spec.max_file_bytes is not None and ref["bytes"] <= spec.max_file_bytes
+        if spec.supports_mime(ref["mime"]) and within_limit:
+            return ResolvedAttachment(
+                file_hash=ref["file_hash"],
+                filename=ref["filename"],
+                mime=ref["mime"],
+                size_bytes=ref["bytes"],
+                mode="native",
+                data=attachment_bytes(),
+                tier="native",
+                token_cost=258,
+            )
+        return ResolvedAttachment(
+            file_hash=ref["file_hash"],
+            filename=ref["filename"],
+            mime=ref["mime"],
+            size_bytes=ref["bytes"],
+            mode="injected",
+            text=SCRIPTED_EXTRACTION_TEXT,
+            confidence="high",
+            tier="llm",
+        )
+
+
 def read_golden(name: str) -> dict[str, Any]:
     """Load a committed golden payload."""
     parsed: dict[str, Any] = json.loads((GOLDEN_ROOT / f"{name}.json").read_text(encoding="utf-8"))
@@ -387,3 +508,20 @@ def dump_golden(payload: dict[str, Any]) -> str:
     people to re-bless golden files without reading them.
     """
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def write_golden(name: str, payload: dict[str, Any]) -> None:
+    """Bless one golden file. Every ``--bless`` entrypoint writes through this.
+
+    ``newline="\\n"`` is load-bearing, not a style choice: ``tests/fixtures/**``
+    is ``-text`` in ``.gitattributes`` (byte-exact, checked out as committed),
+    but ``Path.write_text``'s default ``newline=None`` still translates ``\\n``
+    to the *host's* line ending on write — ``\\r\\n`` on Windows. Skipping this
+    turns "regenerate a golden" into an all-lines-changed diff that is really a
+    line-ending flip, on a repo whose own ``.gitattributes`` explains at length
+    why CRLF must not reach a file a Linux container or CI runner will read.
+    """
+    path = GOLDEN_ROOT / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dump_golden(payload), encoding="utf-8", newline="\n")
+    print(f"wrote {path}")

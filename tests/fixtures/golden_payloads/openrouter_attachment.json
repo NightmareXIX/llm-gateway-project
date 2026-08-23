@@ -22,7 +22,7 @@
       "role": "assistant"
     },
     {
-      "content": "Good. Now summarise that for the README.",
+      "content": "Good. Now summarise that for the README.\n\n<document name=\"tile.png\" source=\"extracted\" confidence=\"high\">\nSummary: a single solid-color test tile, used across the payload fixtures.\nVerbatim text: none — this is a raster image with no text layer.\n</document>",
       "role": "user"
     }
   ],
