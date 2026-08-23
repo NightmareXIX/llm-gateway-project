@@ -217,6 +217,12 @@ class ChatCompletionResponse(BaseModel):
     kind*, so the indicator can render "read by local OCR" rather than a bare
     warning — the same disclosure discipline ``served_by`` gets."""
 
+    messages_dropped: int = 0
+    """How many older turns D4's fitting step dropped to build this answer
+    (Phase 5, D34). Zero means the whole stored history reached the model. A
+    cache hit (D19) always reports ``0`` here — nothing was rendered this
+    turn, and the original turn's own row carries the number it recorded."""
+
     # ---- gateway state ----------------------------------------------------- #
     conversation_id: UUID
     message_id: UUID

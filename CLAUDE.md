@@ -109,7 +109,7 @@ Phase 1 (single-provider proxy), Phase 2 (multi-provider core, failover, streami
 including the five pre-code decisions (D31–D35) and the eight-step, three-milestone plan:
 [phase5.md](doc/reference/phase5.md).
 
-**Status: Milestone A complete — Steps 1–2 of 8 committed.** Step 1 (D31, the cross-provider
+**Status: Milestone A complete, Milestone B underway — Steps 1–3 of 8 committed.** Step 1 (D31, the cross-provider
 golden matrix, §2.2.6) touched only `tests/`: no `app/` change was needed, meaning `render()`
 already agreed with every committed `build_payload` golden — the finding trap 2 warns a real
 disagreement would have produced, and did not. `tests/provider_fixtures.py` gained
@@ -162,6 +162,30 @@ the non-streaming twin's. Per the step's own acceptance
 criterion, all three were confirmed to keep passing with `pinned=` temporarily deleted from both of
 `chat.py`'s `routing.route`/`route_stream` calls — they test memory, not pinning — before that
 change was reverted. `make test`, `ruff check`, `ruff format --check`, and `mypy` are green.
+
+Step 3 (D4 under a real history: fitting exercised, truncation disclosed, implementing D34) touched
+exactly the six files `phase5.md` names — `memory/canonical.py`, `schemas/chat.py`, `streaming/sse.py`,
+`streaming/orchestrator.py`, `streaming/collector.py`, `api/v1/chat.py` — plus tests. `MessageMeta`
+gained `messages_dropped: int = 0` (`to_jsonb`/`from_jsonb` via the existing `_int` helper; an absent
+key reads back as `0` rather than being backfilled, trap 7 — nobody knows whether a pre-Phase-5 row was
+truncated). The same field was threaded through `ChatCompletionResponse`, `DoneEvent`, `StreamResult`
+and `_Turn` by mirroring exactly how `degraded`/`extraction_tier` made the same trip in Phase 4:
+`_Turn.complete` sets it from `event.report.messages_dropped`, both `done_event()` and `result()` read
+it off `_Turn`, and a failed turn — which never reaches `complete` — reports the field's `0` default
+rather than a stale number, the same as `degraded`/`extraction_tier` do on that path. `stream_cached_completion`
+and `_serve_cache_hit`'s non-streaming twin both pass `messages_dropped=0` explicitly: a cache hit never
+re-rendered, so the number belongs to the original turn's own stored row, not the replay (trap 3). Two
+new helpers in `tests/integration/test_chat_endpoint.py` — `_shrink_context` (`_narrow_slot`'s sibling:
+narrows a slot to one provider and overrides its `context_tokens`, so a real multi-turn history forces D4
+truncation without touching `config/providers.yaml` or the fitting algorithm) and `_seed_history` (appends
+turns directly through `messages_repo.append`, so a 200-message fixture costs one flush per row rather than
+200 HTTP round trips) — back three new tests: `test_a_truncated_answer_discloses_how_much_history_it_dropped`
+(non-streaming — response, stored `meta`, and the single omission marker in the outbound payload all
+agree), `test_streaming_done_event_discloses_the_same_truncation` (the `done` event's twin), and
+`test_a_200_message_history_truncates_without_a_provider_error` — `development-plan.md`'s own exit
+criterion, named literally. Two new unit tests in `tests/unit/test_canonical.py` cover the
+`MessageMeta` round trip and the absent-key default. `make test`, `ruff check`, `ruff format --check`,
+and `mypy` are green.
 
 **Scope, from `development-plan.md`:** persist canonical history and load it by `conversation_id`;
 a golden-file test matrix asserting one fixed canonical history (system prompt + `file_ref`,

@@ -356,6 +356,7 @@ def test_meta_round_trips_through_jsonb() -> None:
         wasted_tokens_out=96,
         degraded=True,
         extraction_tier="llm",
+        messages_dropped=42,
     )
     assert parse_meta(meta.to_jsonb()) == meta
 
@@ -379,6 +380,7 @@ def test_default_meta_round_trips_with_every_key_present() -> None:
         "wasted_tokens_out",
         "degraded",
         "extraction_tier",
+        "messages_dropped",
     }
     assert parse_meta(stored) == MessageMeta()
 
@@ -389,6 +391,14 @@ def test_meta_tolerates_missing_and_unknown_keys() -> None:
     assert meta.provider_used == "groq"
     assert meta.attempts == 1
     assert meta.substituted is False
+
+
+def test_meta_without_messages_dropped_reads_back_as_zero() -> None:
+    """D34, trap 7: a row written before this field existed is not backfilled —
+    nobody knows whether that turn was truncated, so the honest reading is the
+    default, not a guess."""
+    meta = parse_meta({"provider_used": "groq"})
+    assert meta.messages_dropped == 0
 
 
 def test_meta_rejects_a_wrongly_typed_value() -> None:

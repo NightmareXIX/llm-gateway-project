@@ -131,6 +131,12 @@ class StreamResult:
     built by hand in a test predates this field and a turn with no attachment
     genuinely has no tier."""
 
+    messages_dropped: int = 0
+    """D34's streaming twin of ``RenderReport.messages_dropped``. Set only by
+    ``_Turn.complete`` — a failed turn never reached a successful render, so
+    it stays the default ``0``, exactly like ``degraded`` and
+    ``extraction_tier`` above."""
+
 
 class StreamPersistence(Protocol):
     """What Step 10's collector implements.
@@ -227,6 +233,9 @@ async def stream_cached_completion(
             # A replay never ran the lane; the tier that produced the original
             # answer is recorded on that answer's own message row.
             extraction_tier=None,
+            # Nothing was rendered this turn (trap 3) — the original turn's own
+            # row carries whatever it dropped, not this one.
+            messages_dropped=0,
             status="ok",
         )
     )
@@ -464,6 +473,7 @@ class _Turn:
     wasted_tokens_out: int
     degraded: bool
     extraction_tier: ExtractionTier | None
+    messages_dropped: int
 
     def __init__(self, *, conversation_id: UUID, message_id: UUID, requested: str) -> None:
         self.conversation_id = conversation_id
@@ -487,6 +497,7 @@ class _Turn:
         self.wasted_tokens_out = 0
         self.degraded = False
         self.extraction_tier = None
+        self.messages_dropped = 0
 
     # ---- transitions ------------------------------------------------------ #
     def begin(self, event: routing.AttemptStarted) -> None:
@@ -514,6 +525,7 @@ class _Turn:
         self.wasted_tokens_out = event.wasted_tokens_out
         self.degraded = event.report.degraded
         self.extraction_tier = event.report.extraction_tier
+        self.messages_dropped = event.report.messages_dropped
         self.done = True
 
     def record_failure(self, failure: routing.RoutingFailed) -> None:
@@ -575,6 +587,7 @@ class _Turn:
             ),
             degraded=self.degraded,
             extraction_tier=self.extraction_tier,
+            messages_dropped=self.messages_dropped,
             status=self.status,
             partial_content=self.partial_content(),
         )
@@ -607,6 +620,7 @@ class _Turn:
             wasted_tokens_out=self.wasted_tokens_out,
             degraded=self.degraded,
             extraction_tier=self.extraction_tier,
+            messages_dropped=self.messages_dropped,
         )
 
     def _served(self) -> ModelSpec:

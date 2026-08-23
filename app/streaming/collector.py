@@ -125,6 +125,7 @@ class Collector:
                 wasted_tokens_out=result.wasted_tokens_out,
                 degraded=result.degraded,
                 extraction_tier=result.extraction_tier,
+                messages_dropped=result.messages_dropped,
             ),
         )
         await usage_logger.record_success(

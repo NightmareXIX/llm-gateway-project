@@ -26,7 +26,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ProvidersConfig, get_providers_config
 from app.db.models import Conversation, File, Message, Request
+from app.db.repo import messages as messages_repo
 from app.deps import get_resolver
+from app.memory.canonical import MessageMeta, text_block
 from app.perception.storage import MemoryStore
 from app.providers.registry import build_registry
 from tests import provider_fixtures
@@ -174,6 +176,24 @@ def _narrow_slot(config: ProvidersConfig, slot: str, providers: tuple[str, ...])
     return config.model_copy(update={"slots": {**config.slots, slot: narrowed}})
 
 
+def _shrink_context(
+    config: ProvidersConfig, slot: str, *, provider: str, context_tokens: int
+) -> ProvidersConfig:
+    """``_narrow_slot``'s sibling for Phase 5 Step 3's truncation tests: narrow
+    a slot to one deterministic provider and shrink its context window small
+    enough that a real multi-turn history forces D4 truncation — without
+    touching ``config/providers.yaml`` or the fitting algorithm itself.
+    """
+    narrowed = _narrow_slot(config, slot, (provider,))
+    declared = narrowed.slots[slot]
+    candidates = tuple(
+        candidate.model_copy(update={"context_tokens": context_tokens})
+        for candidate in declared.candidates
+    )
+    shrunk = declared.model_copy(update={"candidates": candidates})
+    return narrowed.model_copy(update={"slots": {**narrowed.slots, slot: shrunk}})
+
+
 @pytest.fixture
 async def attachment_fleet(app: FastAPI) -> AsyncIterator[Callable[..., ScriptedHandler]]:
     """``fleet_script``'s sibling for the one test that needs a deterministic
@@ -250,6 +270,44 @@ async def _messages(session: AsyncSession, conversation_id: str | UUID) -> list[
 async def _requests(session: AsyncSession) -> list[Request]:
     result = await session.execute(select(Request).order_by(Request.created_at))
     return list(result.scalars().all())
+
+
+async def _seed_history(
+    session: AsyncSession, *, conversation_id: UUID, user_id: UUID, turns: int
+) -> None:
+    """Append ``turns`` user/assistant pairs directly through the repo,
+    bypassing HTTP entirely.
+
+    Phase 5 Step 3's truncation tests need a long history, and driving it
+    through ``turns`` real HTTP round trips would make the suite slow for no
+    reason ``messages_repo.append`` cannot already prove correct on its own
+    (every other test in this module exercises it through the endpoint).
+    """
+    for n in range(turns):
+        await messages_repo.append(
+            session,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role="user",
+            content=[text_block(f"Synthetic turn {n}: filling the history to force truncation.")],
+        )
+        await messages_repo.append(
+            session,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role="assistant",
+            content=[text_block(f"Synthetic reply {n}.")],
+            meta=MessageMeta(
+                provider_used="groq",
+                model_used="synthetic",
+                slot_used="fast",
+                requested_slot="fast",
+                attempts=1,
+                tokens_in=5,
+                tokens_out=5,
+            ),
+        )
+    await session.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -1236,6 +1294,177 @@ def _sse_event(body: str, name: str) -> dict[str, Any]:
             parsed: dict[str, Any] = json.loads(data_line.removeprefix("data: "))
             return parsed
     raise AssertionError(f"no {name!r} event found in stream:\n{body}")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 Step 3 — D4 under a real history: fitting exercised, truncation
+# disclosed (D34). `_shrink_context` forces the fitting step to actually drop
+# turns, rather than only unit-testing the algorithm in isolation, and the
+# three tests below check the three hops `messages_dropped` takes: the
+# response, the stored `meta`, and the `done` event.
+# --------------------------------------------------------------------------- #
+async def test_a_truncated_answer_discloses_how_much_history_it_dropped(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """A turn built on a partial history says so, on the response and in the
+    stored row — the same three-hop disclosure `degraded`/`extraction_tier`
+    already got in Phase 4, and D4's own honest-degradation story finally
+    reaching the wire.
+    """
+    headers = _headers(make_jwt)
+    opener = await client.post(
+        COMPLETIONS,
+        json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+    assert opener.status_code == 200, opener.text
+    conversation_id = UUID(opener.json()["conversation_id"])
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    await _seed_history(
+        db_session, conversation_id=conversation.id, user_id=conversation.user_id, turns=6
+    )
+
+    config = _shrink_context(get_providers_config(), "fast", provider="groq", context_tokens=200)
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=config)
+    try:
+        response = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "fast",
+                "max_tokens": 50,
+                "conversation_id": str(conversation.id),
+                "messages": [{"role": "user", "content": "what did I say first?"}],
+            },
+            headers=headers,
+        )
+    finally:
+        await upstream.aclose()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["messages_dropped"] > 0
+
+    # Exactly one omission marker reached the wire, however many messages it
+    # says were dropped — `_apply_marker` merges rather than appending a second
+    # one, and this is the assertion that would catch it not doing so.
+    sent = json.dumps(handler.last_json())
+    assert sent.count("earlier messages omitted") == 1
+
+    stored = await _messages(db_session, conversation.id)
+    assert stored[-1].role == "assistant"
+    assert stored[-1].meta["messages_dropped"] == body["messages_dropped"]
+
+
+async def test_streaming_done_event_discloses_the_same_truncation(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """D34's streaming twin: the `done` event carries the same number the
+    non-streaming response would have, and the stored row agrees with it.
+    """
+    headers = _headers(make_jwt)
+    opener = await client.post(
+        COMPLETIONS,
+        json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+    assert opener.status_code == 200, opener.text
+    conversation_id = UUID(opener.json()["conversation_id"])
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    await _seed_history(
+        db_session, conversation_id=conversation.id, user_id=conversation.user_id, turns=6
+    )
+
+    config = _shrink_context(get_providers_config(), "fast", provider="groq", context_tokens=200)
+    upstream = provider_fixtures.client_streaming(
+        [provider_fixtures.read_sse("groq", "stream_success").encode("utf-8")]
+    )
+    app.state.provider_registry = build_registry(client=upstream, config=config)
+    try:
+        response = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "fast",
+                "max_tokens": 50,
+                "conversation_id": str(conversation.id),
+                "messages": [{"role": "user", "content": "what did I say first?"}],
+                "stream": True,
+            },
+            headers=headers,
+        )
+    finally:
+        await upstream.aclose()
+
+    assert response.status_code == 200, response.text
+    done = _sse_event(response.text, "done")
+    assert done["messages_dropped"] > 0
+
+    stored = await _messages(db_session, conversation.id)
+    assert stored[-1].role == "assistant"
+    assert stored[-1].meta["messages_dropped"] == done["messages_dropped"]
+
+
+async def test_a_200_message_history_truncates_without_a_provider_error(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    app: FastAPI,
+    db_session: AsyncSession,
+) -> None:
+    """`development-plan.md`'s own exit criterion for this phase: feed a
+    200-message history to a small-context model, and the answer comes back
+    truncated rather than as a `ContextTooLong` error.
+    """
+    headers = _headers(make_jwt)
+    opener = await client.post(
+        COMPLETIONS,
+        json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+    assert opener.status_code == 200, opener.text
+    conversation_id = UUID(opener.json()["conversation_id"])
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    # The opener above already wrote one user/assistant pair; 99 more pairs
+    # brings the stored history to exactly 200 messages.
+    await _seed_history(
+        db_session, conversation_id=conversation.id, user_id=conversation.user_id, turns=99
+    )
+    assert len(await _messages(db_session, conversation.id)) == 200
+
+    config = _shrink_context(get_providers_config(), "fast", provider="groq", context_tokens=800)
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=config)
+    try:
+        response = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "fast",
+                "max_tokens": 50,
+                "conversation_id": str(conversation.id),
+                "messages": [{"role": "user", "content": "what did I say first?"}],
+            },
+            headers=headers,
+        )
+    finally:
+        await upstream.aclose()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["messages_dropped"] > 0
+    assert len(handler.requests) == 1
 
 
 # --------------------------------------------------------------------------- #

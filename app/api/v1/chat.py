@@ -308,6 +308,10 @@ async def create_chat_completion(
             # rather than only returned, so re-opening the thread tomorrow
             # still says how the document reached the model.
             extraction_tier=outcome.report.extraction_tier,
+            # D34: how much of the stored history this answer was actually built
+            # on. Stored for the same reason `extraction_tier` is — re-opening
+            # the thread tomorrow should still say so.
+            messages_dropped=outcome.report.messages_dropped,
         ),
     )
     await usage_logger.record_success(
@@ -359,6 +363,7 @@ async def create_chat_completion(
         estimated=completion.usage.estimated,
         degraded=outcome.report.degraded,
         extraction_tier=outcome.report.extraction_tier,
+        messages_dropped=outcome.report.messages_dropped,
         attempts=outcome.attempts,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -429,6 +434,9 @@ async def _serve_cache_hit(
         # A hit never ran the lane, so there is no tier to disclose — the tier
         # that produced the *original* answer is on that answer's own row.
         extraction_tier=None,
+        # Nothing was rendered this turn (trap 3) — the original turn's own row
+        # carries whatever it dropped, not this one.
+        messages_dropped=0,
         attempts=0,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -719,6 +727,7 @@ def _to_response(
     estimated: bool,
     degraded: bool,
     extraction_tier: ExtractionTier | None,
+    messages_dropped: int,
     attempts: int,
     conversation_id: UUID,
     assistant: CanonicalMessage,
@@ -755,6 +764,7 @@ def _to_response(
         attempts=attempts,
         degraded=degraded,
         extraction_tier=extraction_tier,
+        messages_dropped=messages_dropped,
         conversation_id=conversation_id,
         message_id=assistant.id,
     )

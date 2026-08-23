@@ -181,6 +181,12 @@ class MessageMeta:
     wasted_tokens_out: int = 0
     degraded: bool = False
     extraction_tier: ExtractionTier | None = None
+    messages_dropped: int = 0
+    """D34: how many older turns the fitting step (D4) dropped to build *this*
+    answer. Zero means the whole stored history reached the model; a positive
+    value on a stored assistant row means that answer was built on a partial
+    history — a fact that survives a page reload, the same way ``degraded``
+    does for a document that could not be read natively."""
 
     def to_jsonb(self) -> dict[str, Any]:
         """Serialize for the ``messages.meta`` column.
@@ -201,6 +207,7 @@ class MessageMeta:
             "wasted_tokens_out": self.wasted_tokens_out,
             "degraded": self.degraded,
             "extraction_tier": self.extraction_tier,
+            "messages_dropped": self.messages_dropped,
         }
 
     @classmethod
@@ -257,6 +264,7 @@ class MessageMeta:
             wasted_tokens_out=_int("wasted_tokens_out", 0),
             degraded=_bool("degraded", False),
             extraction_tier=tier,
+            messages_dropped=_int("messages_dropped", 0),
         )
 
 

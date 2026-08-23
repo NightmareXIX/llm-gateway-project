@@ -190,6 +190,11 @@ class DoneEvent(BaseModel):
     kind*, so the indicator can render "read by local OCR" rather than a bare
     warning — the same disclosure discipline ``served_by`` gets."""
 
+    messages_dropped: int = 0
+    """D34's streaming twin of :attr:`~app.schemas.chat.ChatCompletionResponse.messages_dropped`.
+    Zero on a replayed cache hit (:func:`stream_cached_completion`) — nothing was
+    rendered this turn."""
+
     status: Literal["ok", "failed"]
     partial_content: str | None = None
     """Set only when ``status == "failed"`` and the longest discarded buffer is
