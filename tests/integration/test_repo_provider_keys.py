@@ -418,3 +418,38 @@ async def test_mark_invalid_does_not_touch_last_validated_at(
     await db_session.refresh(key)
 
     assert key.last_validated_at == validated_at
+
+
+# --------------------------------------------------------------------------- #
+# record_validation_result — the "check again" button's write
+# --------------------------------------------------------------------------- #
+async def test_record_validation_result_records_a_success(
+    db_session: AsyncSession, user_factory: Callable[..., Any], frozen_clock: FixedClock
+) -> None:
+    user = await user_factory()
+    key = await _add(db_session, user=user, validation_status="unverified", last_validated_at=None)
+
+    await repo.record_validation_result(
+        db_session, key_id=key.id, valid=True, validated_at=frozen_clock.now()
+    )
+    await db_session.refresh(key)
+
+    assert key.validation_status == "valid"
+    assert key.last_validated_at == frozen_clock.now()
+
+
+async def test_record_validation_result_records_a_failure(
+    db_session: AsyncSession, user_factory: Callable[..., Any], frozen_clock: FixedClock
+) -> None:
+    """Unlike ``mark_invalid``, this one moves ``last_validated_at`` too — the
+    user asked "is this still good" and got an answer, even a bad one."""
+    user = await user_factory()
+    key = await _add(db_session, user=user, validation_status="valid", last_validated_at=None)
+
+    await repo.record_validation_result(
+        db_session, key_id=key.id, valid=False, validated_at=frozen_clock.now()
+    )
+    await db_session.refresh(key)
+
+    assert key.validation_status == "invalid"
+    assert key.last_validated_at == frozen_clock.now()

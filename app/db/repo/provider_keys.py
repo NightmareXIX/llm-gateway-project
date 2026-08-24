@@ -180,7 +180,33 @@ async def mark_invalid(session: AsyncSession, *, key_id: UUID) -> None:
     discovered it — the failing candidate has already moved on to the next
     one in the chain by the time this matters. Not called on ``RateLimited``:
     a spent key is still a working key.
+
+    Deliberately does not touch ``last_validated_at`` — see
+    :func:`record_validation_result` for the user-triggered sibling that does.
     """
     await session.execute(
         update(ProviderKey).where(ProviderKey.id == key_id).values(validation_status="invalid")
+    )
+
+
+async def record_validation_result(
+    session: AsyncSession, *, key_id: UUID, valid: bool, validated_at: datetime
+) -> None:
+    """The settings page's "check again" button (§9.2's re-check flow).
+
+    Distinct from :func:`mark_invalid`, deliberately: that one is D40's
+    fire-and-forget write from a private key's mid-request ``AuthFailed`` and
+    never touches ``last_validated_at``, because it is not the user asking
+    "is my key still good". This one *is* that question, so both
+    ``validation_status`` and ``last_validated_at`` move together whichever
+    way the answer comes back — a re-check that came back valid is still
+    worth recording as "checked just now".
+    """
+    await session.execute(
+        update(ProviderKey)
+        .where(ProviderKey.id == key_id)
+        .values(
+            validation_status="valid" if valid else "invalid",
+            last_validated_at=validated_at,
+        )
     )

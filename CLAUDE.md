@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–2 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–3 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -165,6 +165,46 @@ key via an `isolated_encryption_key` fixture that clears both `get_settings`'s c
 gone now that they have real bodies; that behavior moved to `test_crypto.py`. `make test` (1267 passed),
 `ruff check`, `ruff format --check`, and `mypy` are all green; `grep -rn "from cryptography.fernet" app`
 returns only `core/crypto.py`, per the step's own "done when."
+
+Step 3 (the settings endpoints) touches the files `phase6.md` names — `app/schemas/keys.py`,
+`app/api/keys.py`, `app/cache/keys.py`, `app/deps.py`, `app/main.py` — plus one function
+`phase6.md` doesn't list, `app/db/repo/provider_keys.py`'s `record_validation_result` (below), plus
+tests. `api/keys.py` gains a second router, `provider_keys_router`, mounted in `main.py` beside the
+existing one — `/v1/provider-keys`, session-only like every route in the module, §9.2's add flow and
+§9.8's rate limit, and nothing downstream reads a stored row yet (that's Step 4). `schemas/keys.py`
+gained `ProviderKeyCreateRequest` (`key: SecretStr`, so a validation error's `repr` can't leak it),
+`ProviderKeyOut`, and `ProviderKeyStatus` — one row per **enabled** `providers.yaml` entry, `pool:
+"shared"|"private"` plus an optional `key`, so the settings page never has to know the provider list
+itself to draw an empty row. `POST /v1/provider-keys` runs §9.2's order exactly — rate limit, then
+`registry.adapter_for` (an unknown/disabled provider is a 400 before any network call), then
+`adapter.validate_key`, then only on `valid=True` does `encrypt_provider_key` + `provider_keys_repo.upsert`
+run; a `ProviderError` raised by the adapter (unreachable) becomes 503 `provider_unavailable`, and
+`valid=False` becomes 422 `invalid_provider_key` — two distinct codes for two distinct facts, so a client
+can tell "your key is bad" from "we couldn't check." `DELETE /v1/provider-keys/{provider}` and
+`POST /v1/provider-keys/{provider}/validate` (the settings page's "check again" button) round out the
+router. `record_validation_result` is a new `provider_keys.py` function, not in `phase6.md`'s Step 3 file
+list — added because Step 1's own `mark_invalid` docstring says that write is D40's fire-and-forget
+path and *not* for "the user re-checking it," which are different events; `validate` needed a write
+that moves `validation_status` and `last_validated_at` together either way, which neither `mark_invalid`
+nor `upsert` alone provides. D43 lands in `app/deps.py`: `GatewayWindow` gains `"rph"`,
+`RATE_LIMIT_WINDOW_S` gains `{RPH: 3600}`, and `RateLimiter.enforce`/new `enforce_one` now share a
+private `_raise_if_over` rather than duplicating the refund-and-raise logic — `enforce_one(user_id,
+window, limit)` takes its ceiling as a bare argument instead of consulting the per-tier `gateway:` block,
+because an anti-abuse floor on one endpoint is neither per-tier nor throughput; `api/keys.py` calls it
+with `("rph", 5)` on both provider-key routes that reach a network. New tests:
+`tests/integration/test_provider_keys_endpoints.py` (a scripted Groq-only registry serving recorded
+`validate_key` fixtures — `models_list`/`auth_failed`/`server_error_html` — covers a valid add, a
+rejected add storing nothing, an unreachable-provider 503 distinct from the 422, replace-on-second-add,
+the enabled-provider listing and its per-user scoping, delete-then-shared, both `validate` outcomes, the
+sixth-call-in-an-hour 429, an API-key principal's 403, and that no response body in the module ever
+carries the plaintext or the ciphertext); `tests/unit/test_rate_limiter.py` and
+`tests/integration/test_repo_provider_keys.py` gained cases for `enforce_one` (allows-to-the-limit,
+429-with-refund, ignores the tier table, fails open, and shares no counter with `enforce`) and
+`record_validation_result` (both outcomes touching `last_validated_at`, unlike `mark_invalid`)
+respectively. `make test` (1293 passed, 1 skipped — the local-OCR test that needs Tesseract), `ruff
+check`, `ruff format --check`, and `mypy` are all green;
+a user can add, list and remove a provider key, and no request is served differently because of it, per
+the step's own "done when."
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

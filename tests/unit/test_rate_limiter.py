@@ -228,3 +228,80 @@ async def test_the_counter_expires_after_two_windows(redis_client: FakeRedis) ->
         keys.rate_limit(str(principal.user_id), "rpm", int(AT_BOUNDARY.timestamp()))
     )
     assert ttl == 60 * keys.RATE_LIMIT_TTL_MULTIPLIER
+
+
+# --------------------------------------------------------------------------- #
+# enforce_one — D43's anti-abuse floor, factored out for the BYOK endpoint
+# --------------------------------------------------------------------------- #
+async def test_enforce_one_allows_up_to_the_limit(redis_client: FakeRedis) -> None:
+    limiter = _limiter(redis_client, FixedClock(AT_BOUNDARY))
+    user_id = uuid4()
+
+    for _ in range(5):
+        await limiter.enforce_one(user_id, "rph", 5)
+
+
+async def test_enforce_one_raises_over_the_limit_with_a_retry_after(
+    redis_client: FakeRedis,
+) -> None:
+    limiter = _limiter(redis_client, FixedClock(AT_BOUNDARY))
+    user_id = uuid4()
+
+    for _ in range(5):
+        await limiter.enforce_one(user_id, "rph", 5)
+
+    with pytest.raises(TooManyRequests) as caught:
+        await limiter.enforce_one(user_id, "rph", 5)
+
+    assert caught.value.status_code == 429
+    assert int(caught.value.headers["Retry-After"]) >= 1
+
+
+async def test_enforce_one_does_not_consult_the_tier_table(redis_client: FakeRedis) -> None:
+    """The whole point of D43's bare-limit argument: an unknown tier still gets
+    enforced, because the caller supplies the ceiling directly rather than
+    ``enforce``'s ``self._limits.get(principal.tier)`` lookup."""
+    limiter = RateLimiter(redis_client, {}, clock=FixedClock(AT_BOUNDARY))
+    user_id = uuid4()
+
+    for _ in range(3):
+        await limiter.enforce_one(user_id, "rph", 3)
+    with pytest.raises(TooManyRequests):
+        await limiter.enforce_one(user_id, "rph", 3)
+
+
+async def test_enforce_one_is_refunded_on_rejection(redis_client: FakeRedis) -> None:
+    clock = FixedClock(AT_BOUNDARY)
+    limiter = _limiter(redis_client, clock)
+    user_id = uuid4()
+
+    for _ in range(5):
+        await limiter.enforce_one(user_id, "rph", 5)
+    for _ in range(3):
+        with pytest.raises(TooManyRequests):
+            await limiter.enforce_one(user_id, "rph", 5)
+
+    counter = keys.rate_limit(str(user_id), "rph", int(AT_BOUNDARY.timestamp()))
+    assert await redis_client.get(counter) == "5"
+
+
+async def test_enforce_one_and_enforce_do_not_share_a_counter(redis_client: FakeRedis) -> None:
+    """``rph`` and ``rpm`` are different segments of the same key format — one
+    user hammering the validation endpoint must not spend their chat budget,
+    or vice versa."""
+    limiter = _limiter(redis_client, FixedClock(AT_BOUNDARY))
+    principal = _principal()
+
+    for _ in range(FREE.rpm):
+        await limiter.enforce(principal)
+    with pytest.raises(TooManyRequests):
+        await limiter.enforce(principal)
+
+    # The rpm budget is spent, but rph is untouched.
+    await limiter.enforce_one(principal.user_id, "rph", 5)
+
+
+async def test_enforce_one_fails_open_on_a_broken_redis() -> None:
+    limiter = RateLimiter(_BrokenRedis(), TIERS, clock=FixedClock(AT_BOUNDARY))  # type: ignore[arg-type]
+    for _ in range(10):
+        await limiter.enforce_one(uuid4(), "rph", 5)

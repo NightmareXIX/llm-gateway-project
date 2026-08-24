@@ -135,6 +135,10 @@ ignore = [
 # decrypted — matching `StorageUnavailable`/`UnknownSlot`/`InvariantViolation`
 # above rather than the `Error`-suffixed convention.
 "app/core/crypto.py" = ["N818"]
+# `InvalidProviderKey`/`ProviderKeyCheckUnavailable` mirror `core/errors.py`'s
+# own AppError subclasses one directory over — none of those end in `Error`
+# either, and this module's two are the same hierarchy.
+"app/api/keys.py" = ["N818"]
 
 [tool.ruff.lint.isort]
 # `src` alone does not make these first-party — ruff resolves it by looking for

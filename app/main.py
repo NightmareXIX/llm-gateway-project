@@ -179,6 +179,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_routes.router)
     app.include_router(keys_routes.router)
+    app.include_router(keys_routes.provider_keys_router)
     app.include_router(chat_routes.router)
     app.include_router(conversations_routes.router)
     app.include_router(files_routes.router)

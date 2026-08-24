@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
 from typing import Annotated, Any, Final
+from uuid import UUID
 
 import httpx
 from fastapi import Depends, Request
@@ -238,8 +239,11 @@ def get_latency(request: Request) -> LatencyTable:
 # --------------------------------------------------------------------------- #
 RPM: Final[keys.GatewayWindow] = "rpm"
 RPD: Final[keys.GatewayWindow] = "rpd"
+RPH: Final[keys.GatewayWindow] = "rph"
+"""D43: the BYOK validation endpoint's own window. Not a tier throughput
+limit — see :meth:`RateLimiter.enforce_one`."""
 
-RATE_LIMIT_WINDOW_S: Final[Mapping[keys.GatewayWindow, int]] = {RPM: 60, RPD: 86_400}
+RATE_LIMIT_WINDOW_S: Final[Mapping[keys.GatewayWindow, int]] = {RPM: 60, RPD: 86_400, RPH: 3600}
 """How wide each of our own windows is. Unrelated to a provider's reset
 semantics — ``quota/windows.py`` owns those, and a provider's day can end at
 midnight Pacific. Ours is simply a rolling day, because there is no external
@@ -326,6 +330,43 @@ class RateLimiter:
             logger.warning("rate_limit.fail_open", error=str(exc), error_type=type(exc).__name__)
             return
 
+        await self._raise_if_over(user_id, counted, now=now, log_fields={"tier": principal.tier})
+
+    async def enforce_one(
+        self, user_id: str | UUID, window: keys.GatewayWindow, limit: int
+    ) -> None:
+        """D43: a fixed limit on one window, for one caller — not a tier's.
+
+        ``enforce`` reads its limits from ``config/limits.yaml``'s per-tier
+        ``gateway:`` block, which is throughput policy for our users in
+        general. This is an anti-abuse floor on a single endpoint (the BYOK
+        validation route), which is neither per-tier nor throughput, so it
+        takes its limit as a bare argument instead of consulting
+        ``self._limits`` — see ``api/keys.py``'s ``KEY_VALIDATION_LIMIT_PER_HOUR``.
+
+        Shares ``_count``, ``_refund`` and ``_retry_after_s`` with
+        :meth:`enforce` rather than duplicating them, factored out for exactly
+        this second caller.
+        """
+        user_id_str = str(user_id)
+        now = self._clock.now().timestamp()
+
+        try:
+            counted = await self._count(user_id_str, ((window, limit),), now=now)
+        except Exception as exc:
+            logger.warning("rate_limit.fail_open", error=str(exc), error_type=type(exc).__name__)
+            return
+
+        await self._raise_if_over(user_id_str, counted, now=now)
+
+    async def _raise_if_over(
+        self,
+        user_id: str,
+        counted: Sequence[_Counted],
+        *,
+        now: float,
+        log_fields: Mapping[str, Any] | None = None,
+    ) -> None:
         for window in counted:
             if window.count <= window.limit:
                 continue
@@ -334,11 +375,11 @@ class RateLimiter:
             retry_after_s = _retry_after_s(window, now=now)
             logger.warning(
                 "rate_limit.exceeded",
-                tier=principal.tier,
                 window=window.name,
                 limit=window.limit,
                 count=round(window.count, 2),
                 retry_after_s=retry_after_s,
+                **(log_fields or {}),
             )
             raise TooManyRequests(
                 f"You have used your {window.name.upper()} allowance of "

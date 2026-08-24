@@ -50,11 +50,17 @@ QuotaWindow = Literal["rpm", "rpd", "tpm", "tpd"]
 """The four windows a provider may publish. Hitting any one of them is a 429,
 independently of the others — which is why they are four counters and not one."""
 
-GatewayWindow = Literal["rpm", "rpd"]
-"""The two windows *we* limit *our own* users on (D20). A deliberately separate
-type from :data:`QuotaWindow`: the gateway counts requests per user and never
-tokens, and conflating the two would let a ``tpm`` reach a key that has no
-meaning for it."""
+GatewayWindow = Literal["rpm", "rpd", "rph"]
+"""The windows *we* limit *our own* users on. A deliberately separate type from
+:data:`QuotaWindow`: the gateway counts requests per user and never tokens, and
+conflating the two would let a ``tpm`` reach a key that has no meaning for it.
+
+``rpm``/``rpd`` are D20's per-tier chat throughput limit. ``rph`` is D43's
+anti-abuse floor on the BYOK validation endpoint — a third legal value in an
+existing segment, which is what Phase 3 Step 10's amendment to the
+``rl:{user_id}:{window}:{window_start}`` format (ADR-022) was for. Not a
+second Contract C change: the key shape is untouched, only the set of strings
+that may fill this one segment grew."""
 
 
 # --------------------------------------------------------------------------- #
