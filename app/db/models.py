@@ -413,3 +413,131 @@ class FileExtraction(Base):
     and reading as "zero pages"."""
 
     created_at: Mapped[datetime] = _created_at()
+
+
+# --------------------------------------------------------------------------- #
+# provider_keys
+# --------------------------------------------------------------------------- #
+class ProviderKey(Base):
+    """A BYOK credential. Phase 6, D36/D37.
+
+    ``project-overview.md`` §6 describes ``owner_type='system'`` rows backing
+    the shared pool. D37 decided against that: the shared pool stays in
+    ``Settings`` (env-injected, checked at boot, no database round trip on the
+    hot path), so **only ``owner_type='user'`` rows are ever written in v1**.
+    The column and its CHECK are created exactly as §6 specifies so a later
+    phase can populate the other half without a migration.
+
+    ``encrypted_key`` is a Fernet token (``app/core/crypto.py``) — the
+    plaintext never reaches this table. There is deliberately no index on
+    ``encrypted_key`` and no uniqueness on ``last_4``: nothing looks a key up
+    by its value, only by owner, which is what
+    ``ix_provider_keys_owner_id_provider`` serves.
+    """
+
+    __tablename__ = "provider_keys"
+    __table_args__ = (
+        CheckConstraint("owner_type in ('system', 'user')", name="owner_type_known"),
+        # owner_id is null exactly when the row is system-owned.
+        CheckConstraint(
+            "(owner_type = 'system' and owner_id is null) "
+            "or (owner_type = 'user' and owner_id is not null)",
+            name="owner_type_matches_owner_id",
+        ),
+        CheckConstraint(
+            "validation_status in ('valid', 'invalid', 'unverified')",
+            name="validation_status_known",
+        ),
+        Index("ix_provider_keys_owner_id_provider", "owner_id", "provider"),
+        # §9.5's granularity: one live key per (user, provider) — the reason
+        # "replace" is remove-then-add rather than a rotation flow (D36).
+        # Partial so a soft-deleted row never blocks re-adding.
+        Index(
+            "uq_provider_keys_owner_id_provider_active",
+            "owner_id",
+            "provider",
+            unique=True,
+            postgresql_where=text("owner_type = 'user' and is_active"),
+        ),
+    )
+
+    id: Mapped[UUID] = _pk()
+    owner_type: Mapped[str] = mapped_column(nullable=False)
+    owner_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), default=None
+    )
+    provider: Mapped[str] = mapped_column(nullable=False)
+    """Matches a ``providers.yaml`` key. Deliberately not a foreign key to
+    anything — the provider registry is config, not a table."""
+
+    encrypted_key: Mapped[str] = mapped_column(nullable=False)
+    last_4: Mapped[str] = mapped_column(nullable=False)
+    """The only part of the credential that ever leaves this table."""
+
+    nickname: Mapped[str | None] = mapped_column(default=None)
+
+    validation_status: Mapped[str] = mapped_column(
+        server_default=text("'unverified'"), nullable=False
+    )
+    last_validated_at: Mapped[datetime | None] = mapped_column(default=None)
+    last_used_at: Mapped[datetime | None] = mapped_column(default=None)
+    """Written at resolve time, not at success time (D38) — throttled the same
+    way ``api_keys.last_used_at`` is, and for the same reason: threading a
+    post-success callback through both lanes to answer "when was this handed
+    out" more precisely would be machinery for a column nobody sorts on."""
+
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"), nullable=False)
+    """Remove is a soft delete, like ``api_keys.revoke`` — ``requests`` never
+    references this table directly, but the settings UI still benefits from
+    being able to show a key that was removed rather than pretending it never
+    existed. The partial unique index above is what makes re-adding after a
+    soft delete possible."""
+
+    created_at: Mapped[datetime] = _created_at()
+
+
+# --------------------------------------------------------------------------- #
+# user_quota_allocations
+# --------------------------------------------------------------------------- #
+class UserQuotaAllocation(Base):
+    """D39's personal daily cap on the shared pool — an override table.
+
+    Stores the *cap*, not the *count*. The live count is Redis
+    (``keys.user_allocation``, Phase 6 Step 7's ``q:{user_id}:{provider}:
+    {model}:alloc:rpd``); a row here says "this user's slice of the shared
+    pool for this (provider, model) is N requests/day". No row and no
+    configured tier default in ``config/limits.yaml`` means no personal cap —
+    today's behaviour. ``project-overview.md`` §6 also names ``daily_used``
+    and ``window_reset_at`` on this table; they are deliberately absent here,
+    because the live count already lives in Redis and two perpetually-null
+    columns would be worse than none (D39) — the same "the overview names a
+    table, Redis holds the counter" precedent ``file_extractions``/
+    ``provider_quota_state`` already set.
+
+    Read-only in Phase 6 Step 1: rows are written by hand or a seed script
+    until an admin surface exists (Phase 7's ``api/admin.py``).
+    """
+
+    __tablename__ = "user_quota_allocations"
+    __table_args__ = (
+        CheckConstraint("daily_cap > 0", name="daily_cap_positive"),
+        UniqueConstraint(
+            "user_id",
+            "provider",
+            "model",
+            name="uq_user_quota_allocations_user_id_provider_model",
+        ),
+    )
+
+    id: Mapped[UUID] = _pk()
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(nullable=False)
+    model: Mapped[str] = mapped_column(nullable=False)
+    daily_cap: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now(), nullable=False
+    )

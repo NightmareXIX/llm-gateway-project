@@ -7,7 +7,7 @@ through a separate "perception lane" even when the answering model can't. Portfo
 entirely on free tiers. Full specs: [contracts-and-phase1.md](doc/reference/contracts-and-phase1.md),
 [project-overview.md](doc/reference/project-overview.md), [development-plan.md](doc/reference/development-plan.md),
 [phase2.md](doc/reference/phase2.md), [phase3.md](doc/reference/phase3.md), [phase4.md](doc/reference/phase4.md),
-[phase5.md](doc/reference/phase5.md).
+[phase5.md](doc/reference/phase5.md), [phase6.md](doc/reference/phase6.md).
 Where the overview and the contracts doc disagree, the contracts doc wins.
 
 ## Locked decisions (§1) — do not relitigate
@@ -92,7 +92,7 @@ app/
   cache/{keys,client,exact}.py
   keys_resolution/resolver.py
   usage/{logger,metrics}.py
-  db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,files,extractions}.py}
+  db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,allocations,files,extractions}.py}
 frontend/            # Next.js App Router + Tailwind; lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip}.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
@@ -102,14 +102,41 @@ README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.exampl
 
 ## Current phase: Phase 6 — BYOK Settings
 
-Not started. Per `development-plan.md` §3 Phase 6 (§9 implemented end to end): `provider_keys` and
-`user_quota_allocations` migrations, encryption at rest for a user's own provider keys,
-`resolve_provider_key(user_id, provider)` called on every request (no caching at login), quota
-branching between the shared pool and a user's private cap, a rate-limited key-validation endpoint, and
-`/v1/models` personalization so a private key surfaces a slot others don't see. No `phase6.md` has been
-written yet — Phase 5 left `keys_resolution/resolver.py` as the empty package this phase's first file
-goes into, and `scope` as the one constant (`keys.SYSTEM_SCOPE`) every call site in both lanes still
-passes, per `phase5.md` §9.
+In progress. Ten steps, three milestones, per `phase6.md` (derived from `development-plan.md` §3 Phase 6
+read against `project-overview.md` §9 in full, since the plan itself says only "§9 implemented end to
+end"). **Milestone A** (Steps 1–3) gets the key stored, encrypted, addable and removable with nothing
+using it yet; **Milestone B** (Steps 4–7) is the resolver and both lanes threaded, quota branched, and
+the disclosure on the wire; **Milestone C** (Steps 8–10) is the leak test, personalization, the UI, and
+the documentation. `phase6.md` §2's own seam table is the map of exactly what each step touches and
+why — most of the phase's seven overview tasks were already mostly built by Phases 1–5 (`validate_key`,
+`core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
+per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
+
+**Status: Step 1 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+`phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
+`project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
+in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
+a partial unique index on `(owner_id, provider) WHERE owner_type='user' AND is_active` enforces §9.5's
+one-live-key-per-provider granularity without blocking re-adding after a soft delete) and
+`user_quota_allocations` (D39's personal-cap override table — `daily_cap` only, no `daily_used`/
+`window_reset_at`; the live count is Redis, per D39's `keys.user_allocation` key landing in Step 7).
+`app/db/models.py` gained `ProviderKey` and `UserQuotaAllocation` after `FileExtraction`, in the file's
+existing style. `app/db/repo/provider_keys.py` follows `api_keys.py` line for line — `list_for_user`,
+`get_active`, `list_active_for_user` (the resolver's one query, D38), `upsert` (deactivate-then-insert,
+mandatory under the partial index), `deactivate`, `touch_last_used` (throttled, copied from
+`api_keys.py`), and `mark_invalid` (D40's disclosure write). `deactivate` deliberately does not filter on
+the row's current `is_active` state in its WHERE clause, mirroring `api_keys.revoke`'s idempotence
+exactly: a second removal still matches and still returns `True`, so a repeat `DELETE` reads as `204`
+rather than `404` once a key has ever existed for that provider. `app/db/repo/allocations.py` holds the
+one read function Phase 6 needs, `get_cap` — the table stays write-by-hand until Phase 7's admin surface.
+New tests: `tests/integration/test_repo_provider_keys.py` (partial unique index refusing a second active
+row and not blocking a re-add after a soft delete, the `owner_type`/`owner_id` and `validation_status`
+CHECKs, ownership scoping on every function, `upsert` replacing, `deactivate` idempotent, the
+`last_used_at` throttle, `mark_invalid`) and `tests/integration/test_repo_allocations.py` (the cap
+lookup scoped to the exact `(user, provider, model)` triple, the unique constraint, the `daily_cap > 0`
+CHECK). `make migrate` round-trips clean (`upgrade head` → `downgrade -1` → `upgrade head`); `make test`,
+`make lint`, and `make typecheck` are all green; nothing in `app/` outside the two new repo modules reads
+either table yet, per the step's own "done when."
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 
