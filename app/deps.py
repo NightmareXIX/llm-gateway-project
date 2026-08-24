@@ -26,6 +26,7 @@ from app.config import GatewayLimits, get_limits_config, get_settings
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.errors import TooManyRequests
 from app.core.logging import get_logger
+from app.keys_resolution.resolver import ProviderCredentials, UserCredentials
 from app.memory.render import AttachmentResolver
 from app.perception.lane import PerceptionResolver
 from app.perception.storage import ObjectStore
@@ -220,6 +221,33 @@ def get_resolver(
         redis=redis,
         settings=settings,
     )
+
+
+def get_credentials(request: Request, principal: Principal) -> ProviderCredentials:
+    """This request's credential-and-scope resolver (D36, D38).
+
+    A **plain factory**, not a FastAPI dependency in its own right — it needs
+    the authenticated principal, and ``app.auth.dependency`` imports this
+    module for ``SessionDep``/``RateLimiterDep``, so a ``Depends(get_principal)``
+    parameter here would be the same import cycle ``get_rate_limiter``'s
+    docstring already documents. The caller composes it: ``api/v1/chat.py``'s
+    ``CredentialsDep`` wraps this in a small ``Depends``-bound function of its
+    own, exactly the way ``RateLimitDep`` composes ``enforce_rate_limit``.
+
+    Always a fresh :class:`~app.keys_resolution.resolver.UserCredentials`,
+    never cached across requests: D38's whole point is that removing a key
+    takes effect on the very next message, and a resolver held longer than
+    one request would go on serving a revoked key until it expired. The
+    ``session_factory`` — not a request-scoped session — is what lets it
+    survive into the streaming path the same way ``get_resolver`` already
+    does.
+
+    Nothing calls this yet (Phase 6 Step 4). Step 5 wires it through the
+    answer lane, Step 6 through the perception lane.
+    """
+    registry = get_registry(request)
+    session_factory = get_session_factory(request)
+    return UserCredentials(principal.user_id, registry, session_factory)
 
 
 def get_latency(request: Request) -> LatencyTable:

@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–3 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–4 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -204,6 +204,35 @@ carries the plaintext or the ciphertext); `tests/unit/test_rate_limiter.py` and
 respectively. `make test` (1293 passed, 1 skipped — the local-OCR test that needs Tesseract), `ruff
 check`, `ruff format --check`, and `mypy` are all green;
 a user can add, list and remove a provider key, and no request is served differently because of it, per
+the step's own "done when."
+
+Step 4 (the resolver) touches exactly the files `phase6.md` names — `app/keys_resolution/resolver.py`
+(new) and `app/deps.py` — plus tests. `resolver.py` makes D36's sketch real: `ResolvedKey` (the one
+object that replaces the router's two separate questions — which credential, whose quota), the
+`ProviderCredentials` protocol, `SystemCredentials` (three lines — the default every existing call site
+gets when it passes no resolver, which is what keeps every pre-Phase-6 test passing unchanged), and
+`UserCredentials` (§9.3 — a user's own key first, the shared pool second, memoized once per request
+behind an `asyncio.Lock` rather than once per candidate, per D38). `_load_once` issues
+`list_active_for_user`'s one query and, in that same session, touches `last_used_at` for every row it
+loads — not only the provider a caller eventually asks about, which trades precision for the
+one-round-trip cost D38 argues for, the same call `db/repo/provider_keys.py`'s own throttle docstring
+already makes about this column. A row that fails to decrypt — `CredentialUnreadable`, an
+`ENCRYPTION_KEY` rotated out from under it — falls back to the shared pool rather than failing the
+request, logging the `key_id` and never the ciphertext. `app/deps.py` gains one export,
+`get_credentials(request, principal) -> ProviderCredentials`, a plain factory rather than a FastAPI
+dependency: it needs the authenticated principal, and `app.auth.dependency` already imports this module
+for `SessionDep`/`RateLimiterDep`, so a `Depends(get_principal)` parameter here would be the same import
+cycle `get_rate_limiter`'s own docstring documents. Step 5 composes it into a `CredentialsDep` at the
+call site in `api/v1/chat.py`, the way `RateLimitDep` composes `enforce_rate_limit` — nothing calls
+`get_credentials` yet. New tests: `tests/integration/test_key_resolver.py` (the real-database fixture,
+since `UserCredentials` opens its own session, the same D14 shape `PerceptionResolver` already uses)
+cover `SystemCredentials` answering identically for every provider; `UserCredentials` with no rows, with
+a stored row, and the mixed case that matters most — one provider private, one still shared, one
+resolver, two scopes, §9.5 exercised directly; two `for_provider` calls issuing one query, counted via
+an instrumented session factory; a revoked row staying invisible; and an undecryptable row falling back
+to the shared pool while logging the failure. `make test` (1300 passed, 1 skipped), `ruff check`, `ruff
+format --check`, and `mypy` are all green; the resolver is complete and unit-tested, and nothing outside
+`deps.py`/`resolver.py` itself calls `UserCredentials`, `SystemCredentials`, or `get_credentials`, per
 the step's own "done when."
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
