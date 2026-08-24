@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–4 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–5 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -234,6 +234,60 @@ to the shared pool while logging the failure. `make test` (1300 passed, 1 skippe
 format --check`, and `mypy` are all green; the resolver is complete and unit-tested, and nothing outside
 `deps.py`/`resolver.py` itself calls `UserCredentials`, `SystemCredentials`, or `get_credentials`, per
 the step's own "done when."
+
+Step 5 (threading the answer lane) touches exactly the files `phase6.md` names — `app/routing/router.py`,
+`app/streaming/orchestrator.py`, `app/api/v1/chat.py` — plus `app/deps.py` and
+`app/keys_resolution/resolver.py` (both explained below) and tests. `route` and `route_stream` both drop
+`scope: keys.Scope = keys.SYSTEM_SCOPE` and gain `credentials: ProviderCredentials | None = None`,
+defaulting to `SystemCredentials(registry)`; inside each candidate loop, `registry.system_key(spec.provider)`
+becomes `resolved = await credentials.for_provider(spec.provider)`, and every `quota.reserve`/`commit`/
+`_reconcile_hint` call in that iteration reads `resolved.scope` in place of the old parameter — D36's one
+object answering both questions, per candidate, exactly as the step's own file-list note ("there are more
+of these than the reserve") warned: `_reconcile_hint` alone appears four times across the two loops.
+`grep -n "scope=" app/routing/router.py` after the edit shows only `resolved.scope` and `_reconcile_hint`'s
+own pass-through parameter, matching the step's "done when" literally. D42's disclosure plumbing lands here
+too, one layer below the wire: `AttemptRecord` gains `key_pool: str | None = None` (in `to_json()` beside
+`retry_after_s`/`blocked_window`), `RouterOutcome` and `StreamCompleted` both gain a required
+`key_pool: Literal["shared", "private"]` (the winning attempt's), and `RoutingFailed` gains an optional
+`key_pool` naming the last attempted candidate's pool — tracked via a `last_key_pool` local beside the
+existing `last_spec`, so an exhausted chain still reports which pool its last real attempt used. In
+`orchestrator.py`, `_Turn` gains `key_pool`, assigned in both `complete()` (mirroring `extraction_tier`) and
+`record_failure()` (reading `failure.key_pool` — unlike `extraction_tier`, which only a success sets, a
+failed stream still has to say which pool served its last attempt, never a stale value from an earlier one,
+per Phase 5 trap 8) and threaded onto `StreamResult.key_pool` in `result()`; `sse.DoneEvent` itself gains no
+field yet — that wire step is D42's Step 7, and `_Turn`/`StreamResult` exist now so Step 7 has something to
+read off rather than a second file to open here. `api/v1/chat.py` composes `CredentialsDep` — a
+`_get_credentials(request, principal, session_factory)` function wrapped in `Depends`, exactly the shape
+`RateLimitDep` composes `enforce_rate_limit` in — and both call sites drop `scope=keys.SYSTEM_SCOPE` in
+favor of `credentials=credentials`; the two "Constant until Phase 6" comments are gone, along with the
+now-unused `app.cache.keys` import.
+
+Wiring `get_credentials` into a real request surfaced a genuine bug in Step 4's implementation, fixed in
+this commit rather than carried forward: it read its session factory via a bare `get_session_factory
+(request)` call, which reads `request.app.state.db_session_factory` directly and bypasses FastAPI's
+`Depends`-resolution machinery entirely — the very machinery `tests/conftest.py`'s
+`app.dependency_overrides[get_session_factory]` patches for the whole suite. Every integration test that
+reached this path failed with `AttributeError: 'State' object has no attribute 'db_session_factory'`
+(the test app never sets that attribute, by design — everything goes through the override). Latent since
+Step 4 because nothing called `get_credentials` yet. Fixed by giving `get_credentials` a `session_factory`
+parameter instead of fetching it internally, and having `_get_credentials` resolve it as a real
+`Depends(get_session_factory)` sub-dependency (the same shape `get_resolver` already uses) before passing
+it down — both files' docstrings now explain why the difference matters under test. New tests:
+`tests/unit/test_router.py` gains a two-provider fixture (`TWO_PROVIDER_CONFIG`, Groq leading into Gemini),
+a `ScriptedCredentials` double answering a fixed `ResolvedKey` per provider and recording every call, and
+one test each for `route` and `route_stream` driving a chain that fails over from Groq to Gemini and
+asserting `credentials.calls == [PROVIDER, GEMINI_PROVIDER]`, each attempt's outbound `Authorization`/
+`x-goog-api-key` header carried the matching resolved key, `outcome.key_pool`/`completed.key_pool` named
+the winning pool, and (non-streaming only) the two attempts' reservations landed under two different
+`QuotaTracker` scopes with neither leaking into the other's counters — §9.5 exercised directly, the case
+the step's own file-list note calls "the test that matters most." `tests/integration/test_chat_endpoint.py`
+gains `test_a_turn_is_served_under_a_stored_private_key`: a user's key stored via `provider_keys_repo
+.upsert`, a chat turn sent on the very next request, and the mock transport's captured `Authorization`
+header asserted to carry the private key and never the shared pool's — the one test in the suite that
+proves the router asks the resolver instead of `registry.system_key`, complementing rather than
+duplicating `test_key_resolver.py`'s resolver-only coverage. `make test` (1303 passed, 1 skipped), `ruff
+check`, `ruff format --check`, and `mypy` are all green; `grep -n "SYSTEM_SCOPE" app/routing app/streaming
+app/api/v1/chat.py` returns nothing, per the step's own "done when."
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

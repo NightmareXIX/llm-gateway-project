@@ -41,6 +41,7 @@ import json
 import random
 from collections.abc import Iterator
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -50,6 +51,7 @@ from app.cache import keys
 from app.cache.client import LuaScriptRegistry
 from app.config import LimitsConfig, ProviderEntry, ProvidersConfig, Slot, SlotCandidate
 from app.core.clock import FixedClock
+from app.keys_resolution.resolver import ResolvedKey
 from app.memory.canonical import CanonicalMessage
 from app.providers.errors import (
     BadRequest,
@@ -885,6 +887,7 @@ async def test_the_trail_serializes_to_the_documented_shape(
         "latency_ms",
         "wasted_tokens_out",
         "breaker",
+        "key_pool",
     }
     assert first["n"] == 1
     assert first["slot"] == "general"
@@ -1065,6 +1068,237 @@ async def test_a_stream_that_never_produces_a_delta_is_an_empty_response(
     assert isinstance(failure.value.error, EmptyResponse)
     # Retryable, so the one pinned candidate is tried twice and then given up on.
     assert failure.value.attempts == 2
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 5 — per-candidate credentials (D36, §9.5)
+# --------------------------------------------------------------------------- #
+GEMINI_PROVIDER = "gemini"
+GEMINI_MODEL = "gemini-3.6-flash"
+
+
+def _gemini_candidate(model: str) -> SlotCandidate:
+    return SlotCandidate(
+        provider=GEMINI_PROVIDER,
+        model=model,
+        context_tokens=131072,
+        max_output_tokens=32768,
+        capabilities=("text",),
+        supports_streaming=True,
+    )
+
+
+TWO_PROVIDER_CONFIG = ProvidersConfig(
+    version=1,
+    providers={
+        PROVIDER: ProviderEntry(
+            enabled=True,
+            base_url="https://api.groq.com/openai/v1",
+            api_key_env="GROQ_API_KEY",
+        ),
+        GEMINI_PROVIDER: ProviderEntry(
+            enabled=True,
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            api_key_env="GEMINI_API_KEY",
+        ),
+    },
+    slots={
+        # Groq leads so the first attempt fails and the chain has to cross onto
+        # Gemini — the only way one request ever resolves credentials twice.
+        "general": Slot(
+            description="test slot",
+            candidates=(_candidate("model-a"), _gemini_candidate(GEMINI_MODEL)),
+        ),
+    },
+)
+
+
+def _quota_limits_multi(*, rpm: int = 1, tpm: int = 100_000) -> LimitsConfig:
+    """:func:`_quota_limits`, extended with Gemini's candidate — the fixture a
+    chain crossing both providers in :data:`TWO_PROVIDER_CONFIG` needs."""
+    model_limits = {
+        "rpm": rpm,
+        "tpm": tpm,
+        "reset": {"rpm": "rolling_60s", "tpm": "rolling_60s"},
+    }
+    return LimitsConfig.model_validate(
+        {
+            "version": 1,
+            "limits": {
+                PROVIDER: dict.fromkeys(FLEET, model_limits),
+                GEMINI_PROVIDER: {GEMINI_MODEL: model_limits},
+            },
+            "gateway": {"free": {"rpm": 20, "rpd": 500}},
+        }
+    )
+
+
+@pytest.fixture
+def quota_multi(redis_client: FakeRedis, frozen_clock: FixedClock) -> QuotaTracker:
+    scripts = LuaScriptRegistry(redis_client)
+    scripts.load_dir()
+    return QuotaTracker(
+        redis_client, scripts, _quota_limits_multi(), clock=frozen_clock, headroom=0.0
+    )
+
+
+class ScriptedCredentials:
+    """A :class:`~app.keys_resolution.resolver.ProviderCredentials` double that
+    answers a fixed :class:`~app.keys_resolution.resolver.ResolvedKey` per
+    provider and records every call — D36's per-candidate contract, driven
+    directly rather than through the database :class:`~app.keys_resolution
+    .resolver.UserCredentials` needs (that class has its own suite,
+    ``tests/integration/test_key_resolver.py``)."""
+
+    def __init__(self, by_provider: dict[str, ResolvedKey]) -> None:
+        self._by_provider = by_provider
+        self.calls: list[str] = []
+
+    async def for_provider(self, provider: str) -> ResolvedKey:
+        self.calls.append(provider)
+        return self._by_provider[provider]
+
+
+class _MixedProviderScript:
+    """Serves a fixed sequence of pre-built responses across two providers.
+
+    ``ScriptedHandler`` and ``_StreamScript`` each assume every response in
+    the sequence is shaped the same way (JSON, or SSE); this one is for a
+    chain where the first attempt is one provider's ordinary JSON error and
+    the second is another provider's SSE stream.
+    """
+
+    def __init__(self, *responses: httpx.Response) -> None:
+        self._responses = list(responses)
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self._responses[len(self.requests) - 1]
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self))
+
+
+def _credentials_for(*, groq_scope: keys.Scope = keys.SYSTEM_SCOPE) -> ScriptedCredentials:
+    """Groq stays on the shared pool; Gemini resolves to a private key under a
+    user's own scope — the mixed case §9.5 exists to make possible."""
+    return ScriptedCredentials(
+        {
+            PROVIDER: ResolvedKey(
+                provider=PROVIDER,
+                key="shared-groq-key",
+                pool="shared",
+                scope=groq_scope,
+                key_id=None,
+            ),
+            GEMINI_PROVIDER: ResolvedKey(
+                provider=GEMINI_PROVIDER,
+                key="private-gemini-key",
+                pool="private",
+                scope="user-42",
+                key_id=uuid4(),
+            ),
+        }
+    )
+
+
+async def test_a_chain_crossing_two_providers_resolves_credentials_per_candidate(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    quota_multi: QuotaTracker,
+) -> None:
+    """§9.5: a user can hold a private key for one provider in the chain and
+    stay on the shared pool for the next. D36 says the resolver answers this
+    per candidate, not once for the whole request — this is the chain where
+    getting that wrong would actually show: two providers, two scopes, one
+    failover.
+    """
+    handler = provider_fixtures.ScriptedHandler(
+        provider_fixtures.load(PROVIDER, "rate_limited"),
+        provider_fixtures.load(GEMINI_PROVIDER, "success"),
+    )
+    registry = build_registry(client=handler.client(), config=TWO_PROVIDER_CONFIG)
+    credentials = _credentials_for()
+
+    outcome = await router.route(
+        registry=registry,
+        breaker=breaker,
+        history=history,
+        params=PARAMS,
+        requested="general",
+        quota=quota_multi,
+        credentials=credentials,
+        rng=random.Random(0),
+        sleep=_no_sleep,
+    )
+
+    assert credentials.calls == [PROVIDER, GEMINI_PROVIDER]
+    assert outcome.spec.provider == GEMINI_PROVIDER
+    assert outcome.key_pool == "private"
+    assert outcome.trail[0].key_pool == "shared"
+    assert outcome.trail[1].key_pool == "private"
+
+    # Each attempt actually carried the key resolved for *its* provider.
+    assert handler.requests[0].headers["authorization"] == "Bearer shared-groq-key"
+    assert handler.requests[1].headers["x-goog-api-key"] == "private-gemini-key"
+
+    # And each attempt's reservation landed under its own scope — never the
+    # other provider's, and never crossed.
+    groq_spec, gemini_spec = registry.candidates("general")
+    groq_used = {
+        state.window: state
+        for state in await quota_multi.remaining(groq_spec, scope=keys.SYSTEM_SCOPE)
+    }
+    gemini_used = {
+        state.window: state for state in await quota_multi.remaining(gemini_spec, scope="user-42")
+    }
+    assert groq_used["rpm"].used == 1
+    assert gemini_used["rpm"].used == 1
+    gemini_under_shared = {
+        state.window: state
+        for state in await quota_multi.remaining(gemini_spec, scope=keys.SYSTEM_SCOPE)
+    }
+    assert gemini_under_shared["rpm"].used == 0
+
+
+async def test_a_streamed_chain_crossing_two_providers_resolves_credentials_per_candidate(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    quota_multi: QuotaTracker,
+) -> None:
+    """The streaming twin: the same §9.5 contract, through the restart
+    machinery :func:`~app.routing.router.route_stream` adds on top."""
+    handler = _MixedProviderScript(
+        provider_fixtures.load(PROVIDER, "rate_limited").to_response(),
+        httpx.Response(200, text=provider_fixtures.read_sse(GEMINI_PROVIDER, "stream_success")),
+    )
+    registry = build_registry(client=handler.client(), config=TWO_PROVIDER_CONFIG)
+    credentials = _credentials_for()
+
+    events = router.route_stream(
+        registry=registry,
+        breaker=breaker,
+        history=history,
+        params=PARAMS,
+        requested="general",
+        quota=quota_multi,
+        credentials=credentials,
+        sleep=_no_sleep,
+    )
+
+    completed: router.StreamCompleted | None = None
+    async for event in events:
+        if isinstance(event, router.StreamCompleted):
+            completed = event
+
+    assert completed is not None
+    assert completed.spec.provider == GEMINI_PROVIDER
+    assert completed.key_pool == "private"
+    assert credentials.calls == [PROVIDER, GEMINI_PROVIDER]
+
+    assert handler.requests[0].headers["authorization"] == "Bearer shared-groq-key"
+    assert handler.requests[1].headers["x-goog-api-key"] == "private-gemini-key"
 
 
 # --------------------------------------------------------------------------- #

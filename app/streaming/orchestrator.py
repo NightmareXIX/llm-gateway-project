@@ -62,6 +62,7 @@ from app.cache import keys
 from app.cache.exact import CachedResponse, chunk_for_replay
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
+from app.keys_resolution.resolver import ProviderCredentials
 from app.memory.canonical import CanonicalMessage
 from app.memory.render import AttachmentResolver
 from app.providers.base import (
@@ -136,6 +137,12 @@ class StreamResult:
     ``_Turn.complete`` — a failed turn never reached a successful render, so
     it stays the default ``0``, exactly like ``degraded`` and
     ``extraction_tier`` above."""
+
+    key_pool: Literal["shared", "private"] | None = None
+    """D42's disclosure: which pool served the last real attempt of this
+    turn, success or failure — unlike ``degraded``/``extraction_tier``,
+    which are only meaningful on a success. ``None`` only when no candidate
+    was ever reached (every one skipped on an open breaker)."""
 
 
 class StreamPersistence(Protocol):
@@ -280,7 +287,7 @@ async def stream_completion(
     rank_by_latency: bool = True,
     resolver: AttachmentResolver | None = None,
     quota: QuotaTracker | None = None,
-    scope: keys.Scope = keys.SYSTEM_SCOPE,
+    credentials: ProviderCredentials | None = None,
     redis: Redis | None = None,
     persistence: StreamPersistence | None = None,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
@@ -312,7 +319,7 @@ async def stream_completion(
         rank_by_latency=rank_by_latency,
         resolver=resolver,
         quota=quota,
-        scope=scope,
+        credentials=credentials,
         timeout_s=timeout_s,
         idle_timeout_s=idle_timeout_s,
         first_token_timeout_s=first_token_timeout_s,
@@ -486,6 +493,7 @@ class _Turn:
     degraded: bool
     extraction_tier: ExtractionTier | None
     messages_dropped: int
+    key_pool: Literal["shared", "private"] | None
 
     def __init__(
         self,
@@ -518,6 +526,7 @@ class _Turn:
         self.degraded = False
         self.extraction_tier = None
         self.messages_dropped = 0
+        self.key_pool = None
 
     # ---- transitions ------------------------------------------------------ #
     def begin(self, event: routing.AttemptStarted) -> None:
@@ -546,6 +555,7 @@ class _Turn:
         self.degraded = event.report.degraded
         self.extraction_tier = event.report.extraction_tier
         self.messages_dropped = event.report.messages_dropped
+        self.key_pool = event.key_pool
         self.done = True
 
     def record_failure(self, failure: routing.RoutingFailed) -> None:
@@ -556,6 +566,11 @@ class _Turn:
         self.attempts = failure.attempts
         self.latency_ms = failure.latency_ms
         self.wasted_tokens_out = failure.wasted_tokens_out
+        # A failed stream still has to say which pool served its last real
+        # attempt — never a stale value from an earlier, discarded one
+        # (Phase 5 trap 8, Phase 4's `extraction_tier`). `None` only when
+        # every candidate was skipped and nothing ever resolved.
+        self.key_pool = failure.key_pool
         # Whatever the last attempt had managed before it died is still the
         # furthest anything got, and `abort` only sees a buffer it is clearing.
         text = "".join(self.buffer)
@@ -642,6 +657,7 @@ class _Turn:
             degraded=self.degraded,
             extraction_tier=self.extraction_tier,
             messages_dropped=self.messages_dropped,
+            key_pool=self.key_pool,
         )
 
     def _served(self) -> ModelSpec:

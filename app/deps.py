@@ -223,7 +223,11 @@ def get_resolver(
     )
 
 
-def get_credentials(request: Request, principal: Principal) -> ProviderCredentials:
+def get_credentials(
+    request: Request,
+    principal: Principal,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> ProviderCredentials:
     """This request's credential-and-scope resolver (D36, D38).
 
     A **plain factory**, not a FastAPI dependency in its own right — it needs
@@ -234,6 +238,17 @@ def get_credentials(request: Request, principal: Principal) -> ProviderCredentia
     ``CredentialsDep`` wraps this in a small ``Depends``-bound function of its
     own, exactly the way ``RateLimitDep`` composes ``enforce_rate_limit``.
 
+    ``session_factory`` is taken as a parameter — resolved by the caller via
+    ``Depends(get_session_factory)``, the same sub-dependency ``get_resolver``
+    already takes — rather than fetched here with a bare ``get_session_factory
+    (request)`` call. The two look equivalent, but only the ``Depends`` form
+    goes through FastAPI's dependency-resolution machinery, which is what a
+    test's ``app.dependency_overrides[get_session_factory]`` actually patches;
+    a direct call reads ``request.app.state.db_session_factory`` unconditionally
+    and would silently ignore the override, working in production and raising
+    ``AttributeError`` in every test that reaches this path. Found the moment
+    Step 5 wired this in.
+
     Always a fresh :class:`~app.keys_resolution.resolver.UserCredentials`,
     never cached across requests: D38's whole point is that removing a key
     takes effect on the very next message, and a resolver held longer than
@@ -241,12 +256,8 @@ def get_credentials(request: Request, principal: Principal) -> ProviderCredentia
     ``session_factory`` — not a request-scoped session — is what lets it
     survive into the streaming path the same way ``get_resolver`` already
     does.
-
-    Nothing calls this yet (Phase 6 Step 4). Step 5 wires it through the
-    answer lane, Step 6 through the perception lane.
     """
     registry = get_registry(request)
-    session_factory = get_session_factory(request)
     return UserCredentials(principal.user_id, registry, session_factory)
 
 

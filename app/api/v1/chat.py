@@ -30,16 +30,17 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from functools import partial
+from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.dependency import PrincipalDep, RateLimitDep
 from app.auth.principal import Principal
-from app.cache import exact, keys
+from app.cache import exact
 from app.config import get_settings
 from app.core.clock import SYSTEM_CLOCK
 from app.core.errors import InvalidRequest, NotFound
@@ -58,7 +59,9 @@ from app.deps import (
     ResolverDep,
     SessionDep,
     SessionFactoryDep,
+    get_credentials,
 )
+from app.keys_resolution.resolver import ProviderCredentials
 from app.memory.canonical import (
     CanonicalMessage,
     ContentBlock,
@@ -95,6 +98,25 @@ logger = get_logger("app.api.chat")
 router = APIRouter(prefix="/v1/chat", tags=["chat"], responses=AUTHENTICATED_ERROR_RESPONSES)
 
 
+def _get_credentials(
+    request: Request, principal: PrincipalDep, session_factory: SessionFactoryDep
+) -> ProviderCredentials:
+    """Composed here, not in ``deps.py``, for the same import-cycle reason
+    ``enforce_rate_limit`` lives in ``auth/dependency.py``: ``get_credentials``
+    needs the authenticated principal, and ``app.deps`` cannot depend on the
+    module that already depends on it. Exactly the shape ``RateLimitDep``
+    composes ``enforce_rate_limit`` in.
+
+    ``session_factory`` is resolved here, as a real sub-dependency, and handed
+    down rather than fetched inside ``get_credentials`` itself — see that
+    function's docstring for why the difference matters under test.
+    """
+    return get_credentials(request, principal, session_factory)
+
+
+CredentialsDep = Annotated[ProviderCredentials, Depends(_get_credentials)]
+
+
 @router.post(
     "/completions",
     response_model=ChatCompletionResponse,
@@ -119,6 +141,7 @@ async def create_chat_completion(
     quota: QuotaDep,
     cache: ExactCacheDep,
     resolver: ResolverDep,
+    credentials: CredentialsDep,
     _rate_limit: RateLimitDep = None,
 ) -> ChatCompletionResponse | StreamingResponse:
     """Answer one turn, persisting both halves of it.
@@ -204,6 +227,7 @@ async def create_chat_completion(
             quota=quota,
             cache=cache,
             resolver=resolver,
+            credentials=credentials,
             session_factory=session_factory,
         )
 
@@ -259,9 +283,9 @@ async def create_chat_completion(
             # given. `render` step 1 has carried it since Phase 1 and the router
             # since Phase 2 Step 5; neither changed to accept it here.
             resolver=resolver,
-            # Constant until Phase 6's `resolve_provider_key` replaces it with a
-            # real per-user scope — the same pattern `registry.system_key` uses.
-            scope=keys.SYSTEM_SCOPE,
+            # D36: which credential, whose quota scope — per candidate, not per
+            # request (§9.5). A user's own key first, the shared pool second.
+            credentials=credentials,
         )
     except routing.RoutingFailed as failure:
         # Includes `ContextTooLong` raised by the fitting step before a request
@@ -506,6 +530,7 @@ async def _stream_chat_completion(
     quota: QuotaTracker | None,
     cache: exact.ExactCache | None,
     resolver: AttachmentResolver | None,
+    credentials: ProviderCredentials,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> StreamingResponse:
     """Drive the router loop far enough to know whether anything will be sent,
@@ -584,8 +609,8 @@ async def _stream_chat_completion(
         # Same per-request instance the non-streaming path uses, and the same
         # memo: a mid-stream restart (D1) re-renders and must not re-extract.
         resolver=resolver,
-        # Same constant, same reason as the non-streaming path above.
-        scope=keys.SYSTEM_SCOPE,
+        # Same D36 resolver the non-streaming path uses.
+        credentials=credentials,
         redis=redis,
         persistence=Collector(
             session_factory, principal=principal, cache=cache, cache_key=cache_key

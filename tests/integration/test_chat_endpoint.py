@@ -25,8 +25,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ProvidersConfig, get_providers_config
+from app.core.crypto import encrypt_provider_key
 from app.db.models import Conversation, File, Message, Request
 from app.db.repo import messages as messages_repo
+from app.db.repo import provider_keys as provider_keys_repo
 from app.deps import get_resolver
 from app.memory.canonical import MessageMeta, text_block
 from app.perception.storage import MemoryStore
@@ -1921,3 +1923,59 @@ async def test_more_than_four_file_refs_is_a_422(
         headers=_headers(make_jwt),
     )
     assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 5 — a stored private key answers the very next message (D36)
+# --------------------------------------------------------------------------- #
+async def _add_private_key(
+    session: AsyncSession, *, user_id: UUID, provider: str, plaintext: str
+) -> None:
+    await provider_keys_repo.upsert(
+        session,
+        user_id=user_id,
+        provider=provider,
+        encrypted_key=encrypt_provider_key(plaintext),
+        last_4=plaintext[-4:],
+        nickname=None,
+        validation_status="valid",
+        last_validated_at=None,
+    )
+
+
+async def test_a_turn_is_served_under_a_stored_private_key(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    user_factory: Callable[..., Any],
+    db_session: AsyncSession,
+    app: FastAPI,
+) -> None:
+    """D36/§9.5, threaded end to end: once a key is stored, the *next* message
+    on that provider is served under it — no reload — and the shared pool's
+    own credential never leaves the process for that attempt. The resolver
+    unit suite (``tests/integration/test_key_resolver.py``) already proves
+    ``UserCredentials`` in isolation; this is the one place that proves the
+    router actually asks it instead of ``registry.system_key``.
+    """
+    user = await user_factory()
+    await _add_private_key(
+        db_session, user_id=user.id, provider="groq", plaintext="gsk_private_live_key_for_alice"
+    )
+
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=_groq_only())
+    try:
+        response = await client.post(
+            COMPLETIONS,
+            json={"messages": [{"role": "user", "content": "what is a gateway?"}]},
+            headers=_headers(make_jwt, sub=user.id),
+        )
+
+        assert response.status_code == 200
+        assert handler.last.headers["authorization"] == "Bearer gsk_private_live_key_for_alice"
+        # The shared pool's own key — what every other test in this module is
+        # served under — never left the process for this attempt.
+        assert handler.last.headers["authorization"] != "Bearer gsk_test_key_not_real"
+    finally:
+        await upstream.aclose()

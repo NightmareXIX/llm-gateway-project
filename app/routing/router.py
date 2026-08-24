@@ -48,6 +48,7 @@ from uuid import uuid4
 from app.cache import keys
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
+from app.keys_resolution.resolver import ProviderCredentials, SystemCredentials
 from app.memory.canonical import CanonicalMessage
 from app.memory.render import AttachmentResolver, RenderReport, render
 from app.providers.base import (
@@ -145,6 +146,13 @@ class AttemptRecord:
     said no. ``None`` on every other outcome, breaker skips included — a breaker
     skip has no window, it has a cooldown."""
 
+    key_pool: str | None = None
+    """Which pool the credential resolved for this candidate came from
+    (D42) — ``None`` only on ``skipped_breaker``, where no candidate is
+    resolved because the breaker question is asked first. A trail that failed
+    over from a private key to the shared pool is exactly the row this field
+    exists for."""
+
     def to_json(self) -> dict[str, Any]:
         """The JSONB shape. Stable — Phase 7's dashboard reads it."""
         record: dict[str, Any] = {
@@ -162,6 +170,8 @@ class AttemptRecord:
             record["retry_after_s"] = round(self.retry_after_s, 3)
         if self.blocked_window is not None:
             record["blocked_window"] = self.blocked_window
+        if self.key_pool is not None:
+            record["key_pool"] = self.key_pool
         return record
 
 
@@ -186,6 +196,9 @@ class RouterOutcome:
     latency_ms: int
     """Wall time across the whole loop, including retries and abandoned
     candidates — what the user waited, not what the winning attempt took."""
+
+    key_pool: Literal["shared", "private"]
+    """The *winning* attempt's pool (D42) — which credential actually answered."""
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +273,9 @@ class StreamCompleted:
     wasted_tokens_out: int
     """Summed across every discarded attempt, not just the last one."""
 
+    key_pool: Literal["shared", "private"]
+    """The *serving* attempt's pool (D42) — mirrors :attr:`RouterOutcome.key_pool`."""
+
 
 type RouteStreamEvent = AttemptStarted | AttemptDelta | AttemptAborted | StreamCompleted
 
@@ -293,6 +309,7 @@ class RoutingFailed(Exception):
         attempts: int,
         latency_ms: int,
         wasted_tokens_out: int = 0,
+        key_pool: Literal["shared", "private"] | None = None,
     ) -> None:
         self.error = error
         self.spec = spec
@@ -307,6 +324,12 @@ class RoutingFailed(Exception):
         """Tokens the discarded streamed attempts really generated. Always 0 on
         the non-streaming path — a failed ``complete`` produced nothing — and the
         reason this failure still has a token cost worth recording."""
+
+        self.key_pool = key_pool
+        """The pool the *last attempted* candidate resolved to (D42), or
+        ``None`` when every candidate was skipped and nothing ever resolved.
+        A failed stream still has to report which pool served its last real
+        attempt — never a stale value carried over from an earlier one."""
 
         super().__init__(str(error))
 
@@ -325,7 +348,7 @@ async def route(
     timeout_s: float = DEFAULT_READ_TIMEOUT_S,
     max_attempts: int = MAX_ATTEMPTS,
     quota: QuotaTracker | None = None,
-    scope: keys.Scope = keys.SYSTEM_SCOPE,
+    credentials: ProviderCredentials | None = None,
     clock: Clock = SYSTEM_CLOCK,
     rng: random.Random | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -348,10 +371,17 @@ async def route(
 
     ``quota`` being ``None`` disables reservation entirely — the same shape as
     ``metrics=None`` — which is Step 3's ``QUOTA_ENFORCEMENT`` kill switch (D15)
-    reaching this module without it having to read settings either. ``scope`` is
-    ``keys.SYSTEM_SCOPE`` at every call site until Phase 6's
-    ``resolve_provider_key`` replaces the constant.
+    reaching this module without it having to read settings either.
+
+    ``credentials`` answers D36's one question — which key, whose quota scope —
+    per *candidate*, not per request (§9.5): a single failover chain can cross a
+    provider the caller holds their own key for and one where they still ride
+    the shared pool. ``None`` defaults to :class:`~app.keys_resolution.resolver
+    .SystemCredentials`, which resolves every provider to the environment's key
+    under the shared-pool scope — exactly today's behaviour, which is what
+    keeps every pre-Phase-6 test passing unchanged.
     """
+    credentials = credentials or SystemCredentials(registry)
     snapshot = metrics.snapshot(COMPLETE) if metrics is not None and rank_by_latency else None
     chain = selection.candidates(registry, requested, pinned=pinned, latency=snapshot)
 
@@ -363,6 +393,7 @@ async def route(
     # The error names a provider and a model; only the spec names the slot, which
     # is what `requests.served_slot` records on the failure path.
     last_spec: ModelSpec | None = None
+    last_key_pool: Literal["shared", "private"] | None = None
 
     for position, candidate in enumerate(chain):
         if attempts >= max_attempts:
@@ -400,7 +431,7 @@ async def route(
         while True:
             attempt_started = clock.now()
             adapter = registry.adapter_for_spec(spec)
-            key = registry.system_key(spec.provider)
+            resolved = await credentials.for_provider(spec.provider)
             reservation: Reservation | None = None
 
             try:
@@ -414,7 +445,7 @@ async def route(
                 if quota is not None:
                     quota_decision = await quota.reserve(
                         spec,
-                        scope=scope,
+                        scope=resolved.scope,
                         estimated_tokens=report.estimated_tokens,
                         request_id=str(uuid4()),
                     )
@@ -429,6 +460,7 @@ async def route(
                                 breaker=decision.state,
                                 retry_after_s=quota_decision.retry_after_s,
                                 blocked_window=quota_decision.blocked_window,
+                                key_pool=resolved.pool,
                             )
                         )
                         logger.info(
@@ -447,7 +479,7 @@ async def route(
                     reservation = quota_decision.reservation
 
                 attempts += 1
-                completion = await adapter.complete(payload, key, timeout=timeout_s)
+                completion = await adapter.complete(payload, resolved.key, timeout=timeout_s)
             except ProviderError as exc:
                 latency_ms = _elapsed_ms(clock, attempt_started)
                 if quota is not None and reservation is not None:
@@ -456,9 +488,10 @@ async def route(
                     # (trap 6) — only the token estimate corrects, down to what
                     # was really generated: nothing, on this path.
                     await quota.commit(reservation, tokens_in=0, tokens_out=0)
-                await _reconcile_hint(quota, spec, scope=scope)
+                await _reconcile_hint(quota, spec, scope=resolved.scope)
                 last_error = exc
                 last_spec = spec
+                last_key_pool = resolved.pool
                 trail.append(
                     AttemptRecord(
                         n=len(trail) + 1,
@@ -469,6 +502,7 @@ async def route(
                         error_code=exc.code,
                         latency_ms=latency_ms,
                         breaker=decision.state,
+                        key_pool=resolved.pool,
                     )
                 )
                 logger.warning(
@@ -538,6 +572,7 @@ async def route(
                     trail=tuple(trail),
                     attempts=attempts,
                     latency_ms=_elapsed_ms(clock, started),
+                    key_pool=resolved.pool,
                 ) from exc
             else:
                 latency_ms = _elapsed_ms(clock, attempt_started)
@@ -548,7 +583,7 @@ async def route(
                         tokens_in=completion.usage.tokens_in,
                         tokens_out=completion.usage.tokens_out,
                     )
-                await _reconcile_hint(quota, spec, scope=scope)
+                await _reconcile_hint(quota, spec, scope=resolved.scope)
                 await breaker.record_success(decision)
                 if metrics is not None:
                     # Successful attempts only — a provider that 429s in 80ms is
@@ -565,6 +600,7 @@ async def route(
                         outcome="ok",
                         latency_ms=latency_ms,
                         breaker=decision.state,
+                        key_pool=resolved.pool,
                     )
                 )
                 logger.info(
@@ -583,6 +619,7 @@ async def route(
                     trail=tuple(trail),
                     attempts=attempts,
                     latency_ms=_elapsed_ms(clock, started),
+                    key_pool=resolved.pool,
                 )
 
     logger.warning(
@@ -598,6 +635,7 @@ async def route(
         trail=tuple(trail),
         attempts=attempts,
         latency_ms=_elapsed_ms(clock, started),
+        key_pool=last_key_pool,
     )
 
 
@@ -617,7 +655,7 @@ async def route_stream(
     first_token_timeout_s: float = DEFAULT_FIRST_TOKEN_TIMEOUT_S,
     max_attempts: int = MAX_ATTEMPTS,
     quota: QuotaTracker | None = None,
-    scope: keys.Scope = keys.SYSTEM_SCOPE,
+    credentials: ProviderCredentials | None = None,
     clock: Clock = SYSTEM_CLOCK,
     rng: random.Random | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -663,7 +701,12 @@ async def route_stream(
     fresh one; a mid-stream abort commits the tokens it really generated (D1 step
     4) rather than losing them, which is Step 5's whole reason for existing on
     this path.
+
+    ``credentials`` is D36's per-candidate resolver, exactly as :func:`route`
+    takes it — ``None`` defaults to :class:`~app.keys_resolution.resolver
+    .SystemCredentials`.
     """
+    credentials = credentials or SystemCredentials(registry)
     snapshot = metrics.snapshot(STREAM) if metrics is not None and rank_by_latency else None
     chain = selection.candidates(registry, requested, pinned=pinned, latency=snapshot)
 
@@ -674,6 +717,7 @@ async def route_stream(
     wasted_total = 0
     last_error: ProviderError | None = None
     last_spec: ModelSpec | None = None
+    last_key_pool: Literal["shared", "private"] | None = None
 
     for position, candidate in enumerate(chain):
         if attempts >= max_attempts:
@@ -709,7 +753,7 @@ async def route_stream(
         while True:
             attempt_started = clock.now()
             adapter = registry.adapter_for_spec(spec)
-            key = registry.system_key(spec.provider)
+            resolved = await credentials.for_provider(spec.provider)
             reservation: Reservation | None = None
 
             delivered_chars = 0
@@ -726,7 +770,7 @@ async def route_stream(
                 if quota is not None:
                     quota_decision = await quota.reserve(
                         spec,
-                        scope=scope,
+                        scope=resolved.scope,
                         estimated_tokens=report.estimated_tokens,
                         request_id=str(uuid4()),
                     )
@@ -741,6 +785,7 @@ async def route_stream(
                                 breaker=decision.state,
                                 retry_after_s=quota_decision.retry_after_s,
                                 blocked_window=quota_decision.blocked_window,
+                                key_pool=resolved.pool,
                             )
                         )
                         logger.info(
@@ -758,7 +803,9 @@ async def route_stream(
                 attempts += 1
                 yield AttemptStarted(attempt=attempts, spec=spec)
 
-                chunks = adapter.stream(payload, key, timeout_s, idle_timeout_s).__aiter__()
+                chunks = adapter.stream(
+                    payload, resolved.key, timeout_s, idle_timeout_s
+                ).__aiter__()
                 try:
                     while True:
                         try:
@@ -820,9 +867,10 @@ async def route_stream(
                     # (§1.1 step 4, D17 trap 7) — zero here only when nothing was
                     # delivered before the fault, same as the non-streaming path.
                     await quota.commit(reservation, tokens_in=0, tokens_out=wasted)
-                await _reconcile_hint(quota, spec, scope=scope)
+                await _reconcile_hint(quota, spec, scope=resolved.scope)
                 last_error = exc
                 last_spec = spec
+                last_key_pool = resolved.pool
                 trail.append(
                     AttemptRecord(
                         n=len(trail) + 1,
@@ -834,6 +882,7 @@ async def route_stream(
                         latency_ms=latency_ms,
                         wasted_tokens_out=wasted,
                         breaker=decision.state,
+                        key_pool=resolved.pool,
                     )
                 )
                 logger.warning(
@@ -910,6 +959,7 @@ async def route_stream(
                     attempts=attempts,
                     latency_ms=_elapsed_ms(clock, started),
                     wasted_tokens_out=wasted_total,
+                    key_pool=resolved.pool,
                 ) from exc
             else:
                 latency_ms = _elapsed_ms(clock, attempt_started)
@@ -932,7 +982,7 @@ async def route_stream(
                         tokens_in=final_usage.tokens_in,
                         tokens_out=final_usage.tokens_out,
                     )
-                await _reconcile_hint(quota, spec, scope=scope)
+                await _reconcile_hint(quota, spec, scope=resolved.scope)
                 await breaker.record_success(decision)
                 if metrics is not None:
                     metrics.record(spec.provider, spec.model, STREAM, first_token_ms)
@@ -946,6 +996,7 @@ async def route_stream(
                         outcome="ok",
                         latency_ms=latency_ms,
                         breaker=decision.state,
+                        key_pool=resolved.pool,
                     )
                 )
                 logger.info(
@@ -969,6 +1020,7 @@ async def route_stream(
                     latency_ms=_elapsed_ms(clock, started),
                     ttft_ms=first_token_ms,
                     wasted_tokens_out=wasted_total,
+                    key_pool=resolved.pool,
                 )
                 return
 
@@ -987,6 +1039,7 @@ async def route_stream(
         attempts=attempts,
         latency_ms=_elapsed_ms(clock, started),
         wasted_tokens_out=wasted_total,
+        key_pool=last_key_pool,
     )
 
 

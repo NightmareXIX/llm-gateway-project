@@ -31,8 +31,9 @@ read is an operational event, not a caller's problem; :meth:`UserCredentials
 logs the ``key_id`` — never the ciphertext — so an operator has a signal
 without a user ever seeing a 500.
 
-Nothing calls this module yet. Step 5 threads it through the answer lane,
-Step 6 through the perception lane.
+Threaded through the answer lane's two loops (``routing.route``/``route_stream``)
+and ``streaming.stream_completion`` as of Step 5; Step 6 threads it through the
+perception lane the same way.
 """
 
 from __future__ import annotations
