@@ -485,3 +485,26 @@ def validate_startup_config() -> None:
     get_settings()
     get_providers_config()
     get_limits_config()
+    _validate_encryption_key()
+
+
+def _validate_encryption_key() -> None:
+    """Phase 6 Step 2: fail loudly, naming ``ENCRYPTION_KEY``, on a malformed
+    Fernet key.
+
+    Without this, a bad key surfaces on the first user's first paste into
+    Settings — mid-conversation, mid-demo — instead of at boot like every
+    other configuration failure in this module. Imports ``core.crypto``
+    lazily: that module reads ``Settings.ENCRYPTION_KEY`` through
+    ``get_settings()``, and importing it at this module's top level would be
+    a cycle back into this one.
+    """
+    from app.core.crypto import decrypt_provider_key, encrypt_provider_key
+
+    probe = "encryption-key-startup-probe"
+    try:
+        round_tripped = decrypt_provider_key(encrypt_provider_key(probe))
+    except Exception as exc:
+        raise ConfigError(f"ENCRYPTION_KEY is not a usable Fernet key: {exc}") from exc
+    if round_tripped != probe:
+        raise ConfigError("ENCRYPTION_KEY failed to round-trip a startup probe value.")

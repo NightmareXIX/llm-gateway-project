@@ -42,7 +42,10 @@ os.environ.setdefault("REQUIRE_VERIFIED_EMAIL", "true")
 os.environ.setdefault("GROQ_API_KEY", "gsk_test_key_not_real")
 os.environ.setdefault("GEMINI_API_KEY", "gemini_test_key_not_real")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-v1-test-key-not-real")
-os.environ.setdefault("ENCRYPTION_KEY", "dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=")
+# A real Fernet key (32 url-safe base64-encoded bytes) — Phase 6 Step 2's boot
+# validation constructs a `Fernet` from this and round-trips a probe value, so
+# unlike the placeholder-shaped values above, this one has to actually parse.
+os.environ.setdefault("ENCRYPTION_KEY", "iq1hoAgg3prhNnvkakmnNqeU4cn51aLAF9LvKxe6ydU=")
 # Phase 4 Step 1: FILES_STORAGE_BACKEND defaults to "supabase", which a
 # boot-time model validator refuses to accept without this — and `app.main`
 # calls `create_app()` (which validates config) at *module import time*, so a

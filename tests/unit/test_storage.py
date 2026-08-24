@@ -344,7 +344,7 @@ def _settings(**overrides: object) -> Settings:
         "GROQ_API_KEY": "gsk_test",
         "GEMINI_API_KEY": "gemini_test",
         "OPENROUTER_API_KEY": "sk-or-v1-test",
-        "ENCRYPTION_KEY": "dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=",
+        "ENCRYPTION_KEY": "iq1hoAgg3prhNnvkakmnNqeU4cn51aLAF9LvKxe6ydU=",
         "SUPABASE_SERVICE_ROLE_KEY": SERVICE_ROLE_KEY,
     }
     base.update(overrides)

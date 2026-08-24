@@ -18,6 +18,12 @@ dependencies = [
     "pydantic-settings>=2.6",
     "structlog>=24.4",
     "python-jose[cryptography]>=3.3",
+    # BYOK credential encryption at rest (Phase 6 Step 2, ``core/crypto.py``).
+    # Already arrives transitively via `python-jose[cryptography]`'s extra, but
+    # a security primitive should not depend on another library's extra for its
+    # own presence — a `jose` upgrade that drops the extra would silently take
+    # encryption down with it.
+    "cryptography>=44",
     "redis>=5.2",
     "pyyaml>=6.0",
     # Phase 3 Step 1. `ZoneInfo("America/Los_Angeles")` needs a timezone database,
@@ -125,6 +131,10 @@ ignore = [
 # exception verbatim (phase4.md §3) — matching `UnknownSlot` and
 # `InvariantViolation` above rather than the `Error`-suffixed convention.
 "app/perception/storage.py" = ["N818"]
+# `CredentialUnreadable` names the fact — a stored credential could not be
+# decrypted — matching `StorageUnavailable`/`UnknownSlot`/`InvariantViolation`
+# above rather than the `Error`-suffixed convention.
+"app/core/crypto.py" = ["N818"]
 
 [tool.ruff.lint.isort]
 # `src` alone does not make these first-party — ruff resolves it by looking for

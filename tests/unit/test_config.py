@@ -95,7 +95,7 @@ BASELINE = {
     "GROQ_API_KEY": "gsk_not_a_real_key",
     "GEMINI_API_KEY": "not_a_real_gemini_key",
     "OPENROUTER_API_KEY": "sk-or-v1-not-a-real-key",
-    "ENCRYPTION_KEY": "dGVzdC1mZXJuZXQta2V5LW5vdC1hLXJlYWwtb25lLTAwMD0=",
+    "ENCRYPTION_KEY": "iq1hoAgg3prhNnvkakmnNqeU4cn51aLAF9LvKxe6ydU=",
     # Not in REQUIRED_VARS: it is only conditionally required (a model
     # validator, not a bare pydantic field), tied to FILES_STORAGE_BACKEND's
     # default of "supabase" rather than unconditionally to boot.

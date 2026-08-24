@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Step 1 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–2 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -137,6 +137,34 @@ lookup scoped to the exact `(user, provider, model)` triple, the unique constrai
 CHECK). `make migrate` round-trips clean (`upgrade head` → `downgrade -1` → `upgrade head`); `make test`,
 `make lint`, and `make typecheck` are all green; nothing in `app/` outside the two new repo modules reads
 either table yet, per the step's own "done when."
+
+Step 2 (encryption at rest) touches exactly the files `phase6.md` names — `pyproject.toml`,
+`app/core/crypto.py`, `app/config.py` — plus tests. `cryptography>=44` is now a direct dependency
+rather than an accident of `python-jose[cryptography]`'s extra. `encrypt_provider_key`/
+`decrypt_provider_key` are Fernet-backed, keyed from `get_settings().ENCRYPTION_KEY` through a
+module-private `_fernet()` built once behind `lru_cache` rather than per call. `decrypt_provider_key`
+raises a new typed `CredentialUnreadable(RuntimeError)` on a bad or foreign-keyed token — never `None`,
+never a partial string — which is what lets Step 4's `UserCredentials` tell "no key stored" apart from
+"this row was written under a rotated key" and fall back to the shared pool on the second case alone.
+`config.validate_startup_config()` gained `_validate_encryption_key()`, round-tripping a probe string
+through both seams and raising `ConfigError` naming `ENCRYPTION_KEY` on a malformed key — imported
+lazily inside the function body since `core/crypto.py` already imports `get_settings` from this module
+at its own top level, and a top-level import the other way would be a cycle. Writing the boot check
+surfaced a real gap: the placeholder `ENCRYPTION_KEY` value used across the test suite
+(`tests/conftest.py`, `.github/workflows/ci.yml`, `tests/unit/test_storage.py`,
+`tests/unit/test_config.py`'s `BASELINE`) decoded to 35 bytes, not the 32 a Fernet key requires, and had
+never been exercised as one — `create_app()` calls `validate_startup_config()` at import time, so this
+would have failed every test session outright once the boot check landed. All four now share one real
+generated Fernet key. `tests/unit/test_crypto.py` (new) covers the round trip, Fernet's per-call
+randomization (asserted directly, since a deterministic scheme would leak which users share a key), a
+tampered token and a token encrypted under a different key both raising `CredentialUnreadable`, and
+`validate_startup_config` accepting a real key and rejecting a malformed one — each test getting its own
+key via an `isolated_encryption_key` fixture that clears both `get_settings`'s cache and
+`crypto._fernet`'s, since they are two independent `lru_cache`s. `tests/unit/test_core_utils.py`'s
+`test_the_byok_seams_are_loud` — asserting the two functions still raised `NotImplementedError` — is
+gone now that they have real bodies; that behavior moved to `test_crypto.py`. `make test` (1267 passed),
+`ruff check`, `ruff format --check`, and `mypy` are all green; `grep -rn "from cryptography.fernet" app`
+returns only `core/crypto.py`, per the step's own "done when."
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

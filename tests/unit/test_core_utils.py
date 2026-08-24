@@ -9,10 +9,10 @@ seam every TTL and throttle in the system is tested through — the JWKS cache
 today, the quota windows in Phase 3 — so a bug here is invisible in this module
 and shows up as a flaky test three phases from now.
 
-The two BYOK functions in ``crypto`` are Phase 6 seams. The hard rule is that they
-raise rather than silently pass, and that is asserted here rather than assumed:
-a seam that quietly returns ``None`` is how a plaintext provider key ends up in
-the database.
+The two BYOK functions in ``crypto`` (``encrypt_provider_key`` /
+``decrypt_provider_key``) got real bodies in Phase 6 Step 2; their behaviour is
+covered in ``tests/unit/test_crypto.py`` rather than here, since they need an
+``ENCRYPTION_KEY`` fixture the rest of this module has no reason to carry.
 """
 
 from __future__ import annotations
@@ -27,8 +27,6 @@ from app.core.clock import SYSTEM_CLOCK, Clock, FixedClock, SystemClock
 from app.core.crypto import (
     BASE62_ALPHABET,
     constant_time_equals,
-    decrypt_provider_key,
-    encrypt_provider_key,
     generate_secret,
     sha256_hex,
 )
@@ -123,18 +121,6 @@ def test_a_zero_length_secret_is_refused_rather_than_returned_empty(length: int)
     authenticates nobody as somebody."""
     with pytest.raises(ValueError, match="positive"):
         generate_secret(length)
-
-
-# --------------------------------------------------------------------------- #
-# crypto — the Phase 6 seams
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("seam", [encrypt_provider_key, decrypt_provider_key])
-def test_the_byok_seams_are_loud(seam: object) -> None:
-    """A Phase 2+ seam is a typed signature that raises. A silently-passing stub
-    here would mean a user's upstream credential stored in the clear."""
-    assert callable(seam)
-    with pytest.raises(NotImplementedError, match="Phase 6"):
-        seam("some-provider-key")
 
 
 # --------------------------------------------------------------------------- #
