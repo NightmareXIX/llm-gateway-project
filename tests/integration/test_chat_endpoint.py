@@ -24,12 +24,12 @@ from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.chat import _get_resolver as chat_get_resolver
 from app.config import ProvidersConfig, get_providers_config
 from app.core.crypto import encrypt_provider_key
 from app.db.models import Conversation, File, Message, Request
 from app.db.repo import messages as messages_repo
 from app.db.repo import provider_keys as provider_keys_repo
-from app.deps import get_resolver
 from app.memory.canonical import MessageMeta, text_block
 from app.perception.storage import MemoryStore
 from app.providers.registry import build_registry
@@ -241,8 +241,13 @@ def no_perception(app: FastAPI) -> None:
     500 they expect from an accident of Milestone A into the kill switch
     behaving as designed: ``NoAttachments`` raises rather than resolving a
     reference to nothing.
+
+    Overrides ``chat.py``'s ``_get_resolver`` rather than ``deps.get_resolver``
+    itself: since Phase 6 Step 6 the latter needs this request's credentials
+    and is composed at the route, so it is ``_get_resolver`` — not
+    ``get_resolver`` — that FastAPI's dependency graph actually calls.
     """
-    app.dependency_overrides[get_resolver] = lambda: None
+    app.dependency_overrides[chat_get_resolver] = lambda: None
 
 
 def _headers(make_jwt: TokenFactory, **kwargs: Any) -> dict[str, str]:

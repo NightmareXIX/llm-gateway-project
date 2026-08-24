@@ -33,21 +33,26 @@ import httpx
 import pymupdf
 import pytesseract
 import pytest
+from fakeredis.aioredis import FakeRedis
 from fastapi import Depends, FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.v1.chat import _get_resolver as chat_get_resolver
+from app.cache import keys
 from app.config import ProvidersConfig, Settings, get_providers_config, get_settings
+from app.core.crypto import encrypt_provider_key
 from app.db.models import FileExtraction, Message
+from app.db.repo import provider_keys as provider_keys_repo
 from app.deps import (
     get_breaker,
     get_quota,
     get_redis,
     get_registry,
-    get_resolver,
     get_session_factory,
     get_store,
 )
+from app.keys_resolution.resolver import SystemCredentials
 from app.memory.render import AttachmentResolver
 from app.perception import local as local_tier
 from app.perception.lane import TOKENS_PER_TILE, PerceptionResolver
@@ -242,7 +247,7 @@ def perception(app: FastAPI) -> Callable[..., None]:
     """
 
     def configure(**overrides: Any) -> None:
-        app.dependency_overrides[get_resolver] = _resolver_override(
+        app.dependency_overrides[chat_get_resolver] = _resolver_override(
             get_settings().model_copy(update=overrides)
         )
 
@@ -252,11 +257,15 @@ def perception(app: FastAPI) -> Callable[..., None]:
 def _resolver_override(
     settings: Settings, sink: list[PerceptionResolver] | None = None
 ) -> Callable[..., AttachmentResolver | None]:
-    """``deps.get_resolver`` with a substituted ``Settings``.
+    """``chat.py``'s ``_get_resolver`` with a substituted ``Settings``.
 
     The same six sub-dependencies as the real one — in particular
     ``get_session_factory``, which ``conftest``'s ``app`` fixture overrides to
     hand back the test's transactional session — so only the settings differ.
+    ``credentials`` is not one of them: these tests are about the perception
+    lane's tiers, not BYOK (that is ``test_key_resolver.py``'s and
+    ``test_router.py``'s subject), so a plain :class:`SystemCredentials`
+    stands in for the real per-request resolver Phase 6 Step 6 threads here.
 
     ``sink`` collects the resolvers actually built, which is the only way to
     read a per-request object after the request that owned it has returned —
@@ -282,6 +291,7 @@ def _resolver_override(
             quota=quota,
             redis=redis,
             settings=settings,
+            credentials=SystemCredentials(registry),
         )
         if sink is not None:
             sink.append(resolver)
@@ -468,7 +478,7 @@ async def test_a_native_forty_page_pdf_carries_a_five_figure_token_cost(
     """
     fleet(general=("gemini",), gemini=["success"])
     resolvers: list[PerceptionResolver] = []
-    app.dependency_overrides[get_resolver] = _resolver_override(get_settings(), resolvers)
+    app.dependency_overrides[chat_get_resolver] = _resolver_override(get_settings(), resolvers)
     headers = _headers(make_jwt)
     file_hash = await _upload(client, headers, content=_pdf_of(40))
 
@@ -513,6 +523,113 @@ async def test_a_file_over_the_models_cap_never_reaches_tier_one(
     assert response.status_code == 200, response.text
     assert response.json()["extraction_tier"] == "llm"
     assert handler.extraction_calls() == 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 6 — tier 2 resolves credentials per candidate too
+# --------------------------------------------------------------------------- #
+async def _add_private_key(
+    session: AsyncSession, *, user_id: Any, provider: str, plaintext: str
+) -> None:
+    await provider_keys_repo.upsert(
+        session,
+        user_id=user_id,
+        provider=provider,
+        encrypted_key=encrypt_provider_key(plaintext),
+        last_4=plaintext[-4:],
+        nickname=None,
+        validation_status="valid",
+        last_validated_at=None,
+    )
+    await session.flush()
+
+
+async def test_an_extraction_under_a_private_key_spends_the_users_own_perception_budget(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+    user_factory: Callable[..., Any],
+    db_session: AsyncSession,
+    redis_client: FakeRedis,
+) -> None:
+    """The perception lane's own candidate walk resolves credentials
+    independently of the answering model's (D36). Groq answers off the shared
+    pool; Gemini reads the document under this user's own key, on this user's
+    own budget — proving the router asking ``credentials.for_provider`` and
+    the lane asking it are the same fact reached twice, not once.
+    """
+    user = await user_factory()
+    await _add_private_key(
+        db_session, user_id=user.id, provider="gemini", plaintext="private-extraction-key-abcd"
+    )
+
+    handler = fleet(general=("groq",), groq=["success"], gemini=["extraction_complete"])
+    headers = _headers(make_jwt, sub=user.id)
+    file_hash = await _upload(client, headers)
+
+    response = await _ask(client, headers, file_hash=file_hash)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["extraction_tier"] == "llm"
+    # The extraction itself carried the user's own key, not the shared pool's.
+    assert handler.requests["gemini"][0].headers["x-goog-api-key"] == "private-extraction-key-abcd"
+
+    private_lane = keys.quota_perception_lane(str(user.id), "gemini", "gemini-3.6-flash")
+    shared_lane = keys.quota_perception_lane(keys.SYSTEM_SCOPE, "gemini", "gemini-3.6-flash")
+    assert await redis_client.get(private_lane) == "1"
+    assert await redis_client.get(shared_lane) is None
+
+
+async def test_a_shared_pool_extraction_still_answers_a_private_key_users_next_question(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    store: MemoryStore,
+    fleet: Callable[..., _Fleet],
+    user_factory: Callable[..., Any],
+    db_session: AsyncSession,
+    redis_client: FakeRedis,
+) -> None:
+    """``file_extractions`` and ``extract:{hash}`` stay unscoped by design
+    (D22/D24): the text is a fact about the document, not about who paid to
+    learn it. A reading the shared pool paid for is served to this user's next
+    question exactly as it would be to anyone else's, even after they have
+    since added their own key — no re-extraction, private or shared.
+    """
+    user = await user_factory()
+    headers = _headers(make_jwt, sub=user.id)
+    handler = fleet(general=("groq",), groq=["success", "success"], gemini=["extraction_complete"])
+    file_hash = await _upload(client, headers)
+
+    first = await _ask(client, headers, file_hash=file_hash)
+    assert first.json()["extraction_tier"] == "llm"
+
+    # Only now does this user acquire a private Gemini key — after the shared
+    # pool has already paid for the one reading that exists.
+    await _add_private_key(
+        db_session, user_id=user.id, provider="gemini", plaintext="added-after-the-fact-wxyz"
+    )
+
+    # A different question, deliberately: D29's exact-match cache would
+    # otherwise answer the identical question before the lane ever ran, which
+    # would prove nothing about tier 0.
+    second = await _ask(
+        client,
+        headers,
+        file_hash=file_hash,
+        conversation_id=first.json()["conversation_id"],
+        question="summarize this document",
+    )
+
+    assert second.status_code == 200, second.text
+    assert second.json()["extraction_tier"] == "cache"
+    assert handler.extraction_calls() == 1
+
+    # A cache hit costs no quota at all, under either scope — the private key
+    # this user now holds was never asked to pay for a reading that already
+    # existed.
+    private_lane = keys.quota_perception_lane(str(user.id), "gemini", "gemini-3.6-flash")
+    assert await redis_client.get(private_lane) is None
 
 
 # --------------------------------------------------------------------------- #

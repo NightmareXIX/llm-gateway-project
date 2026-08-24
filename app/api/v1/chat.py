@@ -56,10 +56,11 @@ from app.deps import (
     QuotaDep,
     RedisDep,
     RegistryDep,
-    ResolverDep,
     SessionDep,
     SessionFactoryDep,
+    StoreDep,
     get_credentials,
+    get_resolver,
 )
 from app.keys_resolution.resolver import ProviderCredentials
 from app.memory.canonical import (
@@ -115,6 +116,33 @@ def _get_credentials(
 
 
 CredentialsDep = Annotated[ProviderCredentials, Depends(_get_credentials)]
+
+
+def _get_resolver(
+    store: StoreDep,
+    session_factory: SessionFactoryDep,
+    registry: RegistryDep,
+    breaker: BreakerDep,
+    quota: QuotaDep,
+    redis: RedisDep,
+    credentials: CredentialsDep,
+) -> AttachmentResolver | None:
+    """Composed here, not in ``deps.py``, for the same reason ``_get_credentials``
+    is: ``get_resolver`` needs this request's ``credentials``, and ``CredentialsDep``
+    itself is only assembled here (Phase 6 Step 6).
+    """
+    return get_resolver(
+        store=store,
+        session_factory=session_factory,
+        registry=registry,
+        breaker=breaker,
+        quota=quota,
+        redis=redis,
+        credentials=credentials,
+    )
+
+
+ResolverDep = Annotated[AttachmentResolver | None, Depends(_get_resolver)]
 
 
 @router.post(

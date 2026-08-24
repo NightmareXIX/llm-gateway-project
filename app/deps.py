@@ -178,12 +178,14 @@ def get_exact_cache(request: Request) -> ExactCache | None:
 
 
 def get_resolver(
-    store: Annotated[ObjectStore, Depends(get_store)],
-    session_factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
-    registry: Annotated[ProviderRegistry, Depends(get_registry)],
-    breaker: Annotated[CircuitBreaker, Depends(get_breaker)],
-    quota: Annotated[QuotaTracker | None, Depends(get_quota)],
-    redis: Annotated[Redis, Depends(get_redis)],
+    *,
+    store: ObjectStore,
+    session_factory: async_sessionmaker[AsyncSession],
+    registry: ProviderRegistry,
+    breaker: CircuitBreaker,
+    quota: QuotaTracker | None,
+    redis: Redis,
+    credentials: ProviderCredentials,
 ) -> AttachmentResolver | None:
     """Phase 4's perception lane, or ``None`` when it is switched off.
 
@@ -199,15 +201,22 @@ def get_resolver(
     ``file_ref`` fails loudly, instead of quietly answering a question about a
     document nobody read.
 
-    Its six resources arrive as sub-dependencies rather than being read off
-    ``request.app.state`` here, which is the one place in this module that
-    matters: ``get_session_factory`` is overridden in tests, and a direct call
-    would walk straight past the override to a piece of app state a test app
-    never sets.
+    **A plain factory, not a FastAPI dependency in its own right — since Phase
+    6 Step 6, for the same reason ``get_credentials`` already is one.** Tier
+    2's candidate walk needs this request's ``ProviderCredentials``, and
+    building one needs the authenticated principal; ``app.auth.dependency``
+    already imports this module for ``SessionDep``/``RateLimiterDep``, so a
+    ``Depends(get_principal)`` reached transitively from here would be the
+    same import cycle ``get_credentials``'s docstring documents. The caller
+    composes it: ``api/v1/chat.py``'s ``ResolverDep`` wraps this in a small
+    ``Depends``-bound function of its own, supplying ``credentials`` from the
+    ``CredentialsDep`` it already builds for the router.
 
-    ``scope`` is left at its default ``keys.SYSTEM_SCOPE``, exactly as it is at
-    the answer lane's call sites, so Phase 6 replaces one constant in two lanes
-    rather than one.
+    ``credentials`` replaces the constant shared-pool scope this function used
+    to default every request to — Phase 6 replacing one constant in two lanes,
+    as promised. Unlike the router's own ``credentials`` parameter, there is
+    no ``None`` default here: this factory is never called without a real
+    resolver in hand, because its one caller always has one.
     """
     settings = get_settings()
     if not settings.PERCEPTION_ENABLED:
@@ -220,6 +229,7 @@ def get_resolver(
         quota=quota,
         redis=redis,
         settings=settings,
+        credentials=credentials,
     )
 
 
@@ -558,7 +568,10 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 SessionFactoryDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)]
 RegistryDep = Annotated[ProviderRegistry, Depends(get_registry)]
 StoreDep = Annotated[ObjectStore, Depends(get_store)]
-ResolverDep = Annotated[AttachmentResolver | None, Depends(get_resolver)]
+# ResolverDep lives in `api/v1/chat.py`, not here — since Phase 6 Step 6,
+# `get_resolver` needs this request's `ProviderCredentials`, which needs the
+# principal, which is `CredentialsDep`'s import-cycle problem all over again.
+# See `get_resolver`'s own docstring.
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
 BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]

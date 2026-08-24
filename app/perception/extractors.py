@@ -58,6 +58,7 @@ from app.cache import keys
 from app.core.ids import new_uuid
 from app.core.logging import get_logger
 from app.db.repo import extractions as extractions_repo
+from app.keys_resolution.resolver import ProviderCredentials, SystemCredentials
 from app.memory.canonical import CanonicalMessage, MessageMeta, file_ref_block, text_block
 from app.providers.base import ProviderAdapter
 from app.providers.errors import ProviderError
@@ -264,7 +265,7 @@ async def extract_with_llm(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Redis | None,
     quota: QuotaTracker | None,
-    scope: keys.Scope = keys.SYSTEM_SCOPE,
+    credentials: ProviderCredentials | None = None,
     timeout_s: float = EXTRACTION_TIMEOUT_S,
     sleep: Sleeper = asyncio.sleep,
 ) -> Extraction | None:
@@ -289,7 +290,15 @@ async def extract_with_llm(
     ``quota=None`` disables reservation exactly as it does in the router
     (``QUOTA_ENFORCEMENT``); ``redis=None`` disables both the cache and the
     stampede lock, which degrades to "everyone extracts", not to a failure.
+
+    ``credentials`` is D36's per-candidate resolver (Phase 6 Step 6), exactly
+    the same swap ``routing.route`` made in Step 5: ``None`` defaults to
+    :class:`~app.keys_resolution.resolver.SystemCredentials`, which resolves
+    every candidate to the environment's key under the shared-pool scope —
+    today's behaviour, which is what keeps every pre-Phase-6 test in this
+    module passing unchanged.
     """
+    credentials = credentials or SystemCredentials(registry)
     try:
         chain = registry.candidates(PERCEPTION_SLOT)
     except UnknownSlot:
@@ -329,7 +338,7 @@ async def extract_with_llm(
             session_factory=session_factory,
             redis=redis,
             quota=quota,
-            scope=scope,
+            credentials=credentials,
             timeout_s=timeout_s,
         )
     finally:
@@ -348,7 +357,7 @@ async def _walk_candidates(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Redis | None,
     quota: QuotaTracker | None,
-    scope: keys.Scope,
+    credentials: ProviderCredentials,
     timeout_s: float,
 ) -> Extraction | None:
     """The chain itself, split out so the lock's ``finally`` stays one line."""
@@ -388,12 +397,19 @@ async def _walk_candidates(
         )
         payload = _build_payload(adapter, spec, attachment, message)
 
+        # D36: which credential, whose quota scope — per candidate, exactly as
+        # the answer lane resolves it. The extraction chain is its own
+        # candidate walk, independent of whichever provider is about to answer
+        # the turn, so a user's own Gemini key pays for reading their document
+        # even when Groq's shared key ends up serving the answer.
+        resolved = await credentials.for_provider(spec.provider)
+
         reservation: Reservation | None = None
         if quota is not None:
             granted = await lanes.reserve_perception(
                 quota,
                 spec,
-                scope=scope,
+                scope=resolved.scope,
                 estimated_tokens=_estimated_tokens(adapter, payload, size=len(data)),
                 request_id=str(uuid4()),
             )
@@ -409,9 +425,8 @@ async def _walk_candidates(
                 continue
             reservation = granted.reservation
 
-        key = registry.system_key(spec.provider)
         try:
-            completion = await adapter.complete(payload, key, timeout_s)
+            completion = await adapter.complete(payload, resolved.key, timeout_s)
         except ProviderError as exc:
             if quota is not None and reservation is not None:
                 # The provider counted the request the moment it left the

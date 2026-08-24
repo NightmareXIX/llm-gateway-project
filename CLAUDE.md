@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–5 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–6 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -288,6 +288,47 @@ proves the router asks the resolver instead of `registry.system_key`, complement
 duplicating `test_key_resolver.py`'s resolver-only coverage. `make test` (1303 passed, 1 skipped), `ruff
 check`, `ruff format --check`, and `mypy` are all green; `grep -n "SYSTEM_SCOPE" app/routing app/streaming
 app/api/v1/chat.py` returns nothing, per the step's own "done when."
+
+Step 6 (threading the perception lane) touches exactly the files `phase6.md` names —
+`app/perception/lane.py`, `app/perception/extractors.py`, `app/deps.py` — plus tests. `PerceptionResolver
+.__init__` drops `scope: keys.Scope = keys.SYSTEM_SCOPE` and gains a required `credentials:
+ProviderCredentials`; `self._scope` is gone, replaced by `self._credentials`, and tier 2's `_extract` passes
+it straight through to `extract_with_llm` rather than a scope string. `extract_with_llm` and its own
+`_walk_candidates` make the same swap `router.route` made in Step 5: `scope` is gone, `credentials:
+ProviderCredentials | None = None` defaults to `SystemCredentials(registry)` when the caller passes none —
+the same `None`-keeps-every-test-honest shape D36 established, which is why every pre-existing case in
+`tests/unit/test_extractors.py` kept passing with zero edits. Inside the candidate loop, `resolved = await
+credentials.for_provider(spec.provider)` replaces both `registry.system_key(spec.provider)` (now
+`resolved.key`) and the old `scope=scope` argument to `lanes.reserve_perception` (now `resolved.scope`) —
+tier 2 resolves its own candidate chain independently of whichever provider ends up answering the turn, so a
+user's own Gemini key pays to read their document even when Groq's shared key serves the answer. Point 4 of
+the step (the extraction cache stays global and unscoped) needed no code change — `file_extractions` was
+already keyed on `file_hash` alone (D24) — but `PerceptionResolver._cached`'s docstring now says so
+explicitly, so the next reader does not "fix" it into a per-user cache and silently double the extraction
+bill for every document two users happen to share.
+
+Threading `credentials` into `deps.get_resolver` surfaced the same import-cycle constraint Step 4's
+`get_credentials` already worked around, one layer up: building a `ProviderCredentials` needs the
+authenticated principal, and `app.auth.dependency` already imports `app.deps`, so `get_resolver` cannot
+resolve its own `credentials` argument via `Depends(get_principal)` without a cycle. `get_resolver` is now a
+plain factory taking all seven inputs (`credentials` included) as ordinary keyword arguments — no longer a
+FastAPI-dependency callable in its own right — and `ResolverDep` moved out of `deps.py` entirely, into
+`api/v1/chat.py` beside `CredentialsDep`: a new `_get_resolver` there composes `get_resolver` from
+`StoreDep`/`SessionFactoryDep`/`RegistryDep`/`BreakerDep`/`QuotaDep`/`RedisDep`/`CredentialsDep`, exactly the
+shape `_get_credentials` already established. Every test that previously overrode `app.dependency_overrides
+[get_resolver]` (`tests/integration/test_perception_lane.py`, `tests/integration/test_chat_endpoint.py`) now
+overrides `app.dependency_overrides[chat_get_resolver]` — the actual callable FastAPI's dependency graph
+calls since the move — and the perception suite's own resolver-override helper passes a plain
+`SystemCredentials(registry)`, since those tests are about the lane's tiers, not BYOK. New tests in
+`tests/integration/test_perception_lane.py`: `test_an_extraction_under_a_private_key_spends_the_users_own_perception_budget`
+(a user's stored Gemini key pays for the extraction while Groq answers off the shared pool — the extraction
+request carries the private key on the wire, `q:{user_id}:gemini:…:lane:perception` moves and
+`q:system:gemini:…:lane:perception` does not) and
+`test_a_shared_pool_extraction_still_answers_a_private_key_users_next_question` (a reading the shared pool
+already paid for is replayed from tier 0 to the same user's next question even after they add a private key —
+no re-extraction under either pool, and the cache hit spends no quota under either scope). `make test` (1305
+passed, 1 skipped), `ruff check`, `ruff format --check`, and `mypy` are all green; both lanes resolve
+credentials per candidate, and `grep -rn "SYSTEM_SCOPE" app/perception app/deps.py` returns nothing.
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

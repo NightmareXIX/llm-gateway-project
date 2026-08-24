@@ -68,10 +68,10 @@ from typing import Final, TypeVar
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.cache import keys
 from app.config import Settings
 from app.core.errors import FileUnreadable
 from app.core.logging import get_logger
+from app.keys_resolution.resolver import ProviderCredentials
 from app.memory.canonical import FileRefBlock
 from app.perception import extractors, local
 from app.perception.storage import ObjectStore, object_path
@@ -187,6 +187,15 @@ class PerceptionResolver:
     ``quota=None`` disables the perception lane's reservations exactly as it
     disables the answer lane's (``QUOTA_ENFORCEMENT``, D15); ``redis=None``
     disables tier 0's fast path and tier 2's stampede lock and nothing else.
+
+    ``credentials`` is D36's resolver, threaded here in Phase 6 Step 6 exactly
+    as ``routing.route``/``route_stream`` took it in Step 5: tier 2 resolves
+    its own candidate chain, independently of the chain the answering model
+    came from, so a user's own Gemini key should read their own documents on
+    their own budget even when the answering model is Groq's shared key. There
+    is no per-request default here the way the router's is — the caller
+    (``deps.get_resolver``, composed in ``api/v1/chat.py``) always has a real
+    ``ProviderCredentials`` in hand by the time this is constructed.
     """
 
     def __init__(
@@ -199,7 +208,7 @@ class PerceptionResolver:
         quota: QuotaTracker | None,
         redis: Redis | None,
         settings: Settings,
-        scope: keys.Scope = keys.SYSTEM_SCOPE,
+        credentials: ProviderCredentials,
     ) -> None:
         self._store = store
         self._session_factory = session_factory
@@ -208,7 +217,7 @@ class PerceptionResolver:
         self._quota = quota
         self._redis = redis
         self._settings = settings
-        self._scope = scope
+        self._credentials = credentials
         self._memo: dict[_MemoKey, ResolvedAttachment] = {}
         self._locks: dict[_MemoKey, asyncio.Lock] = {}
 
@@ -356,7 +365,19 @@ class PerceptionResolver:
 
     # ---- the tiers, one method each ----------------------------------------- #
     async def _cached(self, file_hash: str) -> extractors.Extraction | None:
-        """Tier 0 — Redis, then ``file_extractions``. Written in Step 6."""
+        """Tier 0 — Redis, then ``file_extractions``.
+
+        Deliberately **not** scoped by ``self._credentials`` or by whichever
+        pool paid for the reading (Phase 6 Step 6). ``file_extractions`` is
+        keyed on ``file_hash`` alone (D24) and ``extract:{file_hash}`` carries
+        no scope segment; whose key paid for an extraction does not change
+        what the bytes say, and scoping this read per user would re-spend the
+        scarcest budget in the fleet to compute the same string twice — the
+        exact reasoning D22/D24 already wrote down. A cached reading produced
+        under the shared pool is served to a private-key user precisely as it
+        is served to anyone else, and that is intentional, not a leak: the
+        text is a fact about the document, not about who paid to learn it.
+        """
         return await extractors.load_cached(
             file_hash=file_hash,
             session_factory=self._session_factory,
@@ -386,7 +407,7 @@ class PerceptionResolver:
             session_factory=self._session_factory,
             redis=self._redis,
             quota=self._quota,
-            scope=self._scope,
+            credentials=self._credentials,
         )
 
     async def _local(self, ref: FileRefBlock, data: bytes) -> extractors.Extraction | None:
