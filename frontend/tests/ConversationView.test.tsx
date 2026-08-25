@@ -81,7 +81,13 @@ function loaded(detail: ConversationDetail | undefined, isLoading = false) {
 
 /** The slot the composer is currently showing. */
 function pickerValue(): string {
-  return (screen.getByLabelText("Model") as HTMLSelectElement).value;
+  return screen.getByRole("combobox", { name: /Model/ }).textContent?.trim() ?? "";
+}
+
+/** Pick a slot the way a user does: open the picker, click the row. */
+function choose(slot: string): void {
+  fireEvent.click(screen.getByRole("combobox", { name: /Model/ }));
+  fireEvent.click(screen.getByRole("option", { name: slot }));
 }
 
 /** The slot the *next send* would actually use — the point of the whole feature. */
@@ -146,7 +152,7 @@ describe("the composer opens on the thread's stored slot", () => {
     loaded(undefined, true);
     const view = render(<ConversationView conversationId={CONVERSATION_ID} />);
 
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "general" } });
+    choose("general");
     expect(pickerValue()).toBe("general");
 
     loaded(conversation({ preferred_slot: "fast" }));
@@ -163,7 +169,7 @@ describe("the composer opens on the thread's stored slot", () => {
     render(<ConversationView conversationId={CONVERSATION_ID} />);
     expect(pickerValue()).toBe("fast");
 
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "general" } });
+    choose("general");
 
     expect(pickerValue()).toBe("general");
     expect(slotHandedToSend()).toBe("general");
@@ -174,7 +180,7 @@ describe("the composer opens on the thread's stored slot", () => {
     // different conversation cannot carry one thread's choice into another.
     loaded(conversation({ preferred_slot: "fast" }));
     const view = render(<ConversationView conversationId={CONVERSATION_ID} />);
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "general" } });
+    choose("general");
     expect(pickerValue()).toBe("general");
 
     const other = "8b0d1f6e-0000-4000-8000-00000000000f";
