@@ -278,3 +278,77 @@ one attempt, changes only which box on the right the same boxed history flows in
 history itself is provider-shaped at rest, which is the property `tests/integration/test_chat_endpoint.py`'s
 `test_a_thread_survives_a_provider_switch` exercises end to end: three turns, three different served
 providers, turn one's own words still present in what turn three's payload carries.
+
+## Phase 6: two pools, one request
+
+Everything above assumes one credential and one set of counters for the whole gateway. Phase 6 breaks
+that assumption in the one place it is hardest to see from the code: **inside a single failover
+chain**. BYOK is per provider, not per user (§9.5), so one request can cross a scope boundary
+mid-chain — the user's own Gemini key pays for candidate 1, the gateway's shared Groq key pays for
+candidate 2, and both are correct.
+
+```mermaid
+flowchart TD
+    Req["One request\nuser U, slot general"] --> C1
+
+    subgraph A["Candidate 1 — gemini/gemini-3.6-flash"]
+        C1["credentials.for_provider('gemini', model)"]
+        C1 --> R1["ResolvedKey\npool=private · scope=U · key_id=…"]
+        R1 --> Q1["reserve q:U:gemini:…:rpm/rpd/tpm\n(no personal cap — nothing shared)"]
+        Q1 --> Call1["POST to Gemini\nAuthorization: the user's own key"]
+    end
+
+    Call1 -->|"AuthFailed / RateLimited\n(never retried on the shared key)"| C2
+
+    subgraph B["Candidate 2 — groq/openai-gpt-oss-120b"]
+        C2["credentials.for_provider('groq', model)"]
+        C2 --> R2["ResolvedKey\npool=shared · scope=system · key_id=None"]
+        R2 --> Q2["reserve q:system:groq:…:rpm/rpd/tpm\n+ q:U:groq:model:alloc:rpd (personal cap)"]
+        Q2 --> Call2["POST to Groq\nAuthorization: the gateway's shared key"]
+    end
+
+    Call2 --> Done["served_by names Groq\nkey_pool = 'shared'\nrequests.quota_scope = 'system'\nattempts[] carries both pools"]
+
+    classDef private fill:#4a3f7a,color:#fff,stroke:none;
+    classDef shared fill:#2f6f4f,color:#fff,stroke:none;
+    class R1,Q1,Call1 private;
+    class R2,Q2,Call2 shared;
+```
+
+**One object answers both questions, per candidate** (D36,
+[ADR-034](decisions/ADR-034-per-candidate-credential-resolution.md)). Before this phase the router
+read its credential from `registry.system_key(provider)` inside the loop and its quota scope from a
+`scope` parameter fixed for the whole request. Those are the same question at two granularities, and
+keeping them apart guarantees the bug where a request spends a private key against the system
+counters. `ProviderCredentials.for_provider(provider, model)` returns a `ResolvedKey` carrying the
+key, the pool, the scope, the row id and the personal cap — and the `scope` parameter was deleted
+rather than carried alongside, because two parameters that must agree eventually will not.
+
+**The two branches differ in exactly one place beyond the scope string.** A private attempt reserves
+the provider's published windows under `q:{user_id}:…` and nothing else — the budget being spent is
+the user's own, and there is nothing to fence. A shared attempt reserves the same windows under
+`q:system:…` **plus** one extra grant, `q:{user_id}:{provider}:{model}:alloc:rpd`, which is that
+user's slice of the shared free tier (D39,
+[ADR-036](decisions/ADR-036-personal-caps-under-frozen-contract-c.md)). Both go through
+`reserve_windows` in a single atomic Lua call, so there is no window in which the pool counter moved
+and the personal one did not.
+
+**The chain proceeds; it does not launder.** A private key's `AuthFailed` or `RateLimited` fails that
+*candidate*, and the next candidate resolves independently — it is never retried on the shared key
+for the same provider (D40, [ADR-037](decisions/ADR-037-private-key-failure-is-not-laundered.md)).
+Contract A already marks both errors `failover_eligible`, so this took no new mechanism: it is a
+decision not to write a special case, plus one fire-and-forget write flipping the row's
+`validation_status` so the settings page can say the key is broken.
+
+**One request, one `quota_scope`, but a per-attempt trail.** `requests.quota_scope` records the
+*winning* attempt's scope, reconstructed from `key_pool` plus the caller's own principal
+(`resolver.quota_scope_for`) rather than threaded as a second raw field. The per-attempt truth is in
+`requests.attempts`, where every `AttemptRecord` carries its own `key_pool` — which is what makes a
+row like the one diagrammed above readable months later.
+
+**The perception lane resolves its own chain, independently.** Tier 2's extraction candidates are
+chosen inside `perception/extractors.py` and have nothing to do with whichever provider answers the
+turn, so a user's own Gemini key can pay to *read* their document while Groq's shared key answers the
+question about it. The extraction cache stays global and keyed on `file_hash` alone (D24): scoping it
+per user to "keep private-key work private" would re-spend a provider's budget to recompute an
+identical string, and that trade is documented in `docs/limitations.md` rather than made silently.

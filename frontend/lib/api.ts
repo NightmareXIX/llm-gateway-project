@@ -10,10 +10,14 @@ import type {
   FileUploadResponse,
   Me,
   ModelsResponse,
+  ProviderKeyStatus,
 } from "./types";
 
 /** Same-origin prefix; `next.config.ts` rewrites it to the gateway. */
 export const GATEWAY_BASE = "/api/gw";
+
+/** Also the SWR cache key for the settings list — see `useProviderKeys`. */
+export const PROVIDER_KEYS_KEY = "/v1/provider-keys";
 
 /**
  * A gateway failure, carrying the error envelope intact.
@@ -234,6 +238,37 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  // ------------------------------------------------------------------------ //
+  // BYOK provider keys (Phase 6, §9.2)
+  // ------------------------------------------------------------------------ //
+  /** One row per *enabled* provider, key or no key — an empty settings page is
+   *  still a full list, and the client never hardcodes the provider set. */
+  listProviderKeys: () => request<ProviderKeyStatus[]>(PROVIDER_KEYS_KEY),
+
+  /**
+   * Add a key. The gateway validates it against the provider **before** storing
+   * anything (§9.2), so the two failures a caller has to tell apart both arrive
+   * here as a `GatewayError` and must not be flattened together:
+   * `invalid_provider_key` (422 — the provider rejected it) and
+   * `provider_unavailable` (503 — we could not check). A 429 is D43's
+   * anti-abuse floor on this route, five an hour.
+   */
+  addProviderKey: (provider: string, key: string, nickname?: string | null) =>
+    request<ProviderKeyStatus>(PROVIDER_KEYS_KEY, {
+      method: "POST",
+      body: JSON.stringify({ provider, key, ...(nickname ? { nickname } : {}) }),
+    }),
+
+  /** Soft-deletes the row. Deliberately leaves the user's `q:{user_id}:…`
+   *  counters alone — they record what that key really spent (trap 4). */
+  removeProviderKey: (provider: string) =>
+    request<void>(`${PROVIDER_KEYS_KEY}/${provider}`, { method: "DELETE", parse: false }),
+
+  /** The settings page's "check again" — `validation_status` is a snapshot, and
+   *  this is the only thing that refreshes it short of a real request failing. */
+  revalidateProviderKey: (provider: string) =>
+    request<ProviderKeyStatus>(`${PROVIDER_KEYS_KEY}/${provider}/validate`, { method: "POST" }),
 };
 
 /** SWR's fetcher: the key is the path, so cache keys read as URLs in devtools. */

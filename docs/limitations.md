@@ -267,15 +267,75 @@ history. The read side gets no equivalent gate — a stored entry is by construc
 since the write side already refused anything else — and ADR-033 explains why that asymmetry is correct
 rather than an inconsistency.
 
+## Bring your own key
+
+**The exact cache is keyed on the request, not on the user — so a private key's answer can be served
+to someone else.** `request_hash` folds in the requested slot, the full canonical history and the
+generation knobs, and deliberately not `user_id` (ADR-023: a cache scoped per user is a cache that
+almost never hits). Under `auto`, two accounts asking the same question with `temperature: 0` produce
+the same hash, so an answer a private Gemini key paid for can be replayed to a shared-pool user for
+up to `EXACT_CACHE_TTL_S`. The reverse also holds and is the more common case. Nothing leaks — the
+credential never enters the cache entry, and `key_pool` is `null` on a hit because no key was spent —
+but the *work* is shared, and a user who added their own key partly to keep their questions off a
+shared path should know the answer text can outlive their request. ADR-023 weighed this class of
+trade already; this is a new instance of it, documented rather than discovered. Turning it off is
+`CACHE_EXACT_ENABLED=false`.
+
+**One active key per provider per user, and no rotation.** A partial unique index on
+`(owner_id, provider) WHERE owner_type='user' AND is_active` enforces it; replacing a key is
+remove-then-add, which the API does in one `POST` (a deactivate-then-insert upsert) but which is
+still, semantically, a replacement rather than a second credential. There is no key-rotation UI and
+no multi-key fallback: if your key is spent, the chain fails over to a *different provider* on the
+shared pool (ADR-037), never to a second key of yours on the same one.
+
+**The shared pool's own credentials are not in the database.** `GROQ_API_KEY`, `GEMINI_API_KEY` and
+`OPENROUTER_API_KEY` stay in the environment (ADR-035), so `provider_keys` holds only
+`owner_type='user'` rows in v1 even though the column admits `'system'`. A database dump therefore
+contains every *user's* key as ciphertext and none of ours in any form.
+
+**`ENCRYPTION_KEY` is a single Fernet key with no rotation path built.** Lose it or rotate it and
+every stored user key becomes unreadable: the resolver logs one error per row (`key_id`, never
+ciphertext) and falls back to the shared pool, so the gateway keeps answering while quietly ignoring
+credentials it can no longer read. Users are not told; their settings page still reads *Using your
+key* until something asks the provider. `MultiFernet` is the named seam for fixing this and is not
+built. `docs/deploy.md` says the same thing where an operator will actually meet it.
+
+**A key's `validation_status` is a snapshot, not a live fact.** `valid` means the provider accepted
+it the last time anyone asked — at add time, or at the user's own re-check. A key revoked upstream
+five minutes ago still reads `valid` until a real request fails with it, at which point D40's write
+flips it to `invalid` (ADR-037) and the settings row says so. There is no background revalidation:
+polling three providers per user per hour to keep a status field warm is not something a free tier
+has room for.
+
+**The personal shared-pool cap is per (provider, model), and it is not the gateway rate limit.**
+`q:{user_id}:{provider}:{model}:alloc:rpd` fences one user's slice of a shared free tier and fails
+*closed* with the rest of quota; `rl:{user_id}:rpd` limits requests to the gateway across all
+providers and fails *open* (ADR-036 vs ADR-022). Hitting the cap skips that candidate the way any
+exhausted candidate is skipped — the request fails over rather than erroring — so a capped user on a
+one-candidate slot sees the same "everything is at its limit" answer an exhausted pool produces, with
+no message distinguishing "your cap" from "the pool's". Making that distinction visible is a Phase 7
+usage-dashboard question.
+
+**What the leak test covers, and what it does not.** `tests/integration/test_credential_leakage.py`
+drives a sentinel key through the real app — add, list, a non-streaming turn, a streaming turn, a
+live `AuthFailed` failing over to another provider, remove — and asserts the plaintext and its Fernet
+ciphertext appear in no JSON log record, no response body, and no stored `requests.attempts` row; a
+second test forces an unhandled exception while the key is a live local in the router's frame and
+checks the traceback carries neither. That is coverage of *our* log stream and *our* responses. It
+says nothing about what a provider logs on their side, about a heap dump, or about a future log call
+written after the test was, which is why the sentinel is asserted against captured records rather
+than against a list of known-risky call sites.
+
 ## Explicitly out of scope for v1
 
-**No file management UI, no summarization, no BYOK, no audio/video/office formats, no async
+**No file management UI, no summarization, no audio/video/office formats, no async
 extraction.** The perception lane (Phase 4) deliberately stops short of a file browser or a delete
 endpoint — a file is referenced by the turn that uploaded it, and `GET /v1/files/{hash}` returns
 metadata only. A truncated document keeps its summary through D28's prompt ordering rather than
 through a new summarization strategy (`memory/summarize.py` is still the unbuilt seam D4 always
-described). Every perception-lane reservation still runs under `keys.SYSTEM_SCOPE`, same as the
-answer lane, until Phase 6 replaces that one constant in both places. The upload allowlist is PDF,
+described). Both lanes resolve their credential per candidate since Phase 6, so a
+perception-lane reservation runs under whichever scope that candidate resolved to — see the BYOK
+section above. The upload allowlist is PDF,
 PNG, JPEG and WebP — a format with no tier-3 fallback is a format that fails at 3am rather than
 degrading, so nothing is accepted without one. And extraction runs synchronously inside the request
 that needs it (D22) rather than on a queue, because a background worker is a second runtime a free

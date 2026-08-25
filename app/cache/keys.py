@@ -18,6 +18,15 @@ decision, and separating them is how a 60-second counter ends up outliving its
 window. The exceptions are the daily counters, whose TTL is a *provider* fact
 rather than ours — see :data:`UNTIL_PROVIDER_RESET`.
 
+**Two amendments have been made to the frozen format, both with sign-off and
+both recorded.** Phase 3 Step 10 added the ``{window}`` segment to
+``rl:{user_id}:{window}:{window_start}`` (ADR-022), because one key cannot
+address two windows. Phase 6 Step 7 added one *builder*,
+:func:`user_allocation` — ``q:{user_id}:{provider}:{model}:alloc:rpd`` (D39,
+ADR-036) — changing no existing format. Neither had ever been written before
+the amendment, so neither cost a migration; the record is the point, and a
+third one should be this visible too.
+
 Keys are built, never parsed. That matters more than it looks: model ids
 legitimately contain colons (``openai/gpt-oss-20b:free``), so the segments of a
 key are not recoverable from the key. Nothing needs to recover them, and the

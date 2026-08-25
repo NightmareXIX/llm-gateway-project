@@ -22,7 +22,7 @@
  */
 
 import { GATEWAY_BASE, NetworkError, authHeaders, gatewayErrorFrom } from "./api";
-import type { ChatCompletionRequest, ExtractionTier, ServedBy, UsageOut } from "./types";
+import type { ChatCompletionRequest, ExtractionTier, KeyPool, ServedBy, UsageOut } from "./types";
 
 export type MetaEvent = {
   attempt: number;
@@ -62,6 +62,9 @@ export type DoneEvent = {
   /** D32's streaming twin: the pin disclosure. Rides on a successful stream —
    *  it is not an error, and must not be rendered as one (trap 6). */
   warning?: string | null;
+  /** D42's streaming twin: which credential pool served the winning attempt.
+   *  `null` on a cache-hit replay — nothing was spent to produce it. */
+  key_pool?: KeyPool | null;
   status: "ok" | "failed";
   /** Present only on `status: "failed"` with a non-trivial partial buffer. */
   partial_content?: string;

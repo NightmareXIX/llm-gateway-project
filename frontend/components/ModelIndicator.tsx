@@ -44,8 +44,16 @@ import { VisuallyHidden } from "./ui/VisuallyHidden";
  *      and cannot override, so the one turn it silently redirects is exactly
  *      the turn that has to say so.
  *
- * Both are **disclosures on a successful answer**, not errors (trap 6). They
- * ride on a 200 with real content under them and belong in the register the
+ * Phase 6 adds a seventh, in the same register:
+ *
+ *   7. `keyPool === "private"` → say that the user's own key served it. And say
+ *      **nothing** when it is `"shared"`: the shared pool is what every account
+ *      is on by default, so a badge on every message announcing the default
+ *      would be noise rather than disclosure. `null` — a cache hit, or a
+ *      mid-stream `meta` — says nothing either, because nothing was spent.
+ *
+ * All of them are **disclosures on a successful answer**, not errors (trap 6).
+ * They ride on a 200 with real content under them and belong in the register the
  * degraded notice already occupies — never a `TurnErrorCard`.
  *
  * Everything it needs arrives as one `Provenance` object, built by an adapter in
@@ -69,6 +77,7 @@ export function ModelIndicator({
     extractionTier,
     messagesDropped,
     warning,
+    keyPool,
     tokensIn,
     tokensOut,
   } = provenance;
@@ -187,6 +196,23 @@ export function ModelIndicator({
         </>
       )}
 
+      {/* Rule 7 — whose credential paid for this (Phase 6, D42). Only the
+          non-default is disclosed; `shared` and `null` say nothing at all. */}
+      {keyPool === "private" && (
+        <>
+          <Separator />
+          <Tooltip content={<span>{PRIVATE_KEY_DETAIL(provider)}</span>}>
+            <span
+              tabIndex={0}
+              className="cursor-help rounded border-b border-dotted border-ink-tertiary text-ink-tertiary"
+            >
+              your {provider} key
+            </span>
+          </Tooltip>
+          <VisuallyHidden>{PRIVATE_KEY_DETAIL(provider)}</VisuallyHidden>
+        </>
+      )}
+
       {(tokensIn !== null || tokensOut !== null) && (
         <>
           <Separator />
@@ -201,6 +227,17 @@ export function ModelIndicator({
     </div>
   );
 }
+
+/**
+ * Rule 7's sentence: what "your key" actually means for this answer.
+ *
+ * Both halves are worth saying, and neither is obvious from the chip: the
+ * request was billed to the user's own provider account, and it was counted
+ * against their own budget rather than the pool everyone shares (§9.4).
+ */
+const PRIVATE_KEY_DETAIL = (provider: string) =>
+  `This answer was served with your own ${provider} key, billed to your ${provider} ` +
+  "account and counted against its budget rather than the gateway's shared pool.";
 
 /**
  * D4's omission, said in one line.

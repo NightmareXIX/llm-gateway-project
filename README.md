@@ -2,9 +2,11 @@
 
 A FastAPI service that sits between clients and Gemini/Groq/OpenRouter, exposing one
 OpenAI-shaped API while it owns conversation state, routes across logical model slots, fails over
-when a free tier runs out, tracks heterogeneous quota (RPM/RPD/TPM) in Redis, and understands
-uploaded files through a separate "perception lane" even when the answering model can't. Built
-entirely on free tiers, as a portfolio/learning project.
+when a free tier runs out, tracks heterogeneous quota (RPM/RPD/TPM) in Redis, understands
+uploaded files through a separate "perception lane" even when the answering model can't, and lets a
+user bring their own provider key — resolved per candidate, so one failover chain can spend a private
+key and a shared one and count each correctly. Built entirely on free tiers, as a portfolio/learning
+project.
 
 Full design docs live in [`doc/reference/`](doc/reference/) — start with
 [`project-overview.md`](doc/reference/project-overview.md) for the pitch and
@@ -12,7 +14,7 @@ Full design docs live in [`doc/reference/`](doc/reference/) — start with
 everything else is built against. Decision records are in [`docs/decisions/`](docs/decisions/);
 the honest-edges document is [`docs/limitations.md`](docs/limitations.md).
 
-*(This README covers three interview questions in depth for now — the architecture diagrams, full
+*(This README covers four interview questions in depth for now — the architecture diagrams, full
 request-flow walkthrough, and "Design Decisions" index it will eventually carry are Phase 7 work,
 tracked in [`doc/reference/development-plan.md`](doc/reference/development-plan.md).)*
 
@@ -112,6 +114,40 @@ The demo this proves: start a conversation on `fast` (Groq), ask something, get 
 than the one that answered turn one. Attach a PDF on the first turn and ask about it on the second — the
 same uploaded bytes render natively for one model and as extracted text for the other, with one upload
 and one extraction between them.
+
+## What changes when you paste in your own API key?
+
+The next message. Not the next session, not the next login — the next message, in the same
+conversation, with no reload.
+
+Open Settings → API Keys and every provider reads *Using shared pool*. Paste a Gemini key and the
+gateway validates it against Gemini **before** storing anything: a bad key comes back with Google's
+own wording and nothing is written, and a Gemini that happens to be *down* comes back as a distinct
+"we couldn't check this" rather than as "your key is bad" — two sentences that lead to opposite next
+actions, which is the entire reason there are two error codes. A good key is encrypted with Fernet,
+stored, and the row flips to *Using your key · ••••a91c*. Send the next message and its provenance
+says `key_pool: private`, the `requests` row carries `quota_scope = <your user id>`, and in Redis
+`q:{you}:gemini:gemini-3.6-flash:rpd` has moved while `q:system:…` has not. Remove the key and the
+message after that is back on the shared pool.
+
+The part that is actually hard is that **BYOK is per provider, not per user**. One failover chain
+crosses both pools: your Gemini key pays for candidate 1, and when it is spent, the gateway's shared
+Groq key pays for candidate 2 — one request, two credentials, two sets of counters, neither leaking
+into the other. So "which key" and "which budget" are one question answered *per candidate*, by one
+injected object, and the old per-request `scope` parameter was deleted rather than kept alongside it
+([ADR-034](docs/decisions/ADR-034-per-candidate-credential-resolution.md)). A private key that gets
+rejected is never quietly retried on the shared key for the same provider: the chain moves to the
+next *provider*, and the broken key's row is flagged so Settings can say so, because silently
+laundering a dead key through the shared pool means the user is told everything is fine forever
+([ADR-037](docs/decisions/ADR-037-private-key-failure-is-not-laundered.md)).
+
+Two consequences worth naming rather than hiding. Your own key can unlock a slot nobody else sees —
+`pro`, on a Gemini Pro model the shared free-tier key genuinely cannot reach — and `auto` still never
+routes to it, because an `auto` that resolves differently per account is unreproducible and its cache
+entries unshareable ([ADR-038](docs/decisions/ADR-038-private-key-only-slots.md)). And the exact
+cache is keyed on the request, not on the user, so an answer your key paid for can be replayed to
+someone else asking the identical question; that trade is written down in
+[`docs/limitations.md`](docs/limitations.md) rather than discovered.
 
 ## Running it
 

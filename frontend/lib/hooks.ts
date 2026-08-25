@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import useSWR, { mutate as globalMutate } from "swr";
 
-import { GatewayError, NetworkError, api, swrFetcher } from "./api";
+import { GatewayError, NetworkError, PROVIDER_KEYS_KEY, api, swrFetcher } from "./api";
 import { MAX_ATTACHMENTS, rejectionFor, uploadFailureReason, type SentAttachment } from "./files";
 import { deriveTitle } from "./format";
 import { buildAttemptTrail, fromDoneEvent, fromMetaEvent, type Provenance } from "./provenance";
@@ -17,6 +17,7 @@ import type {
   Message,
   MessageMeta,
   ModelsResponse,
+  ProviderKeyStatus,
 } from "./types";
 
 export const CONVERSATIONS_KEY = "/v1/conversations";
@@ -66,6 +67,67 @@ export function useConversation(id: string | null) {
     { revalidateOnFocus: false },
   );
   return { conversation: data, error, isLoading, mutate };
+}
+
+// --------------------------------------------------------------------------- //
+// BYOK provider keys (Phase 6, Step 10)
+// --------------------------------------------------------------------------- //
+/**
+ * The settings page's rows, and the three writes that change them.
+ *
+ * **Every write revalidates `/v1/models` as well as this list**, and that is not
+ * belt-and-braces: §9.7 lets a private key unlock a slot nobody else can see
+ * (`pro`, on a Gemini Pro model the shared free-tier key cannot reach), and the
+ * per-candidate status of every *other* slot is computed under the caller's own
+ * scope (§9.4) — so adding or removing a key changes what the picker should
+ * offer and what each entry's status means. A stale picker after a successful
+ * add is the one place a user would conclude the feature does not work.
+ *
+ * The three writes deliberately do **not** swallow their errors. Which failure
+ * happened is the entire message: a 422 is the provider's own wording about the
+ * key, a 503 is "we could not check", and a 429 is D43's five-an-hour floor.
+ * `ProviderKeysSection` renders each one differently, inline and next to the
+ * row it belongs to, so it needs the `GatewayError` itself rather than a
+ * boolean.
+ */
+export function useProviderKeys() {
+  const { data, error, isLoading, mutate } = useSWR<ProviderKeyStatus[]>(
+    PROVIDER_KEYS_KEY,
+    swrFetcher,
+    { revalidateOnFocus: false },
+  );
+
+  const refresh = useCallback(async () => {
+    await mutate();
+    await globalMutate(MODELS_KEY);
+  }, [mutate]);
+
+  const add = useCallback(
+    async (provider: string, key: string) => {
+      await api.addProviderKey(provider, key);
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const remove = useCallback(
+    async (provider: string) => {
+      await api.removeProviderKey(provider);
+      await refresh();
+    },
+    [refresh],
+  );
+
+  /** D40's payoff: re-ask the provider about a key a live request found broken. */
+  const revalidate = useCallback(
+    async (provider: string) => {
+      await api.revalidateProviderKey(provider);
+      await refresh();
+    },
+    [refresh],
+  );
+
+  return { rows: data, error, isLoading, add, remove, revalidate };
 }
 
 // --------------------------------------------------------------------------- //
@@ -589,6 +651,10 @@ async function applyOptimisticTurn({
           // answer built on two thirds of the thread must not look like a
           // whole-history answer for the second before the refetch lands.
           messages_dropped: done.messages_dropped ?? 0,
+          // And the pool disclosure (D42). Same reasoning a third time: a turn
+          // the user's own key paid for must not read as a shared-pool turn for
+          // the second between `done` and the revalidation.
+          key_pool: done.key_pool ?? null,
         } satisfies Partial<MessageMeta>,
         created_at: now,
       };

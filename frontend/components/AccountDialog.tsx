@@ -7,6 +7,7 @@ import { cn } from "@/lib/cn";
 import { useMe } from "@/lib/hooks";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { THEMES, THEME_LABELS, useTheme, type Theme } from "@/lib/theme";
+import { ProviderKeysSection } from "./ProviderKeysSection";
 import { Button } from "./ui/Button";
 import { Dialog } from "./ui/Dialog";
 import { Skeleton } from "./ui/Skeleton";
@@ -19,10 +20,11 @@ import { Skeleton } from "./ui/Skeleton";
  * the header. Both problems were the same problem: settings were being laid out
  * *around* the conversation list instead of being given their own surface.
  *
- * A modal fixes the crowding and the discoverability at once. It is not a
- * settings *page*: BYOK, model preferences and usage all belong to later phases,
- * and this holds only what Phase 1 actually has — who you are, how it looks, and
- * the way out.
+ * A modal fixes the crowding and the discoverability at once. It is still not a
+ * settings *page* — model preferences and usage belong to Phase 7 — but Phase 6
+ * gave it the third thing an account genuinely owns: the provider keys that
+ * decide whose credential answers your messages (§9.2). It now holds who you
+ * are, whose key pays, how it looks, and the way out.
  */
 export function AccountDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { me, isLoading } = useMe();
@@ -77,6 +79,8 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
             </dl>
           )}
         </section>
+
+        <ProviderKeysSection />
 
         <section>
           <h3 className="mb-2 text-sm font-medium text-ink">Appearance</h3>

@@ -86,23 +86,34 @@ app/
   providers/{types,errors,base,groq,gemini,openrouter,registry}.py
   routing/{router,selection,circuit_breaker}.py
   streaming/{sse,orchestrator,collector}.py
-  quota/{tracker,windows,lanes}.py + quota/scripts/*.lua
+  quota/{tracker,windows,lanes,allocations}.py + quota/scripts/*.lua
   memory/{canonical,render,fitting,summarize}.py
   perception/{lane,extractors,local,storage}.py
   cache/{keys,client,exact}.py
   keys_resolution/resolver.py
   usage/{logger,metrics}.py
   db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,allocations,files,extractions}.py}
-frontend/            # Next.js App Router + Tailwind; lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip}.tsx
+frontend/            # Next.js App Router + Tailwind; lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip,ProviderKeysSection}.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
 docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ holds the source specs
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 6 — BYOK Settings
+## Current phase: Phase 7 — Polish & Portfolio
 
-In progress. Ten steps, three milestones, per `phase6.md` (derived from `development-plan.md` §3 Phase 6
+Not started. Per `development-plan.md` §3 Phase 7: the usage dashboard against `api/admin.py`
+(request volume, provider distribution, error rate, cache hit rate, quota utilization, and §4.8's
+simulated cost off a checked-in `config/pricing.yaml`), the README's architecture/request-flow/
+"Design Decisions" build-out, `/metrics` in Prometheus format, the load-and-chaos demo script,
+idempotency (D6, `keys.idempotency` still unwritten), keyset message pagination as a **second** repo
+function beside an untouched `list_for_conversation`, and `docs/limitations.md` finalized. Phase 6
+hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` on every attempt —
+see `phase6.md` §9.
+
+## Phase 6 — BYOK Settings — complete
+
+Ten steps, three milestones, per `phase6.md` (derived from `development-plan.md` §3 Phase 6
 read against `project-overview.md` §9 in full, since the plan itself says only "§9 implemented end to
 end"). **Milestone A** (Steps 1–3) gets the key stored, encrypted, addable and removable with nothing
 using it yet; **Milestone B** (Steps 4–7) is the resolver and both lanes threaded, quota branched, and
@@ -112,7 +123,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–9 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: all 10 steps committed, all three milestones done.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -496,6 +507,73 @@ everyone else; `auto` never selects `pro` even for the key holder). `make test` 
 skipped), `ruff check`, `ruff format --check`, and `mypy` are all green; two accounts hitting
 `/v1/models` in the same test get different, correct answers, per the step's own "done when." No
 frontend change — Step 10.
+
+Step 10 (the frontend, six ADRs, and the docs) touches the files `phase6.md` names —
+`frontend/lib/{types,api,hooks,provenance}.ts`, `frontend/components/{ModelIndicator,AccountDialog}.tsx`,
+`frontend/components/ProviderKeysSection.tsx` (new), `frontend/tests/`, `docs/` — plus one the step's
+list does not name, `frontend/components/ErrorState.tsx`, whose `formatWaitSeconds` is now exported so
+the 429 on the settings surface rounds a wait exactly the way the chat surface does rather than growing
+a second copy of the same rounding. `types.ts` gained a named `KeyPool` type (four files restate it),
+`key_pool` on `MessageMeta` / `ChatCompletionResponse` / `DoneEvent` (the last in `sse.ts`), and the
+three BYOK wire shapes; `api.ts` gained `PROVIDER_KEYS_KEY` plus `listProviderKeys` /
+`addProviderKey` / `removeProviderKey` / `revalidateProviderKey`. `provenance.ts` carries `keyPool`
+through all four constructors: `fromMetaEvent` reports `null` because a restart can change the pool
+mid-stream (a private Gemini key failing over to shared Groq is D40's own scenario, so `meta` cannot
+honestly claim one), while `fromMessageMeta` — unlike `warning`, which it hard-codes `null` — *reads*
+the stored value, since which pool paid for a turn is a fact about the turn rather than about the
+request, so a reopened thread still discloses it. `ModelIndicator` gained rule 7 in the disclosure
+register: `"private"` renders "your {provider} key" with a tooltip naming the billing consequence, and
+`"shared"`/`null` render nothing at all, because a badge on every message announcing the default is
+noise rather than disclosure. `hooks.ts` gained `useProviderKeys` — SWR over `/v1/provider-keys` plus
+three writes that each revalidate **`/v1/models` as well**, since §9.7's private-key-only slot appears
+or disappears and §9.4 computes every other slot's status under the caller's own scope; the three
+writes deliberately do not swallow their errors, because which failure happened (422 the provider's
+wording, 503 "we could not check", 429 D43's floor) is the entire message on that surface. The
+optimistic turn in `applyOptimisticTurn` mirrors `key_pool` onto the local `meta` for the same reason
+it already mirrors `extraction_tier` and `messages_dropped`.
+
+`ProviderKeysSection` renders inside `AccountDialog` (whose docstring, which had said BYOK belongs to a
+later phase, now says what it holds): §9.8's disclosure in plain language above the rows, one row per
+enabled provider whether or not a key is stored, a `type="password"` input that is never pre-filled and
+is cleared on failure as well as on success (a rejected key left in the box invites a second submit
+against a five-an-hour route, and leaves a live credential in the DOM), and D40's payoff — a row whose
+`validation_status` is `invalid` warns that the provider rejected the key and offers a re-check beside
+the removal. Each row is a labelled `role="group"`, which is both the a11y answer to three identical
+"Remove" buttons and what makes the tests addressable. New tests:
+`frontend/tests/ProviderKeysSection.test.tsx` (the six states — no key, adding, the 422 rendered as the
+provider's own wording plus "nothing was saved", the 503 explicitly *not* saying the key is bad, the
+429 as a wait, an active key, an invalid stored key) and `frontend/tests/useProviderKeys.test.tsx` — a
+separate file rather than a block in the first, since that file mocks `@/lib/hooks` wholesale and the
+hook test needs the real one, the same split `useSendMessage.test.tsx` already models. `ModelIndicator
+.test.tsx` gained rule 7's four cases and two adapter cases; `provenance.test.ts` moved `key_pool` into
+the shared `facts` object of the two-transport agreement test, so a field added to `DoneEvent` and
+forgotten on the response fails there (trap 8's client half, third field to make the trip).
+
+One backend file changed, and it is the exit checklist's doing rather than the step's file list:
+`app/cache/keys.py`'s **module** docstring now records both Contract C amendments together — ADR-022's
+`{window}` segment and this phase's `user_allocation` builder — since the checklist asks for the second
+to be as visible as the first and only the builder's own docstring carried it. Six ADRs landed:
+[ADR-034](docs/decisions/ADR-034-per-candidate-credential-resolution.md) (D36+D38, and the record that
+D42 deliberately gets no ADR of its own), [ADR-035](docs/decisions/ADR-035-shared-pool-stays-in-the-environment.md)
+(D37, `MultiFernet` named as the rotation seam), [ADR-036](docs/decisions/ADR-036-personal-caps-under-frozen-contract-c.md)
+(D39, and the amendment record itself), [ADR-037](docs/decisions/ADR-037-private-key-failure-is-not-laundered.md)
+(D40, including that the write had never been wired until Step 8 found it),
+[ADR-038](docs/decisions/ADR-038-private-key-only-slots.md) (D41) and
+[ADR-039](docs/decisions/ADR-039-validation-endpoint-rate-limiting.md) (D43, with the note that a third
+`GatewayWindow` value is not a Contract C format change). `docs/limitations.md` gained a BYOK section
+(the cache being keyed on the request and not the user, so a private key's answer can be replayed to
+someone else; one key per provider; no rotation; the shared pool staying in the environment;
+`validation_status` as a snapshot; the personal cap vs. the gateway rate limit; and what the leak test
+does and does not cover), and its out-of-scope paragraph stopped claiming BYOK and `SYSTEM_SCOPE`.
+`docs/architecture.md` gained "Phase 6: two pools, one request" — a diagram of one failover chain
+crossing a scope boundary, which is the thing genuinely hard to see from the code.
+`docs/deploy.md` gained an operating note on what a lost or rotated `ENCRYPTION_KEY` actually does
+(every stored row unreadable, one `keys_resolution.credential_unreadable` log line per row, silent
+fallback to the shared pool) and an updated variable row; `.env.example`'s comment says the same.
+`README.md` gained a fourth in-depth section framed around the demo. `make test` (1347 passed, 1
+skipped), `ruff check`, `ruff format --check`, `mypy`, `make frontend-test` (123 passing),
+`make frontend-lint` and `next build` are all green; the definition of done's live-browser walkthrough
+is not something this pass ran.
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

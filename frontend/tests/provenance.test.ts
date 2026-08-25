@@ -47,6 +47,11 @@ describe("fromDoneEvent", () => {
       // silently discloses less.
       messages_dropped: 148,
       warning: "conversation pinned to gemini/gemini-3.6-flash due to prior tool use",
+      // Phase 6's own addition, in `facts` for the same reason and as the
+      // third field to make the trip: D42 said "follow the pattern exactly",
+      // and this is the line that proves the pattern was followed on both
+      // transports rather than only on the one that was tested by hand.
+      key_pool: "private" as const,
     };
 
     const done: DoneEvent = {
@@ -74,6 +79,7 @@ describe("fromDoneEvent", () => {
     // the same nothing and agreeing vacuously.
     expect(fromDoneEvent(done).messagesDropped).toBe(148);
     expect(fromDoneEvent(done).warning).toBe(facts.warning);
+    expect(fromDoneEvent(done).keyPool).toBe("private");
   });
 
   it("defaults both Phase 5 fields when a `done` event omits them", () => {
@@ -93,6 +99,7 @@ describe("fromDoneEvent", () => {
 
     expect(fromDoneEvent(done).messagesDropped).toBe(0);
     expect(fromDoneEvent(done).warning).toBeNull();
+    expect(fromDoneEvent(done).keyPool).toBeNull();
   });
 
   it("carries the tokens a discarded attempt really spent", () => {

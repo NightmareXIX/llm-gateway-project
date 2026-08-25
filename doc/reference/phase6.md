@@ -938,6 +938,24 @@ D42 gets no ADR; say so in ADR-034's consequences.
 **Done when:** all five `make` targets are green and the definition-of-done's eight steps are demoable in a
 browser.
 
+**Landed.** The frontend touched every file this step names plus one it does not,
+`frontend/components/ErrorState.tsx` — `formatWaitSeconds` is now exported so the 429 on this surface
+rounds a wait the same way the chat surface does, rather than growing a second copy. `types.ts` gained
+`KeyPool` (a named type, since four files restate it), `key_pool` on `MessageMeta` /
+`ChatCompletionResponse` / `DoneEvent`, and the three BYOK shapes; `provenance.ts` carries `keyPool`
+through all four constructors, `fromMetaEvent` reporting `null` because a restart can change the pool
+mid-stream and `fromMessageMeta` *reading* the stored value — unlike `warning`, which pool paid for a turn
+is a fact about the turn rather than about the request, so a reopened thread still discloses it. Rule 7 in
+`ModelIndicator` renders only `"private"`. `ProviderKeysSection` is the new component, rendered in
+`AccountDialog`, each row a labelled `role="group"` so three identical "Remove" buttons stay
+distinguishable to a screen reader and to a test. The hook test moved to its own file
+(`frontend/tests/useProviderKeys.test.tsx`, the `useSendMessage.test.tsx` precedent) rather than fighting
+`ProviderKeysSection.test.tsx`'s own module mock. One backend file changed:
+`app/cache/keys.py`'s module docstring now records **both** Contract C amendments together, since the exit
+checklist asks for the second one to be as visible as ADR-022's and only the `user_allocation` builder's
+own docstring carried it. Six ADRs, the limitations section, the architecture diagram, the deploy note,
+the README section and the `.env.example` comment all landed as specified.
+
 ---
 
 ## 5. Traps

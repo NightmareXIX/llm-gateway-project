@@ -257,7 +257,7 @@ wholesale points production at your laptop:
 | `SUPABASE_URL`, `SUPABASE_JWT_AUDIENCE`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | same as `.env` — the service-role key bypasses row-level security on the whole project, so handle it exactly like a provider key: never logged, never in an error message |
 | `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
 | `REDIS_URL` | Upstash, from step 2 — `.env` holds `localhost:6379` |
-| `ENCRYPTION_KEY` | **generate a fresh one.** Nothing is encrypted with it until Phase 6, so a new key is free now; sharing dev's means a leaked dev `.env` also decrypts production, and rotating later is a migration |
+| `ENCRYPTION_KEY` | **generate a fresh one, and keep it.** `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Since Phase 6 this encrypts every BYOK provider key users add in Settings; sharing dev's means a leaked dev `.env` also decrypts production. See *If `ENCRYPTION_KEY` is lost or rotated* under Operating notes before you change it |
 | `REQUIRE_VERIFIED_EMAIL` | type `true` **literally**. It has a default in `Settings`, so it is frequently absent from `.env` — scripting it out of that file yields an empty string, and an empty string is not a boolean |
 
 > That last row is a real failure, not a hypothetical. Anything scripted that interpolates a missing
@@ -675,10 +675,25 @@ search the **Logs** tab for the request id — the one in the error envelope the
 Free instances have no shell, so the dashboard (or `render logs` from the CLI, if you install it) is
 the only way in.
 
+**If `ENCRYPTION_KEY` is lost or rotated, every stored user key becomes unreadable.** This is the
+one operational fact Phase 6 adds. `provider_keys.encrypted_key` holds a Fernet token per BYOK
+credential, and Fernet refuses a token it did not produce — so a new key means every existing row
+fails to decrypt. Nothing crashes: `decrypt_provider_key` raises the typed `CredentialUnreadable`,
+the resolver logs one `keys_resolution.credential_unreadable` line per row (carrying `key_id`, never the
+ciphertext) and falls back to the shared pool, and requests keep being answered. But those keys are
+gone, users are not told, and their settings page still reads *Using your key* until something asks
+the provider. **There is no rotation path built** — `MultiFernet` is the named seam
+([ADR-035](decisions/ADR-035-shared-pool-stays-in-the-environment.md)) and building it is what a
+planned rotation would need first. Practically: back the value up wherever you back up the database,
+and if it is genuinely lost, the recovery is to tell users to re-add their keys (a `DELETE` of the
+dead rows is optional — the resolver already ignores them).
+
 **Rotating a provider key.** Edit `GROQ_API_KEY` (or `GEMINI_API_KEY` / `OPENROUTER_API_KEY`) in the
 service's Environment tab; saving triggers a redeploy. A revoked key surfaces as a clean 502 with a
 `requests` row at `status='error'`, never a traceback — and from Phase 2 Step 5 onward, as a failover
-to whichever provider is still live rather than as an error at all.
+to whichever provider is still live rather than as an error at all. This is the *shared pool's*
+keys, which stay in the environment on purpose (ADR-035); a user's own key is a database row they
+manage themselves in Settings, and nothing here touches it.
 
 **Database migrations on a live deploy.** They run in the new container before it passes its health
 check and takes traffic, while the old one is still serving — so a migration must be compatible with

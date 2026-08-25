@@ -34,6 +34,7 @@ const BASE: Provenance = {
   extractionTier: null,
   messagesDropped: 0,
   warning: null,
+  keyPool: "shared",
   tokensIn: 812,
   tokensOut: 340,
   wastedTokensOut: 0,
@@ -241,6 +242,39 @@ describe("rule 6 — a pinned conversation discloses its pin", () => {
   });
 });
 
+describe("rule 7 — a private key is disclosed, the shared pool is not", () => {
+  it("says whose key served the answer when it was the user's own", () => {
+    render(<ModelIndicator provenance={{ ...BASE, keyPool: "private" }} />);
+
+    expect(screen.getByText("your Groq key")).toBeInTheDocument();
+  });
+
+  it("stays silent on the shared pool", () => {
+    // The default every account is on. A badge on every message announcing it
+    // would be noise, and noise is what makes real disclosures unreadable.
+    render(<ModelIndicator provenance={{ ...BASE, keyPool: "shared" }} />);
+
+    expect(screen.queryByText(/your .* key/)).not.toBeInTheDocument();
+  });
+
+  it("stays silent when nothing was spent at all", () => {
+    // A cache hit, or a mid-stream `meta`. There is no pool to name.
+    render(<ModelIndicator provenance={{ ...BASE, keyPool: null }} />);
+
+    expect(screen.queryByText(/your .* key/)).not.toBeInTheDocument();
+  });
+
+  it("is a disclosure on a real answer, not an error", () => {
+    render(<ModelIndicator provenance={{ ...BASE, keyPool: "private" }} />);
+
+    expect(screen.getByText("GPT-OSS 120B")).toBeInTheDocument();
+    expect(screen.queryByText(/was unavailable/)).not.toBeInTheDocument();
+    // The billing consequence is the part worth spelling out, and it is
+    // available without a pointer.
+    expect(screen.getAllByText(/billed to your Groq account/).length).toBeGreaterThan(0);
+  });
+});
+
 describe("provenance adapters", () => {
   const meta: MessageMeta = {
     provider_used: "groq",
@@ -255,6 +289,7 @@ describe("provenance adapters", () => {
     degraded: false,
     extraction_tier: null,
     messages_dropped: 0,
+    key_pool: "shared",
   };
 
   it("builds provenance from a stored message's meta", () => {
@@ -276,6 +311,19 @@ describe("provenance adapters", () => {
     delete withoutCount.messages_dropped;
 
     expect(fromMessageMeta(withoutCount)?.messagesDropped).toBe(0);
+  });
+
+  it("carries the key pool off a stored row", () => {
+    // Unlike `warning`, this one *is* stored: which credential paid for a turn
+    // is a fact about the turn, so a reopened thread still discloses it.
+    expect(fromMessageMeta({ ...meta, key_pool: "private" })?.keyPool).toBe("private");
+  });
+
+  it("reads a pre-Phase-6 row's missing key pool as null, not as shared", () => {
+    const withoutPool: Partial<MessageMeta> = { ...meta };
+    delete withoutPool.key_pool;
+
+    expect(fromMessageMeta(withoutPool)?.keyPool).toBeNull();
   });
 
   it("never reads a pin warning off a stored row", () => {
@@ -313,6 +361,7 @@ describe("provenance adapters", () => {
       substituted: false,
       attempts: 1,
       degraded: false,
+      key_pool: "shared",
       conversation_id: "8b0d1f6e-0000-4000-8000-000000000000",
       message_id: "8b0d1f6e-0000-4000-8000-000000000001",
     };

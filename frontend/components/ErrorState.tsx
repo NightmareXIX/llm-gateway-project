@@ -66,7 +66,9 @@ export function describeError(error: unknown): { title: string; detail: string }
   };
 }
 
-function formatWaitSeconds(seconds: number): string {
+/** Shared with `ProviderKeysSection`, so the two places that turn a wait into
+ *  words round it the same way. */
+export function formatWaitSeconds(seconds: number): string {
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
   return `${Math.ceil(seconds / 60)} min`;
 }

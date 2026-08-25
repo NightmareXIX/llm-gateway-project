@@ -77,6 +77,10 @@ export type ContentBlock = TextBlock | FileRefBlock | OmissionMarkerBlock | Unkn
  * own `ExtractionTier`, and the order here is the order the lane tries them. */
 export type ExtractionTier = "cache" | "native" | "llm" | "local";
 
+/** Which credential paid for a turn (Phase 6, §9.4). `shared` is the gateway's
+ *  own free-tier pool; `private` is a key the user added in Settings. */
+export type KeyPool = "shared" | "private";
+
 export type MessageMeta = {
   provider_used: string | null;
   model_used: string | null;
@@ -97,6 +101,14 @@ export type MessageMeta = {
    * that nothing was dropped.
    */
   messages_dropped: number;
+  /**
+   * Which credential pool served this turn (Phase 6, D42) — `"private"` when
+   * the user's own provider key paid for it, `"shared"` when the gateway's
+   * pool did. Absent on a row written before the field existed, and `null` on
+   * a turn that spent no key at all (a cache hit), exactly as
+   * `extraction_tier` is.
+   */
+  key_pool: KeyPool | null;
 };
 
 export type MessageRole = "system" | "user" | "assistant";
@@ -214,6 +226,9 @@ export type ChatCompletionResponse = {
    *  this turn asked for. A disclosure riding on a 200, never an error — it
    *  must not render as a failure (trap 6). */
   warning?: string | null;
+  /** D42's eighth disclosure field: which pool's credential served this turn.
+   *  `null` on a cache hit — no key was spent, so there is nothing to say. */
+  key_pool?: KeyPool | null;
 
   conversation_id: string;
   message_id: string;
@@ -261,4 +276,51 @@ export type ModelEntry = {
 export type ModelsResponse = {
   object: "list";
   data: ModelEntry[];
+};
+
+// --------------------------------------------------------------------------- //
+// BYOK provider keys — app/schemas/keys.py (Phase 6, §9.2/§9.9)
+// --------------------------------------------------------------------------- //
+/**
+ * A key's last verdict from the provider itself.
+ *
+ * **A snapshot, not a live fact.** `valid` means the provider accepted it the
+ * last time anyone asked — at add time, at the user's own re-check, or (for
+ * `invalid`) the moment a real request was rejected with it (D40). A key
+ * revoked upstream five minutes ago still reads `valid` here until something
+ * tries to use it.
+ */
+export type ProviderKeyValidationStatus = "valid" | "invalid" | "unverified";
+
+/** A stored BYOK credential, as safe to display as it will ever be: the
+ *  plaintext is not recoverable from this shape or from any endpoint. */
+export type ProviderKeyOut = {
+  provider: string;
+  /** `"••••a91c"`, built from the last four characters kept at add time. */
+  masked: string;
+  nickname: string | null;
+  validation_status: ProviderKeyValidationStatus;
+  last_validated_at: string | null;
+  /** When the resolver last handed this credential to a request (D38). */
+  last_used_at: string | null;
+  is_active: boolean;
+  created_at: string;
+};
+
+/**
+ * One settings row — returned for *every* enabled provider, with or without a
+ * stored key, so the client never has to know the provider list to draw an
+ * empty "Using shared pool" row.
+ */
+export type ProviderKeyStatus = {
+  provider: string;
+  pool: KeyPool;
+  /** `null` on the shared-pool rows; present and active on the private ones. */
+  key: ProviderKeyOut | null;
+};
+
+export type ProviderKeyCreateRequest = {
+  provider: string;
+  key: string;
+  nickname?: string | null;
 };
