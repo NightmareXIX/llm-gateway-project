@@ -1,9 +1,11 @@
 "use client";
 
+import { cn } from "@/lib/cn";
 import { formatBytes } from "@/lib/files";
 import type { PendingTurn as PendingTurnState } from "@/lib/hooks";
 import { modelLabel } from "@/lib/models";
 import { restartReason } from "@/lib/provenance";
+import { Markdown } from "./Markdown";
 import { ModelIndicator } from "./ModelIndicator";
 import { FileIcon } from "./ui/FileIcon";
 
@@ -79,17 +81,21 @@ export function PendingTurn({ pending }: { pending: PendingTurnState }) {
             </p>
           )}
 
-          <div className="prose-answer text-[0.9375rem] text-ink">
-            <p>
-              {pending.answer}
-              {pending.status === "streaming" && (
-                <span
-                  aria-hidden
-                  className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[0.15em] bg-accent [animation:thinking-pulse_1.1s_ease-in-out_infinite]"
-                />
-              )}
-            </p>
-          </div>
+          {/* Rendered as markdown while it streams, exactly as the stored row
+              will be a moment later, so the finished answer does not visibly
+              reflow when the optimistic turn is replaced. Half-written syntax
+              is the price: a fence is a fence only once its closing ``` has
+              arrived, so a code block appears as plain text for as long as the
+              model is inside it. The caret is attached in CSS (`is-streaming`)
+              rather than as an element here, because the last block might be a
+              list item or a table cell rather than a paragraph. */}
+          <Markdown
+            text={pending.answer}
+            className={cn(
+              "text-[0.9375rem] text-ink",
+              pending.status === "streaming" && "is-streaming",
+            )}
+          />
 
           {pending.provenance && (
             <ModelIndicator provenance={pending.provenance} className="mt-2.5" />

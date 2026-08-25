@@ -5,6 +5,7 @@ import { describeTier, formatBytes } from "@/lib/files";
 import { absoluteTime } from "@/lib/format";
 import { fromMessage } from "@/lib/provenance";
 import type { ContentBlock, ExtractionTier, Message } from "@/lib/types";
+import { Markdown } from "./Markdown";
 import { ModelIndicator } from "./ModelIndicator";
 import { FileIcon } from "./ui/FileIcon";
 
@@ -66,7 +67,7 @@ function AssistantTurn({ message }: { message: Message }) {
 
   return (
     <article className="max-w-[46rem]" aria-label="Model response">
-      <Blocks blocks={message.content} className="prose-answer text-[0.9375rem] text-ink" />
+      <Blocks blocks={message.content} markdown className="text-[0.9375rem] text-ink" />
       {/* Always rendered when the row carries provenance — this is the D1/D2
           disclosure, not an optional detail. */}
       {provenance && <ModelIndicator provenance={provenance} className="mt-2.5" />}
@@ -88,6 +89,10 @@ function SystemTurn({ message }: { message: Message }) {
 /**
  * Canonical content blocks → DOM.
  *
+ * `markdown` is set for assistant turns and nothing else: what the model wrote
+ * is markdown and has to be rendered as such, while the user's own text is
+ * literal.
+ *
  * The unknown-block fallback is deliberate. `tool_call`, `tool_result` and
  * `summary` are reserved types a later phase will start writing, and a
  * transcript that throws on one would turn a forward-compatible schema into a
@@ -97,17 +102,24 @@ function Blocks({
   blocks,
   className,
   reading,
+  markdown = false,
 }: {
   blocks: ContentBlock[];
   className?: string;
   reading?: AttachmentReading;
+  markdown?: boolean;
 }) {
   return (
     <div className={className}>
       {blocks.map((block, index) => {
         switch (block.type) {
-          case "text":
-            return <p key={index}>{String((block as { text?: unknown }).text ?? "")}</p>;
+          case "text": {
+            const text = String((block as { text?: unknown }).text ?? "");
+            // Only a model answer is markdown. A user who typed `**hi**` meant
+            // the asterisks, and rendering their own text as markdown would
+            // silently rewrite what they said back at them.
+            return markdown ? <Markdown key={index} text={text} /> : <p key={index}>{text}</p>;
+          }
 
           case "omission_marker": {
             const count = Number((block as { omitted_count?: unknown }).omitted_count ?? 0);
