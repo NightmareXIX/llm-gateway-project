@@ -92,18 +92,20 @@ export function ConversationSidebar({ onNavigate }: { onNavigate?: () => void })
       <div className="px-3 pb-3">
         {/* Left-aligned, icon boxed at a fixed size: a centred icon+label pair
             shifts horizontally with the label's width, which is what made this
-            button read as unsettled next to a column of left-aligned rows. */}
+            button read as unsettled next to a column of left-aligned rows.
+            `whitespace-nowrap` because the sidebar is a drawer at narrow
+            widths, and a label that wraps under its own icon breaks the
+            fixed-height control it sits in. */}
         <Button
           variant="primary"
-          className="w-full justify-start gap-2.5 px-3"
+          shape="card"
+          className="w-full justify-start gap-2.5 whitespace-nowrap px-3"
           onClick={() => {
             router.push("/chat");
             onNavigate?.();
           }}
         >
-          <svg viewBox="0 0 24 24" fill="none" className="size-4 shrink-0" aria-hidden>
-            <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-          </svg>
+          <NewConversationIcon className="size-[1.125rem] shrink-0" />
           New conversation
         </Button>
       </div>
@@ -267,6 +269,36 @@ function SidebarSkeleton() {
         <Skeleton key={row} className="h-9 w-full" />
       ))}
     </div>
+  );
+}
+
+/**
+ * The new-conversation mark: a speech bubble with a plus badge.
+ *
+ * A bare `+` said "add something" without saying what — next to a column of
+ * threads it could as easily have been "add a folder". The bubble names the
+ * noun, and the badge keeps the verb.
+ *
+ * The bubble's outline stops short of the badge on both sides rather than
+ * running behind it. At 18px an unbroken stroke crossing the circle reads as a
+ * smudge, and the gap is what keeps the two shapes legible as two shapes.
+ * `aria-hidden` throughout: the button's own text is the accessible name, and
+ * a second one here would have a screen reader announce the control twice.
+ */
+function NewConversationIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+      <g
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M12.7 4.3H5.05A2.3 2.3 0 0 0 2.75 6.6v6.35a2.3 2.3 0 0 0 2.3 2.3h1.2v4.6l4.6-4.6h5.35a2.3 2.3 0 0 0 2.3-2.3v-1.6" />
+        <circle cx="18.5" cy="5.9" r="4.15" />
+        <path d="M18.5 3.9v4M16.5 5.9h4" />
+      </g>
+    </svg>
   );
 }
 
