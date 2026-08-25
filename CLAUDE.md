@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–8 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–9 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -445,6 +445,57 @@ Both existing leak-adjacent surfaces named in the step's plan were checked and n
 `_serializable_errors` already drops pydantic's `input` field, and `AttemptRecord.to_json` never
 carried a key field to begin with. `make test` (1333 passed, 1 skipped), `ruff check`, `ruff format
 --check`, and `mypy` are all green.
+
+Step 9 (`/v1/models` personalization, D41) touches the files `phase6.md` names —
+`app/config.py`, `config/providers.yaml`, `config/limits.yaml`, `app/providers/registry.py`,
+`app/api/v1/models.py`, `app/api/v1/chat.py` — plus two it doesn't, `app/routing/selection.py` and
+`app/keys_resolution/resolver.py`, for the same reason earlier steps sometimes needed one or two extra
+files beyond their own list. `list_models` drops its `PrincipalDep` parameter and the `SYSTEM_SCOPE`
+constant in favor of `CredentialsDep` (imported straight from `api/v1/chat.py` — no cycle, since
+`chat.py` never imports `models.py`), resolved per candidate through a `resolved_for`/`status_for` pair
+of memoized closures; the status cache key becomes `(provider, model, scope)` rather than
+`(provider, model)`, and authentication stays enforced through `CredentialsDep`'s own dependency chain
+even though the endpoint no longer names the principal directly. `Slot` gains
+`requires_private_key: bool = False` (`config.py`), a second visibility flag beside `internal` but with
+different semantics — client-facing, not hidden by `registry.slots()`, only conditionally visible;
+`ProviderRegistry` gains `requires_private_key(slot) -> bool`, backed by a `private_key_only_slots`
+frozenset `build_registry` computes exactly the way it already computes `internal_slots`. A new shared
+helper, `keys_resolution/resolver.py::resolves_private_for_every_provider(candidates, credentials)`,
+walks a slot's distinct providers and confirms `pool == "private"` for every one — used by `list_models`
+to decide whether to list the slot at all, and by `chat.py::_validate_slot` (now `async`, taking
+`credentials`) to refuse a named request for it with the exact same 400 `unknown_slot` shape `internal`
+already gets, rather than a second refusal shape. `routing/selection.py`'s `_fleet` — the `auto` chain
+builder, shared by `/v1/models`'s `auto` entry and by `router.route`/`route_stream` — now skips any slot
+`registry.requires_private_key` flags, for every caller including the key holder, so `auto` stays
+reproducible and its cache entries stay shareable; requesting the slot *by name* still leads with its
+own candidate and still spills into the rest of the (now private-slot-free) fleet on failover, D10's
+spill rule unchanged. `config/providers.yaml` gains a real `pro` slot — one Gemini Pro candidate
+(`gemini-3.6-pro`), `requires_private_key: true`, commented with why the shared key genuinely cannot
+reach it — and `config/limits.yaml` gains the matching paid-tier limits block. Implementing this
+surfaced a test whose assertion was coincidentally, not fundamentally, correct:
+`tests/unit/test_config.py::test_gemini_candidates_reserve_half_their_budget_for_perception` had
+asserted every Gemini candidate anywhere in `providers.yaml` reserves exactly 0.5, which was only ever
+true because every prior Gemini candidate happened to also be one `perception` declares; `pro`'s new
+Gemini candidate is deliberately the exception (`perception` never declares `gemini-3.6-pro`, so nothing
+reserves a share of its budget for a lane that never spends against it), and the test now checks
+`reserved_fraction` against the actual set of models `perception` declares rather than against every
+Gemini candidate in the table — D8's real invariant, not the one that happened to hold before this slot
+existed. New tests: `test_config.py` (`requires_private_key` defaults false and can be set,
+`enabled_slots()` includes `pro`, the rewritten reserved-fraction test); `test_provider_registry.py`
+(the method itself, a private-key-only slot routable and client-facing unlike `internal`, the checked-in
+`pro` slot requiring a private key, updated committed-config slot counts); `test_selection.py` (`auto`
+never includes `pro`'s candidate for anyone, key holder included; naming it still spills into the rest
+of the fleet); `test_key_resolver.py` (`resolves_private_for_every_provider`: a key holder resolves
+private, someone with no key doesn't, the general multi-provider case, `SystemCredentials` never
+resolves private); `test_models_endpoint.py` (a keyless user never sees `pro`; two accounts, one
+`/v1/models` call each, only the Gemini key holder sees `pro` and neither account's `auto` entry ever
+offers it; a key holder's `general` status reflects their own counters, not the shared pool's);
+`test_chat_endpoint.py` (`"model": "pro"` answers for the key holder — `served_by` names
+`gemini-3.6-pro`, `key_pool: "private"`, the private key on the wire — and 400s `unknown_slot` for
+everyone else; `auto` never selects `pro` even for the key holder). `make test` (1347 passed, 1
+skipped), `ruff check`, `ruff format --check`, and `mypy` are all green; two accounts hitting
+`/v1/models` in the same test get different, correct answers, per the step's own "done when." No
+frontend change — Step 10.
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

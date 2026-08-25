@@ -26,11 +26,12 @@ from typing import Final
 
 from fastapi import APIRouter
 
-from app.auth.dependency import PrincipalDep
+from app.api.v1.chat import CredentialsDep
 from app.cache import keys
 from app.config import get_providers_config
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.deps import BreakerDep, QuotaDep, RegistryDep
+from app.keys_resolution.resolver import ResolvedKey, resolves_private_for_every_provider
 from app.providers.types import ModelSpec
 from app.quota.tracker import QuotaTracker
 from app.routing import selection
@@ -63,37 +64,44 @@ _STATUS_RANK: Final[dict[SlotStatus, int]] = {
 
 @router.get("/models", response_model=ModelsResponse)
 async def list_models(
-    principal: PrincipalDep,
     registry: RegistryDep,
     breaker: BreakerDep,
     quota: QuotaDep,
+    credentials: CredentialsDep,
 ) -> ModelsResponse:
     """Every routable slot, ``auto`` included, with live per-candidate status.
 
-    Authenticated (``PrincipalDep``) even though the response does not yet vary
-    by caller: Phase 6 personalizes it per user (§9.7), and an endpoint that
-    starts anonymous and becomes authenticated later is a breaking change on a
-    phase boundary rather than an additive one.
+    Authenticated via ``CredentialsDep``, whose own dependency chain requires
+    the principal (``_get_credentials`` in ``api/v1/chat.py``) — a request
+    with no session gets the same 401 it always did, even though this
+    function no longer names ``PrincipalDep`` directly. Personalized per
+    caller since Phase 6 Step 9 (§9.7, D41): each candidate's status is
+    resolved under *that caller's* real scope, and a slot the shared pool
+    cannot serve is listed only for someone who can actually reach it.
     """
-    del principal  # Not yet read — Phase 6 threads it into `scope` below.
-
     providers_config = get_providers_config()
-    scope = keys.SYSTEM_SCOPE
-    # Phase 6 replaces the constant above with `resolve_provider_key(user_id,
-    # provider)`'s scope, per candidate — the same seam `registry.system_key`
-    # and `router.route`'s `scope` parameter already carry.
 
-    cache: dict[tuple[str, str], CandidateStatus] = {}
+    resolved_cache: dict[tuple[str, str], ResolvedKey] = {}
+    status_cache: dict[tuple[str, str, str], CandidateStatus] = {}
+
+    async def resolved_for(spec: ModelSpec) -> ResolvedKey:
+        # Memoized because the same (provider, model) pair can appear in more
+        # than one slot's chain and always appears again in `auto`'s fleet.
+        # `UserCredentials.for_provider` already memoizes its own database
+        # round trip per provider (D38); this cache is what keeps a repeat
+        # call from even reaching that lookup.
+        if spec.key not in resolved_cache:
+            resolved_cache[spec.key] = await credentials.for_provider(spec.provider, spec.model)
+        return resolved_cache[spec.key]
 
     async def status_for(spec: ModelSpec) -> CandidateStatus:
-        # Memoized because the same (provider, model) pair can appear in more
-        # than one slot's chain and always appears again in `auto`'s fleet —
-        # one Redis round trip per candidate, not one per appearance.
-        if spec.key not in cache:
-            cache[spec.key] = await _candidate_status(
-                spec, breaker=breaker, quota=quota, scope=scope, clock=SYSTEM_CLOCK
+        resolved = await resolved_for(spec)
+        cache_key = (*spec.key, resolved.scope)
+        if cache_key not in status_cache:
+            status_cache[cache_key] = await _candidate_status(
+                spec, breaker=breaker, quota=quota, scope=resolved.scope, clock=SYSTEM_CLOCK
             )
-        return cache[spec.key]
+        return status_cache[cache_key]
 
     entries: list[ModelEntry] = []
 
@@ -114,6 +122,14 @@ async def list_models(
 
     for slot_name in registry.slots():
         specs = registry.candidates(slot_name)
+        if registry.requires_private_key(slot_name):
+            reachable = await resolves_private_for_every_provider(specs, credentials)
+            if not reachable:
+                # D41: a slot the caller cannot actually reach is not a slot
+                # they should be told about — the same treatment `internal`
+                # gets, one layer later because this one *is* routable for
+                # someone.
+                continue
         statuses = tuple([await status_for(spec) for spec in specs])
         status, resets_at = _summarize(statuses)
         entries.append(

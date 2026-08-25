@@ -29,8 +29,10 @@ from app.keys_resolution.resolver import (
     SystemCredentials,
     UserCredentials,
     quota_scope_for,
+    resolves_private_for_every_provider,
 )
 from app.providers.registry import ProviderRegistry
+from app.providers.types import ModelSpec
 
 pytestmark = pytest.mark.integration
 
@@ -491,3 +493,93 @@ def test_quota_scope_for_the_shared_pool_and_for_no_pool_is_system() -> None:
     user_id = UUID("11111111-1111-1111-1111-111111111111")
     assert quota_scope_for("shared", user_id) == keys.SYSTEM_SCOPE
     assert quota_scope_for(None, user_id) == keys.SYSTEM_SCOPE
+
+
+# --------------------------------------------------------------------------- #
+# D41 — whether a caller can reach a `requires_private_key` slot
+# --------------------------------------------------------------------------- #
+def _spec(provider: str, model: str) -> ModelSpec:
+    return ModelSpec(
+        slot="pro",
+        provider=provider,
+        model=model,
+        context_window=1_000_000,
+        max_output_tokens=8192,
+        supports_streaming=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_system_field=True,
+        max_file_bytes=None,
+        priority=0,
+    )
+
+
+async def test_a_key_holder_resolves_private_for_every_provider(
+    db_session: AsyncSession,
+    session_factory: tuple[SessionFactory, list[int]],
+    user_factory: Callable[..., Any],
+) -> None:
+    user = await user_factory()
+    await _add_key(
+        db_session, user_id=user.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+    factory, _ = session_factory
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = UserCredentials(user.id, registry, factory)
+
+    reachable = await resolves_private_for_every_provider(
+        (_spec("gemini", "gemini-3.6-pro"),), credentials
+    )
+
+    assert reachable is True
+
+
+async def test_someone_with_no_key_does_not_resolve_private(
+    db_session: AsyncSession,
+    session_factory: tuple[SessionFactory, list[int]],
+    user_factory: Callable[..., Any],
+) -> None:
+    user = await user_factory()
+    factory, _ = session_factory
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = UserCredentials(user.id, registry, factory)
+
+    reachable = await resolves_private_for_every_provider(
+        (_spec("gemini", "gemini-3.6-pro"),), credentials
+    )
+
+    assert reachable is False
+
+
+async def test_a_multi_provider_private_slot_needs_every_provider_covered(
+    db_session: AsyncSession,
+    session_factory: tuple[SessionFactory, list[int]],
+    user_factory: Callable[..., Any],
+) -> None:
+    """The general case the docstring insists on checking even though today's
+    ``pro`` slot only names one provider: a key for *one* of two providers a
+    hypothetical private slot spans is not enough."""
+    user = await user_factory()
+    await _add_key(
+        db_session, user_id=user.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+    factory, _ = session_factory
+    registry = _registry(gemini="shared-gemini-key", groq="shared-groq-key")
+    credentials = UserCredentials(user.id, registry, factory)
+
+    reachable = await resolves_private_for_every_provider(
+        (_spec("gemini", "gemini-3.6-pro"), _spec("groq", "openai/gpt-oss-120b")), credentials
+    )
+
+    assert reachable is False
+
+
+async def test_system_credentials_never_resolves_private() -> None:
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = SystemCredentials(registry)
+
+    reachable = await resolves_private_for_every_provider(
+        (_spec("gemini", "gemini-3.6-pro"),), credentials
+    )
+
+    assert reachable is False

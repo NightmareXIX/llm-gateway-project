@@ -50,6 +50,7 @@ than by caller discipline.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 from uuid import UUID
@@ -65,6 +66,7 @@ from app.db.models import ProviderKey
 from app.db.repo import allocations as allocations_repo
 from app.db.repo import provider_keys as provider_keys_repo
 from app.providers.registry import ProviderRegistry
+from app.providers.types import ModelSpec
 
 logger = get_logger("app.keys_resolution.resolver")
 
@@ -320,6 +322,33 @@ class UserCredentials:
                 for allocation in allocations
             }
             self._loaded = True
+
+
+async def resolves_private_for_every_provider(
+    candidates: Sequence[ModelSpec], credentials: ProviderCredentials
+) -> bool:
+    """D41/§9.7: whether ``credentials`` answers ``pool == "private"`` for
+    every distinct provider a ``requires_private_key`` slot's candidate chain
+    touches — the gate ``GET /v1/models`` (hide the slot) and
+    ``api/v1/chat.py::_validate_slot`` (refuse a named request) both apply.
+
+    In practice a private-key-only slot names one provider (the shared key
+    genuinely cannot reach it), but this walks the general case rather than
+    assuming one — a two-provider private slot is a config edit away, and a
+    check that assumed one candidate would be a trap the day that changes.
+    Distinct providers only: two candidates on the same provider would
+    otherwise cost a second, redundant resolution for an answer
+    :class:`UserCredentials` already memoized on the first.
+    """
+    seen: set[str] = set()
+    for spec in candidates:
+        if spec.provider in seen:
+            continue
+        seen.add(spec.provider)
+        resolved = await credentials.for_provider(spec.provider, spec.model)
+        if resolved.pool != "private":
+            return False
+    return True
 
 
 def quota_scope_for(pool: Literal["shared", "private"] | None, user_id: UUID) -> keys.Scope:

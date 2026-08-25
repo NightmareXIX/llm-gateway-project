@@ -580,6 +580,42 @@ def test_a_slot_can_declare_itself_internal(tmp_path: Path) -> None:
     assert "perception" in config.enabled_slots()
 
 
+def test_slot_requires_private_key_defaults_false(tmp_path: Path) -> None:
+    """Phase 6 Step 9's ``pro`` slot is the first to set this true; every slot
+    written before it must keep behaving as shared-pool-reachable."""
+    config = _load_yaml_model(ProvidersConfig, _write(tmp_path, _providers_document()))
+
+    assert config.slots["general"].requires_private_key is False
+
+
+def test_a_slot_can_require_a_private_key(tmp_path: Path) -> None:
+    """D41: unlike ``internal``, a ``requires_private_key`` slot is still
+    client-facing — it is ``enabled_slots()``'s business whether a provider is
+    live, not whether the caller can reach it, which is a registry/resolver
+    concern (Phase 6 Step 9)."""
+    document = _providers_document()
+    document["slots"]["pro"] = {
+        "description": "Requires your own key.",
+        "requires_private_key": True,
+        "candidates": [
+            {
+                "provider": "gemini",
+                "model": "gemini-pro",
+                "context_tokens": 2097152,
+                "max_output_tokens": 8192,
+                "capabilities": ["text", "vision", "pdf"],
+            }
+        ],
+    }
+    document["providers"]["gemini"]["enabled"] = True
+
+    config = _load_yaml_model(ProvidersConfig, _write(tmp_path, document))
+
+    assert config.slots["pro"].requires_private_key is True
+    assert config.slots["general"].requires_private_key is False
+    assert "pro" in config.enabled_slots()
+
+
 # --------------------------------------------------------------------------- #
 # config/limits.yaml
 # --------------------------------------------------------------------------- #
@@ -757,7 +793,7 @@ def test_the_committed_table_declares_three_providers_all_enabled() -> None:
     assert config.providers["gemini"].enabled is True
     assert config.providers["openrouter"].enabled is True
 
-    assert set(config.enabled_slots()) == {"general", "fast", "perception"}
+    assert set(config.enabled_slots()) == {"general", "fast", "pro", "perception"}
 
 
 def test_the_committed_perception_slot_is_internal_and_matches_the_answer_slots(
@@ -812,10 +848,15 @@ def test_every_routable_candidate_has_a_limits_entry() -> None:
 
 
 def test_gemini_candidates_reserve_half_their_budget_for_perception() -> None:
-    """D8/trap 15: ``reserved_fraction`` must halve the *answer* lane, and it is
-    only Gemini that declares it non-zero — the two vision-capable candidates in
-    ``config/providers.yaml``, and nothing else in the table."""
+    """D8/trap 15: ``reserved_fraction`` must halve the *answer* lane for every
+    Gemini model the ``perception`` slot also declares — ``general``'s and
+    ``fast``'s two vision-capable candidates. Phase 6 Step 9's ``pro`` slot
+    is deliberately the exception: it names a third Gemini model
+    ``perception`` never reads, so nothing reserves a share of its budget for
+    a lane it never spends against (D8 only splits a model both an answering
+    slot and ``perception`` declare)."""
     config = get_providers_config()
+    perception_models = {c.model for c in config.slots["perception"].candidates}
 
     reserved = {
         (slot_name, candidate.provider, candidate.model): candidate.reserved_fraction
@@ -823,8 +864,8 @@ def test_gemini_candidates_reserve_half_their_budget_for_perception() -> None:
         for candidate in slot.candidates
     }
 
-    for (_, provider, _), fraction in reserved.items():
-        if provider == "gemini":
+    for (_, provider, model), fraction in reserved.items():
+        if provider == "gemini" and model in perception_models:
             assert fraction == 0.5
         else:
             assert fraction == 0.0

@@ -157,11 +157,21 @@ def candidates(
 
 
 def _fleet(registry: ProviderRegistry) -> list[ModelSpec]:
-    """Every routable candidate, once, in config order — the ``auto`` chain."""
+    """Every routable candidate, once, in config order — the ``auto`` chain.
+
+    D41 (Phase 6 Step 9): a slot ``registry.requires_private_key`` is never
+    flattened in here, for *every* caller, key holder included — ``auto``'s
+    whole promise is "the gateway picks", and silently routing to a model
+    only one user can reach makes their ``auto`` unreproducible and their
+    cache entries unshareable. Requesting such a slot *by name* still works;
+    only its presence in the undifferentiated fleet is refused.
+    """
     flattened: list[ModelSpec] = []
     seen: set[tuple[str, str]] = set()
 
     for slot in registry.slots():
+        if registry.requires_private_key(slot):
+            continue
         for spec in registry.candidates(slot):
             if spec.key in seen:
                 continue

@@ -62,7 +62,11 @@ from app.deps import (
     get_credentials,
     get_resolver,
 )
-from app.keys_resolution.resolver import ProviderCredentials, quota_scope_for
+from app.keys_resolution.resolver import (
+    ProviderCredentials,
+    quota_scope_for,
+    resolves_private_for_every_provider,
+)
 from app.memory.canonical import (
     CanonicalMessage,
     ContentBlock,
@@ -184,7 +188,7 @@ async def create_chat_completion(
     # the name came off a request body and is therefore a 400. Before the
     # conversation is touched, so a typo'd slot does not open a thread it will
     # never answer.
-    _validate_slot(registry, body.model)
+    await _validate_slot(registry, body.model, credentials)
 
     conversation = await _resolve_conversation(session, principal=principal, body=body)
     conversation_id = conversation.id
@@ -760,7 +764,9 @@ async def _resolve_file_refs(
     return by_hash
 
 
-def _validate_slot(registry: ProviderRegistry, requested: str) -> None:
+async def _validate_slot(
+    registry: ProviderRegistry, requested: str, credentials: ProviderCredentials
+) -> None:
     """Reject a slot name the table does not carry, before anything else happens.
 
     ``UnknownSlot`` is translated here rather than in ``selection.py`` because
@@ -779,11 +785,18 @@ def _validate_slot(registry: ProviderRegistry, requested: str) -> None:
     it exists for the perception lane to call on itself, never for a client to
     ask for, and a routable-but-forbidden slot is exactly as much a client
     mistake as a typo.
+
+    A ``requires_private_key`` slot (Phase 6 Step 9, D41 — ``pro``) is also
+    routable, and gets the same 400 too, but only for a caller whose
+    credentials do not resolve ``"private"`` for every provider in its
+    candidate chain — reusing the unknown-slot shape rather than inventing a
+    second refusal, because a slot you cannot be served is not a slot you
+    should be told about, the same reasoning ``internal`` already carries.
     """
     if requested == selection.AUTO:
         return
     try:
-        registry.candidates(requested)
+        candidates = registry.candidates(requested)
     except UnknownSlot as exc:
         raise InvalidRequest(
             f"Unknown model slot {requested!r}.",
@@ -796,6 +809,14 @@ def _validate_slot(registry: ProviderRegistry, requested: str) -> None:
             code="unknown_slot",
             details={"available": [selection.AUTO, *registry.slots()]},
         )
+    if registry.requires_private_key(requested):
+        reachable = await resolves_private_for_every_provider(candidates, credentials)
+        if not reachable:
+            raise InvalidRequest(
+                f"Unknown model slot {requested!r}.",
+                code="unknown_slot",
+                details={"available": [selection.AUTO, *registry.slots()]},
+            )
 
 
 def _is_substitution(requested_slot: str, served_slot: str) -> bool:

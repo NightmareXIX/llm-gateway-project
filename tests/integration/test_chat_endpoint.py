@@ -2210,3 +2210,81 @@ async def test_a_users_personal_cap_on_the_shared_pool_blocks_only_that_user(
     # gateway's own bookkeeping, not a real second call that also happened to
     # 429.
     assert handler.calls == 2
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 9 — the `pro` slot (D41, §9.7)
+# --------------------------------------------------------------------------- #
+async def test_naming_pro_answers_for_the_key_holder_and_400s_for_everyone_else(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    db_session: AsyncSession,
+    user_factory: Callable[..., Any],
+    app: FastAPI,
+) -> None:
+    """D41's own demo: the shared pool genuinely cannot reach `pro`, so a
+    holder of their own Gemini key answers and everyone else gets the same
+    400 an unknown slot gets — never a structured refusal naming the slot as
+    theirs to unlock."""
+    holder = await user_factory()
+    other = await user_factory()
+    await _add_private_key(
+        db_session, user_id=holder.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("gemini", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream)
+    try:
+        holder_response = await client.post(
+            COMPLETIONS,
+            json={"model": "pro", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_headers(make_jwt, sub=holder.id, email=holder.email),
+        )
+        other_response = await client.post(
+            COMPLETIONS,
+            json={"model": "pro", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_headers(make_jwt, sub=other.id, email=other.email),
+        )
+    finally:
+        await upstream.aclose()
+
+    assert holder_response.status_code == 200
+    assert holder_response.json()["served_by"]["model"] == "gemini-3.6-pro"
+    assert holder_response.json()["key_pool"] == "private"
+    assert handler.last.headers["x-goog-api-key"] == "user-owned-gemini-key"
+
+    assert other_response.status_code == 400
+    assert other_response.json()["error"]["code"] == "unknown_slot"
+
+
+async def test_auto_never_selects_the_pro_candidate_even_for_the_key_holder(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    db_session: AsyncSession,
+    user_factory: Callable[..., Any],
+    app: FastAPI,
+) -> None:
+    """D41: `auto`'s promise is "the gateway picks", and silently routing to a
+    model only one caller can reach would make their `auto` unreproducible
+    and their cache entries unshareable — so `pro` stays out of the fleet
+    even for the one caller who could actually be served by it."""
+    holder = await user_factory()
+    await _add_private_key(
+        db_session, user_id=holder.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream)
+    try:
+        response = await client.post(
+            COMPLETIONS,
+            json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_headers(make_jwt, sub=holder.id, email=holder.email),
+        )
+    finally:
+        await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["served_by"]["model"] != "gemini-3.6-pro"

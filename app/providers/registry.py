@@ -192,11 +192,13 @@ class ProviderRegistry:
         adapters: dict[str, ProviderAdapter],
         keys: dict[str, SecretStr],
         internal_slots: frozenset[str] = frozenset(),
+        private_key_only_slots: frozenset[str] = frozenset(),
     ) -> None:
         self._specs = specs
         self._adapters = adapters
         self._keys = keys
         self._internal_slots = internal_slots
+        self._private_key_only_slots = private_key_only_slots
 
     def slots(self) -> tuple[str, ...]:
         """Every routable, client-facing slot name, in config order.
@@ -217,6 +219,20 @@ class ProviderRegistry:
         resolve the slot by name.
         """
         return slot in self._internal_slots
+
+    def requires_private_key(self, slot: str) -> bool:
+        """D41 (§9.7): whether ``slot`` is a slot the shared pool cannot serve.
+
+        Unlike :meth:`is_internal`, such a slot *is* client-facing —
+        ``slots()`` still lists it. ``api/v1/models.py`` uses this to hide it
+        from a caller who does not hold a private key for every provider in
+        its candidate chain, ``api/v1/chat.py::_validate_slot`` uses it to
+        refuse an explicit request the same way, and ``routing/selection.py``'s
+        ``_fleet`` uses it to keep the slot's candidates out of ``auto``
+        entirely — for every caller, key holder included, so that ``auto``
+        stays reproducible and its cache entries stay shareable.
+        """
+        return slot in self._private_key_only_slots
 
     def candidates(self, slot: str) -> tuple[ModelSpec, ...]:
         """The slot's candidates in failover order. Phase 2's router walks this."""
@@ -302,9 +318,16 @@ def build_registry(
     internal_slots = frozenset(
         name for name, slot in config.slots.items() if slot.internal and name in specs
     )
+    private_key_only_slots = frozenset(
+        name for name, slot in config.slots.items() if slot.requires_private_key and name in specs
+    )
 
     registry = ProviderRegistry(
-        specs=specs, adapters=adapters, keys=keys, internal_slots=internal_slots
+        specs=specs,
+        adapters=adapters,
+        keys=keys,
+        internal_slots=internal_slots,
+        private_key_only_slots=private_key_only_slots,
     )
     logger.info(
         "providers.registry_built",

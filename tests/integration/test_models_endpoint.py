@@ -10,15 +10,19 @@ matter what the endpoint reports.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fakeredis.aioredis import FakeRedis
 from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import keys
 from app.core.clock import FixedClock
+from app.core.crypto import encrypt_provider_key
+from app.db.repo import provider_keys as provider_keys_repo
 from app.providers.errors import RateLimited
 from app.providers.registry import build_registry
 from app.routing.circuit_breaker import CircuitBreaker
@@ -246,3 +250,115 @@ async def test_a_dead_redis_reports_unknown_rather_than_available(
             assert candidate["status"] == "unknown"
             assert candidate["windows"] == []
         assert entry["status"] == "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 9 — per-caller scope and the `pro` slot (D41, §9.7)
+# --------------------------------------------------------------------------- #
+async def _add_private_key(
+    db_session: AsyncSession, *, user_id: UUID, provider: str, plaintext: str
+) -> None:
+    await provider_keys_repo.upsert(
+        db_session,
+        user_id=user_id,
+        provider=provider,
+        encrypted_key=encrypt_provider_key(plaintext),
+        last_4=plaintext[-4:],
+        nickname=None,
+        validation_status="valid",
+        last_validated_at=None,
+    )
+
+
+async def test_a_user_with_no_keys_never_sees_the_pro_slot(
+    client: Any, make_jwt: TokenFactory, no_upstream: Any
+) -> None:
+    response = await client.get(MODELS, headers=_headers(make_jwt))
+
+    assert response.status_code == 200
+    assert no_upstream.requests == []
+    body = response.json()
+
+    assert "pro" not in [entry["id"] for entry in body["data"]]
+    auto = _entry(body, "auto")
+    assert ("gemini", "gemini-3.6-pro") not in {
+        (c["provider"], c["model"]) for c in auto["candidates"]
+    }
+
+
+async def test_a_gemini_key_holder_sees_the_pro_slot_and_nobody_else_does(
+    client: Any,
+    make_jwt: TokenFactory,
+    no_upstream: Any,
+    db_session: AsyncSession,
+    user_factory: Callable[..., Any],
+) -> None:
+    """D41's own demo: two accounts, one `/v1/models` call each, and a slot
+    that exists for exactly one of them."""
+    holder = await user_factory()
+    other = await user_factory()
+    await _add_private_key(
+        db_session, user_id=holder.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+
+    holder_response = await client.get(
+        MODELS, headers=_headers(make_jwt, sub=holder.id, email=holder.email)
+    )
+    other_response = await client.get(
+        MODELS, headers=_headers(make_jwt, sub=other.id, email=other.email)
+    )
+
+    assert no_upstream.requests == []
+    holder_body = holder_response.json()
+    other_body = other_response.json()
+
+    assert "pro" in [entry["id"] for entry in holder_body["data"]]
+    assert "pro" not in [entry["id"] for entry in other_body["data"]]
+
+    pro = _entry(holder_body, "pro")
+    assert pro["status"] == "available"
+    assert len(pro["candidates"]) == 1
+    assert pro["candidates"][0]["provider"] == "gemini"
+    assert pro["candidates"][0]["model"] == "gemini-3.6-pro"
+
+    # Neither account's `auto` entry ever offers it (D41: reproducibility
+    # outranks the key holder's own reach).
+    for body in (holder_body, other_body):
+        auto = _entry(body, "auto")
+        assert ("gemini", "gemini-3.6-pro") not in {
+            (c["provider"], c["model"]) for c in auto["candidates"]
+        }
+
+
+async def test_a_key_holders_general_status_reflects_their_own_counters(
+    client: Any,
+    make_jwt: TokenFactory,
+    no_upstream: Any,
+    db_session: AsyncSession,
+    redis_client: FakeRedis,
+    user_factory: Callable[..., Any],
+) -> None:
+    """Once scopes diverge, computing every candidate at ``SYSTEM_SCOPE`` is
+    simply wrong: a private key holder's own Gemini counters, not the shared
+    pool's, decide what they see."""
+    holder = await user_factory()
+    await _add_private_key(
+        db_session, user_id=holder.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+    # Exhaust the *shared* pool's rpm window for `general`'s Gemini candidate.
+    shared_key = keys.quota(keys.SYSTEM_SCOPE, "gemini", "gemini-3.6-flash", "rpm")
+    await redis_client.set(shared_key, 999_999, ex=60)
+
+    response = await client.get(
+        MODELS, headers=_headers(make_jwt, sub=holder.id, email=holder.email)
+    )
+
+    assert response.status_code == 200
+    assert no_upstream.requests == []
+    body = response.json()
+
+    general = _entry(body, "general")
+    gemini_candidate = _candidate(general, "gemini")
+    # The holder's own counter is untouched, so their private-scope reading
+    # is `available` even though the shared pool's is spent.
+    assert gemini_candidate["status"] == "available"

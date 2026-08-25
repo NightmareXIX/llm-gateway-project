@@ -132,6 +132,30 @@ slots:
         max_file_bytes: null
         reserved_fraction: 0.0
 
+  # Phase 6 Step 9 (D41, §9.7). The one slot the shared pool genuinely cannot
+  # serve: a paid Gemini Pro model, reachable only by a caller holding their
+  # own Gemini key. `requires_private_key: true` is what makes that real
+  # rather than staged — `registry.requires_private_key` hides this slot from
+  # `GET /v1/models` and refuses it in `api/v1/chat.py::_validate_slot` for
+  # anyone whose resolved credentials are not `"private"` for gemini, and
+  # `routing/selection.py`'s `_fleet` keeps its candidate out of `auto`
+  # entirely — reproducibility, not the shared key's reach, is why.
+  pro:
+    description: Gemini Pro — requires your own Gemini API key; the shared pool cannot reach it.
+    requires_private_key: true
+    candidates:
+      - provider: gemini
+        model: gemini-3.6-pro
+        context_tokens: 2097152
+        max_output_tokens: 65536
+        capabilities: [text, vision, pdf]
+        supports_streaming: true
+        max_file_bytes: 20000000
+        # Never shared with the perception slot below, so nothing reserves a
+        # perception-lane fraction of this model's own budget (D8 only splits
+        # a model both `general`/`fast` and `perception` declare).
+        reserved_fraction: 0.0
+
   # Phase 4 Step 1. The perception lane's own slot (D26) — candidates are the
   # same two Gemini models `general` and `fast` already declare, in the same
   # capability order, so the extraction call is a normal `build_payload` +

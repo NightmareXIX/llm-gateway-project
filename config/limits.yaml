@@ -80,6 +80,22 @@ limits:
         rpd: fixed_daily_pt
         tpm: rolling_60s
 
+    # Phase 6 Step 9 (D41): `pro`'s only candidate — a paid-tier model, never
+    # reachable through the shared key, so these numbers describe a private
+    # key's *own* budget with Google, not anything this gateway's shared pool
+    # ever spends against. Read off AI Studio's paid-tier rate-limit page
+    # (Aug 2026 snapshot), the same source and the same caveat as the two
+    # free-tier Gemini entries above.
+    gemini-3.6-pro:
+      rpm: 60
+      rpd: 1500
+      tpm: 4000000
+      tpd: null
+      reset:
+        rpm: rolling_60s
+        rpd: fixed_daily_pt
+        tpm: rolling_60s
+
   # OpenRouter publishes one limit for *all* `:free` models together — it is an
   # account-level allowance, not a per-model one, so these two blocks are the same
   # numbers describing a single shared budget. Phase 3's tracker will over-count here

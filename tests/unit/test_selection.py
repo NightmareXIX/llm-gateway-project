@@ -163,6 +163,27 @@ def test_the_real_config_produces_a_chain(registry: ProviderRegistry) -> None:
     assert chain[0] == registry.primary(registry.slots()[0])
 
 
+def test_auto_never_includes_a_private_key_only_slots_candidates() -> None:
+    """D41: ``auto``'s promise is "the gateway picks" — silently routing to a
+    model only one caller can reach makes their ``auto`` unreproducible and
+    their cache entries unshareable. ``_fleet`` skips the slot for every
+    caller, key holder included — but requesting it *by name* still leads
+    with its own candidate and spills into the rest of the fleet exactly as
+    D10 always has (the fleet it spills into simply no longer contains a
+    second copy of itself, since ``_fleet`` never carries it at all).
+    """
+    specs: dict[str, tuple[ModelSpec, ...]] = {
+        "general": (spec("general", "groq", "big", 0),),
+        "pro": (spec("pro", "gemini", "flash-pro", 0),),
+    }
+    table = ProviderRegistry(
+        specs=specs, adapters={}, keys={}, private_key_only_slots=frozenset({"pro"})
+    )
+
+    assert names(selection.candidates(table, selection.AUTO)) == ["groq/big"]
+    assert names(selection.candidates(table, "pro")) == ["gemini/flash-pro", "groq/big"]
+
+
 # --------------------------------------------------------------------------- #
 # Named slots, and the spill (D10)
 # --------------------------------------------------------------------------- #

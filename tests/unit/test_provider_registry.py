@@ -143,7 +143,7 @@ def test_the_checked_in_config_produces_the_slots_phase_one_expects() -> None:
     # too, because the perception lane (Phase 4) resolves it by name. Filtering
     # it out of what a client can see is `ProviderRegistry.slots()`'s job, not
     # this function's.
-    assert set(specs) == {"general", "fast", "perception"}
+    assert set(specs) == {"general", "fast", "pro", "perception"}
     assert specs["general"][0].provider == "groq"
     assert specs["general"][0].slot == "general"
 
@@ -352,7 +352,7 @@ def test_the_checked_in_config_builds_a_registry_for_all_three_providers(
     """
     registry = build_registry(client=client, settings=get_settings())
 
-    assert registry.slots() == ("general", "fast")
+    assert registry.slots() == ("general", "fast", "pro")
     assert registry.primary("general").provider == "groq"
 
     assert isinstance(registry.adapter_for("gemini"), GeminiAdapter)
@@ -415,6 +415,65 @@ def test_the_checked_in_config_does_not_expose_perception(client: httpx.AsyncCli
     assert "perception" not in registry.slots()
     assert registry.is_internal("perception") is True
     assert len(registry.candidates("perception")) == 2
+
+
+def test_a_private_key_only_slot_is_routable_and_client_facing(
+    client: httpx.AsyncClient,
+) -> None:
+    """D41: unlike ``perception``, ``pro`` is not hidden from ``slots()`` — a
+    ``requires_private_key`` slot is client-facing, just conditionally so.
+    Filtering it per caller is ``GET /v1/models``/``_validate_slot``'s job,
+    not the registry's."""
+    config = _config(
+        slots={
+            "general": Slot(
+                description="client-facing",
+                candidates=(
+                    SlotCandidate(
+                        provider="groq",
+                        model="llama-3.3-70b-versatile",
+                        context_tokens=131072,
+                        max_output_tokens=32768,
+                    ),
+                ),
+            ),
+            "pro": Slot(
+                description="private-key only",
+                requires_private_key=True,
+                candidates=(
+                    SlotCandidate(
+                        provider="gemini",
+                        model="gemini-flash",
+                        context_tokens=1_000_000,
+                        max_output_tokens=8192,
+                    ),
+                ),
+            ),
+        },
+        providers={
+            "groq": ProviderEntry(
+                enabled=True, base_url="https://api.groq.com/openai/v1", api_key_env="GROQ_API_KEY"
+            ),
+            "gemini": ProviderEntry(
+                enabled=True, base_url="https://example.invalid", api_key_env="GEMINI_API_KEY"
+            ),
+        },
+    )
+    registry = build_registry(client=client, config=config, settings=get_settings())
+
+    assert registry.slots() == ("general", "pro")
+    assert registry.requires_private_key("pro") is True
+    assert registry.requires_private_key("general") is False
+    assert registry.is_internal("pro") is False
+    assert len(registry.candidates("pro")) == 1
+
+
+def test_the_checked_in_pro_slot_requires_a_private_key(client: httpx.AsyncClient) -> None:
+    registry = build_registry(client=client, settings=get_settings())
+
+    assert registry.requires_private_key("pro") is True
+    assert registry.requires_private_key("general") is False
+    assert registry.requires_private_key("fast") is False
 
 
 def test_an_enabled_provider_with_an_empty_key_kills_startup(

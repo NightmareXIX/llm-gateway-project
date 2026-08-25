@@ -362,6 +362,17 @@ class Slot(BaseModel):
     still resolves them, because the perception lane has to be able to call
     one by name."""
 
+    requires_private_key: bool = False
+    """D41 (Phase 6 Step 9): true for a slot the shared pool genuinely cannot
+    serve — ``pro``, on a Gemini Pro model no free-tier key can reach. Unlike
+    ``internal`` above, this slot *is* client-facing: ``registry.slots()``
+    still lists it, and it appears in ``GET /v1/models`` — but only for a
+    caller whose resolved credentials are ``"private"`` for every provider in
+    its candidate chain (``registry.requires_private_key``). Everyone else
+    gets the same 400 an unknown slot gets (``api/v1/chat.py::_validate_slot``),
+    and ``auto`` never selects one of its candidates for anybody, key holder
+    included — see ``routing/selection.py``'s ``_fleet``."""
+
 
 class ProvidersConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
