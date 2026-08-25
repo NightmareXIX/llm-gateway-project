@@ -58,6 +58,7 @@ from app.providers.base import (
     take_hint,
 )
 from app.providers.errors import (
+    AuthFailed,
     ContextTooLong,
     EmptyResponse,
     ProviderError,
@@ -496,6 +497,11 @@ async def route(
                 last_error = exc
                 last_spec = spec
                 last_key_pool = resolved.pool
+                if isinstance(exc, AuthFailed) and resolved.pool == "private":
+                    # D40: a private key that fails is not laundered through
+                    # the shared pool — disclose it, then let the ordinary
+                    # failover below move to the next candidate.
+                    await credentials.record_auth_failure(resolved)
                 trail.append(
                     AttemptRecord(
                         n=len(trail) + 1,
@@ -876,6 +882,9 @@ async def route_stream(
                 last_error = exc
                 last_spec = spec
                 last_key_pool = resolved.pool
+                if isinstance(exc, AuthFailed) and resolved.pool == "private":
+                    # D40, the streaming twin — see `route`'s own comment.
+                    await credentials.record_auth_failure(resolved)
                 trail.append(
                     AttemptRecord(
                         n=len(trail) + 1,

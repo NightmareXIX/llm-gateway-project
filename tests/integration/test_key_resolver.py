@@ -386,6 +386,100 @@ async def test_the_allocations_load_shares_the_provider_keys_query(
 
 
 # --------------------------------------------------------------------------- #
+# D40 — a private key's `AuthFailed` is disclosed, not laundered
+# --------------------------------------------------------------------------- #
+async def test_record_auth_failure_flips_the_row_to_invalid(
+    db_session: AsyncSession,
+    session_factory: tuple[SessionFactory, list[int]],
+    user_factory: Callable[..., Any],
+) -> None:
+    user = await user_factory()
+    await _add_key(
+        db_session, user_id=user.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+    factory, _ = session_factory
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = UserCredentials(user.id, registry, factory)
+    resolved = await credentials.for_provider("gemini", "gemini-3.6-flash")
+
+    await credentials.record_auth_failure(resolved)
+
+    row = await provider_keys_repo.get_active(db_session, user_id=user.id, provider="gemini")
+    assert row is not None
+    assert row.validation_status == "invalid"
+    # Unlike the user-triggered re-check (`record_validation_result`), D40's
+    # fire-and-forget write never touches `last_validated_at` — this is not
+    # the user asking "is my key still good".
+    assert row.last_validated_at is None
+
+
+async def test_system_credentials_record_auth_failure_is_a_no_op() -> None:
+    """The shared pool has no per-user row to flag — this must simply not
+    raise. The router never calls it on a shared resolution, but the method
+    stays safe to call regardless of the guard at the call site."""
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = SystemCredentials(registry)
+    resolved = await credentials.for_provider("gemini", "gemini-3.6-flash")
+
+    await credentials.record_auth_failure(resolved)
+
+
+async def test_record_auth_failure_on_a_shared_resolution_writes_nothing(
+    db_session: AsyncSession,
+    session_factory: tuple[SessionFactory, list[int]],
+    user_factory: Callable[..., Any],
+) -> None:
+    """A `UserCredentials` resolution with no stored row has `key_id=None` —
+    there is no row to flip, and the call is a no-op rather than an error."""
+    user = await user_factory()
+    factory, _ = session_factory
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = UserCredentials(user.id, registry, factory)
+    resolved = await credentials.for_provider("gemini", "gemini-3.6-flash")
+
+    await credentials.record_auth_failure(resolved)
+
+
+async def test_record_auth_failure_swallows_a_write_failure_and_logs(
+    db_session: AsyncSession,
+    session_factory: tuple[SessionFactory, list[int]],
+    user_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fire-and-forget (D40's own wording): a failure writing the disclosure
+    must never surface as an error to the caller that already recovered from
+    the real failure via the next candidate in the chain."""
+    user = await user_factory()
+    await _add_key(
+        db_session, user_id=user.id, provider="gemini", plaintext="user-owned-gemini-key"
+    )
+    factory, _ = session_factory
+    registry = _registry(gemini="shared-gemini-key")
+    credentials = UserCredentials(user.id, registry, factory)
+    resolved = await credentials.for_provider("gemini", "gemini-3.6-flash")
+
+    async def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(provider_keys_repo, "mark_invalid", _boom)
+
+    logged: list[tuple[str, dict[str, Any]]] = []
+
+    class _LogSpy:
+        def error(self, event: str, **kwargs: Any) -> None:
+            logged.append((event, kwargs))
+
+    monkeypatch.setattr(resolver_module, "logger", _LogSpy())
+
+    await credentials.record_auth_failure(resolved)
+
+    assert len(logged) == 1
+    event, fields = logged[0]
+    assert event == "keys_resolution.mark_invalid_failed"
+    assert fields["provider"] == "gemini"
+
+
+# --------------------------------------------------------------------------- #
 # D42 — reconstructing `requests.quota_scope` from a turn's `key_pool`
 # --------------------------------------------------------------------------- #
 def test_quota_scope_for_a_private_pool_is_the_users_own_id() -> None:

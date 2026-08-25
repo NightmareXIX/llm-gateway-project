@@ -1153,11 +1153,18 @@ class ScriptedCredentials:
     def __init__(self, by_provider: dict[str, ResolvedKey]) -> None:
         self._by_provider = by_provider
         self.calls: list[str] = []
+        self.auth_failures: list[ResolvedKey] = []
 
     async def for_provider(self, provider: str, model: str) -> ResolvedKey:
         del model
         self.calls.append(provider)
         return self._by_provider[provider]
+
+    async def record_auth_failure(self, resolved: ResolvedKey) -> None:
+        """D40: records the call rather than writing anywhere — this double
+        has no database, and the write itself is `UserCredentials`'s own
+        suite's to prove."""
+        self.auth_failures.append(resolved)
 
 
 class _MixedProviderScript:
@@ -1300,6 +1307,45 @@ async def test_a_streamed_chain_crossing_two_providers_resolves_credentials_per_
 
     assert handler.requests[0].headers["authorization"] == "Bearer shared-groq-key"
     assert handler.requests[1].headers["x-goog-api-key"] == "private-gemini-key"
+
+
+async def test_a_private_candidates_auth_failure_is_disclosed_to_its_credentials(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    quota_multi: QuotaTracker,
+) -> None:
+    """D40: a private key that fails with ``AuthFailed`` is flagged through
+    its own :class:`~app.keys_resolution.resolver.ProviderCredentials` — found
+    while writing Phase 6 Step 8's leakage test, which needed this write to
+    actually exist to drive it. Groq's own failure here is a shared-pool
+    ``RateLimited`` (failover-eligible, not this decision's business at all);
+    only Gemini's ``AuthFailed``, on the private candidate, must trigger the
+    disclosure — proving the guard reads ``resolved.pool``, not just the
+    error class.
+    """
+    handler = provider_fixtures.ScriptedHandler(
+        provider_fixtures.load(PROVIDER, "rate_limited"),
+        provider_fixtures.load(GEMINI_PROVIDER, "auth_failed"),
+    )
+    registry = build_registry(client=handler.client(), config=TWO_PROVIDER_CONFIG)
+    credentials = _credentials_for()
+
+    with pytest.raises(router.RoutingFailed):
+        await router.route(
+            registry=registry,
+            breaker=breaker,
+            history=history,
+            params=PARAMS,
+            requested="general",
+            quota=quota_multi,
+            credentials=credentials,
+            rng=random.Random(0),
+            sleep=_no_sleep,
+        )
+
+    assert len(credentials.auth_failures) == 1
+    assert credentials.auth_failures[0].provider == GEMINI_PROVIDER
+    assert credentials.auth_failures[0].pool == "private"
 
 
 # --------------------------------------------------------------------------- #

@@ -34,6 +34,17 @@ without a user ever seeing a 500.
 Threaded through the answer lane's two loops (``routing.route``/``route_stream``)
 and ``streaming.stream_completion`` as of Step 5; Step 6 threads it through the
 perception lane the same way.
+
+**D40's other half.** ``for_provider`` answers "which credential"; a private
+credential can still turn out to be *wrong*, discovered only when a real
+``AuthFailed`` comes back. :meth:`ProviderCredentials.record_auth_failure` is
+that answer's sequel — found while writing Phase 6 Step 8's leakage test,
+which drives exactly this scenario and needs a real disclosure write to
+assert against. Both call sites (``routing/router.py``, both loops, and
+``perception/extractors.py``'s tier 2) call it only when
+``resolved.pool == "private"``; :class:`SystemCredentials` never sees a
+private resolution, so its implementation is inert by construction rather
+than by caller discipline.
 """
 
 from __future__ import annotations
@@ -112,6 +123,17 @@ class ProviderCredentials(Protocol):
 
     async def for_provider(self, provider: str, model: str) -> ResolvedKey: ...
 
+    async def record_auth_failure(self, resolved: ResolvedKey) -> None:
+        """D40: a candidate resolved from this object just failed with
+        ``AuthFailed``. A no-op for anything that never hands out a private
+        credential; :class:`UserCredentials` is the one implementation that
+        does something with it. The router calls this only when
+        ``resolved.pool == "private"``, but the method itself takes no
+        position on that — it is cheap to call unconditionally and wrong to
+        assume every caller remembers the guard.
+        """
+        ...
+
 
 class SystemCredentials:
     """The shared-pool-only implementation. Every provider resolves to the
@@ -135,6 +157,11 @@ class SystemCredentials:
             scope=keys.SYSTEM_SCOPE,
             key_id=None,
         )
+
+    async def record_auth_failure(self, resolved: ResolvedKey) -> None:
+        """No-op: the shared pool has no per-user row to flag. D40 applies
+        only to a credential BYOK actually stored."""
+        return None
 
 
 class UserCredentials:
@@ -208,6 +235,33 @@ class UserCredentials:
             shared_daily_cap=None,
             user_id=self._user_id,
         )
+
+    async def record_auth_failure(self, resolved: ResolvedKey) -> None:
+        """D40's disclosure write: flip this row's ``validation_status`` to
+        ``'invalid'`` after a live ``AuthFailed``, so the settings UI can say
+        *This key was rejected — re-add it* instead of silently laundering
+        the traffic through the shared pool.
+
+        Fire-and-forget, in its own session — never the one ``_load_once``
+        opened, which is already closed by the time a candidate can fail —
+        and never blocking the request that discovered it: the failing
+        candidate has already moved on to the next one in the chain (D40's
+        whole point) by the time this matters, and a write that failed here
+        must not turn a successfully-failed-over turn into a 500. Errors are
+        logged with the ``key_id`` alone, never the key.
+        """
+        if resolved.key_id is None:
+            return
+        try:
+            async with self._session_factory() as session:
+                await provider_keys_repo.mark_invalid(session, key_id=resolved.key_id)
+                await session.commit()
+        except Exception:
+            logger.error(
+                "keys_resolution.mark_invalid_failed",
+                key_id=str(resolved.key_id),
+                provider=resolved.provider,
+            )
 
     def _shared(self, provider: str, model: str) -> ResolvedKey:
         return ResolvedKey(

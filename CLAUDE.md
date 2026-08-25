@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–7 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–8 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -407,6 +407,44 @@ the same literal for every call, so two different users authenticated in one tes
 overrides or the second login 409s. `make test` (1326 passed, 1 skipped), `ruff check`, `ruff format --check`,
 and `mypy` are all green; `grep -n "scope=" app/routing/router.py` still shows only `resolved.scope` and
 `_reconcile_hint`'s pass-through, per Step 5's own invariant.
+
+Step 8 (the key never reaches a log) touches `tests/` only, per the step's own scope — plus one genuine
+gap it surfaced and fixed. Writing `tests/integration/test_credential_leakage.py`'s scripted "force an
+`AuthFailed` on the private key so D40's failure path runs" scenario found that D40's disclosure write
+had never actually been wired anywhere: `db/repo/provider_keys.py::mark_invalid` existed since Step 1,
+but nothing between Steps 4–7 ever called it, so a private key's live `AuthFailed` failed over silently
+with no annotation — the exact "hides a broken key indefinitely" failure D40 exists to prevent, latent
+since the resolver was built. Fixed in this commit rather than carried forward, the same way Step 5
+fixed Step 4's session-factory bug: `ProviderCredentials` gains `record_auth_failure(resolved)` —
+`SystemCredentials`'s is a no-op (the shared pool has no per-user row to flag), `UserCredentials`'s
+flips the row's `validation_status` to `'invalid'` in its own session, fire-and-forget, swallowing and
+logging any write failure so a broken disclosure write can never turn an already-recovered request into
+a 500. `routing/router.py` (both loops) and `perception/extractors.py`'s tier 2 each gained one guarded
+call — `if isinstance(exc, AuthFailed) and resolved.pool == "private": await
+credentials.record_auth_failure(resolved)` — right beside the existing `except ProviderError` handling,
+never on `RateLimited` (a spent key is a working key, per D40 itself). `tests/unit/test_router.py`'s
+`ScriptedCredentials` gained a matching method (recording calls rather than writing anywhere) and a new
+test proving the guard reads `resolved.pool`, not just the error class: Groq's own shared-pool
+`RateLimited` never triggers it, only Gemini's private-pool `AuthFailed` does. `test_key_resolver.py`
+gained four `D40` cases: the row really flips (and `last_validated_at` stays untouched, unlike the
+user-triggered `record_validation_result`), `SystemCredentials`'s no-op, a shared resolution's `key_id
+=None` writing nothing, and a write failure being swallowed and logged rather than raised.
+
+The leakage suite itself (`tests/integration/test_credential_leakage.py`) drives `phase6.md`'s own
+script end to end through the real app — add a private key, list keys, a non-streaming turn, a
+streaming turn, a live `AuthFailed` failing over to Gemini's shared pool (D40's disclosure now actually
+firing), remove the key — capturing every JSON log line the same way `tests/unit/test_logging.py`
+does (a handler on the root logger, not `structlog.testing.capture_logs`, which drops
+`merge_contextvars`) and asserting a sentinel plaintext and its Fernet ciphertext appear in no log
+line, no response body, and no stored `requests.attempts` row. A second test forces a bare
+`RuntimeError` from the mock transport — not an `httpx.HTTPError`, so `ProviderAdapter._request`'s own
+`except` never catches it — while a private key is a local variable in the router's frame, confirming
+`unhandled_exception_handler`'s output carries neither the plaintext nor a variable dump, which holds
+only because `structlog.processors.format_exc_info` renders a plain traceback and never local values.
+Both existing leak-adjacent surfaces named in the step's plan were checked and needed no change:
+`_serializable_errors` already drops pydantic's `input` field, and `AttemptRecord.to_json` never
+carried a key field to begin with. `make test` (1333 passed, 1 skipped), `ruff check`, `ruff format
+--check`, and `mypy` are all green.
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

@@ -61,7 +61,7 @@ from app.db.repo import extractions as extractions_repo
 from app.keys_resolution.resolver import ProviderCredentials, SystemCredentials
 from app.memory.canonical import CanonicalMessage, MessageMeta, file_ref_block, text_block
 from app.providers.base import ProviderAdapter
-from app.providers.errors import ProviderError
+from app.providers.errors import AuthFailed, ProviderError
 from app.providers.registry import ProviderRegistry, UnknownSlot
 from app.providers.types import ExtractionConfidence, GenParams, ModelSpec, ResolvedAttachment
 from app.quota import lanes
@@ -434,6 +434,10 @@ async def _walk_candidates(
                 await lanes.commit_perception(quota, reservation, tokens_in=0, tokens_out=0)
             await breaker.record_failure(decision, exc)
             logger.warning("perception.attempt_failed", **exc.log_fields(), file_hash=file_hash)
+            if isinstance(exc, AuthFailed) and resolved.pool == "private":
+                # D40, the perception lane's own candidate walk — see
+                # `routing/router.py`'s identical guard.
+                await credentials.record_auth_failure(resolved)
             if exc.failover_eligible:
                 continue
             # ContentFiltered and BadRequest fail identically everywhere. Stop
