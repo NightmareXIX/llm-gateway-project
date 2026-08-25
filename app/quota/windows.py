@@ -32,6 +32,11 @@ _ROLLING_WINDOW_S: Final = keys.QUOTA_WINDOW_TTL_S
 schema — is implemented as a fixed window rather than a true rolling one; see
 D16 for the reasoning and the bounded overshoot it accepts."""
 
+_ROLLING_DAILY_WINDOW_S: Final = 86_400
+"""The width of ``rolling_daily`` (Phase 6 Step 7, D39) — a day, the same
+overshoot-accepting fixed-window trick ``rolling_60s`` uses, scaled up for a
+counter with no provider-defined midnight to align to."""
+
 
 @dataclass(frozen=True, slots=True)
 class WindowSpec:
@@ -80,6 +85,8 @@ def resets_at(reset: ResetKind, *, now: datetime) -> datetime:
     """
     if reset == "rolling_60s":
         return now + timedelta(seconds=_ROLLING_WINDOW_S)
+    if reset == "rolling_daily":
+        return now + timedelta(seconds=_ROLLING_DAILY_WINDOW_S)
     if reset == "fixed_daily_utc":
         return _next_midnight(now.astimezone(UTC), UTC)
     if reset == "fixed_daily_pt":

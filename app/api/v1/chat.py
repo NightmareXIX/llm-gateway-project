@@ -30,7 +30,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -62,7 +62,7 @@ from app.deps import (
     get_credentials,
     get_resolver,
 )
-from app.keys_resolution.resolver import ProviderCredentials
+from app.keys_resolution.resolver import ProviderCredentials, quota_scope_for
 from app.memory.canonical import (
     CanonicalMessage,
     ContentBlock,
@@ -329,6 +329,7 @@ async def create_chat_completion(
             latency_ms=_elapsed_ms(started),
             conversation_id=conversation_id,
             attempts=failure.trail,
+            quota_scope=quota_scope_for(failure.key_pool, principal.user_id),
         )
         await session.commit()
         # Substitutes a message written for our caller; the provider's own prose
@@ -378,6 +379,8 @@ async def create_chat_completion(
             # on. Stored for the same reason `extraction_tier` is — re-opening
             # the thread tomorrow should still say so.
             messages_dropped=outcome.report.messages_dropped,
+            # D42: which pool paid for it — the eighth disclosure field.
+            key_pool=outcome.key_pool,
         ),
     )
     # D32(c): a complete, reachable pin mechanism whose only deferred part is
@@ -407,6 +410,7 @@ async def create_chat_completion(
         conversation_id=conversation_id,
         attempts=outcome.trail,
         substituted=substituted,
+        quota_scope=quota_scope_for(outcome.key_pool, principal.user_id),
     )
     await session.commit()
 
@@ -451,6 +455,7 @@ async def create_chat_completion(
         extraction_tier=outcome.report.extraction_tier,
         messages_dropped=outcome.report.messages_dropped,
         warning=warning,
+        key_pool=outcome.key_pool,
         attempts=outcome.attempts,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -513,6 +518,7 @@ async def _serve_cache_hit(
         latency_ms=_elapsed_ms(started),
         conversation_id=conversation_id,
         substituted=substituted,
+        quota_scope="system",
     )
     await session.commit()
 
@@ -533,6 +539,9 @@ async def _serve_cache_hit(
         # carries whatever it dropped, not this one.
         messages_dropped=0,
         warning=warning,
+        # A hit spent no credential (D42) — the original turn's own row
+        # already names the pool that paid for it.
+        key_pool=None,
         attempts=0,
         conversation_id=conversation_id,
         assistant=assistant,
@@ -661,6 +670,7 @@ async def _stream_chat_completion(
             latency_ms=_elapsed_ms(started),
             conversation_id=conversation.id,
             attempts=failure.trail,
+            quota_scope=quota_scope_for(failure.key_pool, principal.user_id),
         )
         await session.commit()
         raise to_app_error(failure.error) from failure
@@ -826,6 +836,7 @@ def _to_response(
     extraction_tier: ExtractionTier | None,
     messages_dropped: int,
     warning: str | None,
+    key_pool: Literal["shared", "private"] | None,
     attempts: int,
     conversation_id: UUID,
     assistant: CanonicalMessage,
@@ -864,6 +875,7 @@ def _to_response(
         extraction_tier=extraction_tier,
         messages_dropped=messages_dropped,
         warning=warning,
+        key_pool=key_pool,
         conversation_id=conversation_id,
         message_id=assistant.id,
     )

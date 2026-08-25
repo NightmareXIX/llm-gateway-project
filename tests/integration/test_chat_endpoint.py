@@ -20,14 +20,16 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from fakeredis.aioredis import FakeRedis
 from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.chat import _get_resolver as chat_get_resolver
-from app.config import ProvidersConfig, get_providers_config
+from app.cache import keys
+from app.config import ProviderEntry, ProvidersConfig, Slot, SlotCandidate, get_providers_config
 from app.core.crypto import encrypt_provider_key
-from app.db.models import Conversation, File, Message, Request
+from app.db.models import Conversation, File, Message, Request, UserQuotaAllocation
 from app.db.repo import messages as messages_repo
 from app.db.repo import provider_keys as provider_keys_repo
 from app.memory.canonical import MessageMeta, text_block
@@ -1984,3 +1986,227 @@ async def test_a_turn_is_served_under_a_stored_private_key(
         assert handler.last.headers["authorization"] != "Bearer gsk_test_key_not_real"
     finally:
         await upstream.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 7 — key_pool, quota_scope, and D39's personal cap
+# --------------------------------------------------------------------------- #
+async def test_a_shared_pool_turn_discloses_shared_and_bills_the_system_scope(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    groq: provider_fixtures.RecordingHandler,
+    db_session: AsyncSession,
+) -> None:
+    """D42/D39: nobody has added a key, so the response, the stored message
+    and the ``requests`` row all agree the shared pool paid for it."""
+    response = await client.post(
+        COMPLETIONS,
+        json={"model": "auto", "messages": [{"role": "user", "content": "what is a gateway?"}]},
+        headers=_headers(make_jwt),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["key_pool"] == "shared"
+
+    stored = await _messages(db_session, body["conversation_id"])
+    assert stored[1].meta["key_pool"] == "shared"
+
+    rows = await _requests(db_session)
+    assert rows[-1].quota_scope == "system"
+
+
+async def test_a_private_key_turn_discloses_private_and_bills_the_users_own_scope(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    user_factory: Callable[..., Any],
+    db_session: AsyncSession,
+    redis_client: FakeRedis,
+    app: FastAPI,
+) -> None:
+    """The definition of done's exit criterion 4: the private counter moves
+    and the shared one does not, and both the wire and the stored row say
+    which pool actually paid."""
+    user = await user_factory()
+    await _add_private_key(
+        db_session, user_id=user.id, provider="groq", plaintext="gsk_private_live_key_for_bob"
+    )
+    handler = provider_fixtures.RecordingHandler(provider_fixtures.load("groq", "success"))
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=_groq_only())
+    try:
+        response = await client.post(
+            COMPLETIONS,
+            json={"model": "auto", "messages": [{"role": "user", "content": "what is a gateway?"}]},
+            headers=_headers(make_jwt, sub=user.id),
+        )
+    finally:
+        await upstream.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["key_pool"] == "private"
+
+    stored = await _messages(db_session, body["conversation_id"])
+    assert stored[1].meta["key_pool"] == "private"
+
+    rows = await _requests(db_session)
+    assert rows[-1].quota_scope == str(user.id)
+
+    private_used = await redis_client.get(
+        keys.quota(str(user.id), "groq", "openai/gpt-oss-120b", "rpm")
+    )
+    shared_used = await redis_client.get(
+        keys.quota(keys.SYSTEM_SCOPE, "groq", "openai/gpt-oss-120b", "rpm")
+    )
+    assert private_used == "1"
+    assert shared_used is None
+
+
+async def test_quota_scope_changes_within_one_conversation_after_a_key_is_added(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    user_factory: Callable[..., Any],
+    db_session: AsyncSession,
+    app: FastAPI,
+) -> None:
+    """The definition of done, driven end to end: one conversation, a key
+    added mid-thread, and the *next* message — no reload — bills a different
+    scope than the first."""
+    user = await user_factory()
+    handler = provider_fixtures.ScriptedHandler(
+        provider_fixtures.load("groq", "success"),
+        provider_fixtures.load("groq", "success"),
+    )
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=_groq_only())
+    try:
+        first = await client.post(
+            COMPLETIONS,
+            json={"model": "auto", "messages": [{"role": "user", "content": "first"}]},
+            headers=_headers(make_jwt, sub=user.id),
+        )
+        assert first.status_code == 200
+        conversation_id = first.json()["conversation_id"]
+
+        await _add_private_key(
+            db_session,
+            user_id=user.id,
+            provider="groq",
+            plaintext="gsk_private_live_key_for_carol",
+        )
+
+        second = await client.post(
+            COMPLETIONS,
+            json={
+                "model": "auto",
+                "conversation_id": conversation_id,
+                "messages": [{"role": "user", "content": "second"}],
+            },
+            headers=_headers(make_jwt, sub=user.id),
+        )
+    finally:
+        await upstream.aclose()
+
+    assert second.status_code == 200
+    assert first.json()["key_pool"] == "shared"
+    assert second.json()["key_pool"] == "private"
+
+    rows = [
+        row for row in await _requests(db_session) if str(row.conversation_id) == conversation_id
+    ]
+    assert [row.quota_scope for row in rows] == ["system", str(user.id)]
+
+
+def _solo_config() -> ProvidersConfig:
+    """Exactly one slot, one candidate — unlike ``_groq_only``, which keeps
+    both ``general`` and ``fast`` enabled and therefore still spills
+    ``general`` into ``fast``'s own groq candidate (D10). This test needs a
+    chain with nothing else in it: a second reachable candidate would quietly
+    absorb the block this test exists to prove.
+    """
+    return ProvidersConfig(
+        version=1,
+        providers={
+            "groq": ProviderEntry(
+                enabled=True,
+                base_url="https://api.groq.com/openai/v1",
+                api_key_env="GROQ_API_KEY",
+            )
+        },
+        slots={
+            "general": Slot(
+                description="test slot",
+                candidates=(
+                    SlotCandidate(
+                        provider="groq",
+                        model="openai/gpt-oss-120b",
+                        context_tokens=131072,
+                        max_output_tokens=65536,
+                        capabilities=("text",),
+                        supports_streaming=True,
+                    ),
+                ),
+            )
+        },
+    )
+
+
+async def test_a_users_personal_cap_on_the_shared_pool_blocks_only_that_user(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    user_factory: Callable[..., Any],
+    db_session: AsyncSession,
+    app: FastAPI,
+) -> None:
+    """D39, demoed exactly as the phase's own definition of done describes
+    it: a user pinned to a cap of one is refused on their second message,
+    served entirely off the gateway's own bookkeeping (never a real second
+    provider call), while a second user with no cap of their own is
+    unaffected on the very same shared model."""
+    capped_user = await user_factory()
+    other_user = await user_factory()
+    db_session.add(
+        UserQuotaAllocation(
+            user_id=capped_user.id,
+            provider="groq",
+            model="openai/gpt-oss-120b",
+            daily_cap=1,
+        )
+    )
+    await db_session.flush()
+
+    handler = provider_fixtures.ScriptedHandler(
+        provider_fixtures.load("groq", "success"),
+        provider_fixtures.load("groq", "success"),
+    )
+    upstream = handler.client()
+    app.state.provider_registry = build_registry(client=upstream, config=_solo_config())
+    try:
+        first = await client.post(
+            COMPLETIONS,
+            json={"model": "general", "messages": [{"role": "user", "content": "one"}]},
+            headers=_headers(make_jwt, sub=capped_user.id, email=capped_user.email),
+        )
+        assert first.status_code == 200
+
+        second = await client.post(
+            COMPLETIONS,
+            json={"model": "general", "messages": [{"role": "user", "content": "two"}]},
+            headers=_headers(make_jwt, sub=capped_user.id, email=capped_user.email),
+        )
+        assert second.status_code == 502
+        assert second.json()["error"]["code"] == "rate_limited"
+
+        third = await client.post(
+            COMPLETIONS,
+            json={"model": "general", "messages": [{"role": "user", "content": "three"}]},
+            headers=_headers(make_jwt, sub=other_user.id, email=other_user.email),
+        )
+    finally:
+        await upstream.aclose()
+
+    assert third.status_code == 200
+    # The blocked second request never reached the provider — refused on the
+    # gateway's own bookkeeping, not a real second call that also happened to
+    # 429.
+    assert handler.calls == 2

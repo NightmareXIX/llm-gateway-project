@@ -54,6 +54,7 @@ async def record_success(
     attempts: Sequence[AttemptRecord] = (),
     substituted: bool = False,
     wasted_tokens_out: int = 0,
+    quota_scope: str = "system",
 ) -> Request:
     """Record a turn that produced an answer.
 
@@ -68,6 +69,13 @@ async def record_success(
     nothing to have wasted. The streaming collector is the first caller to pass a
     non-zero value — tokens a *discarded* attempt generated on the way to this
     successful one, really spent even though the client never saw them.
+
+    ``quota_scope`` (Phase 6 Step 7) is who actually paid: ``"system"`` for the
+    shared pool, a ``user_id`` string for a private key — the caller derives it
+    from the winning attempt's ``key_pool`` (D42) via
+    :func:`~app.keys_resolution.resolver.quota_scope_for`, since that pool
+    label plus the caller's own principal is exactly what
+    :class:`~app.keys_resolution.resolver.ResolvedKey.scope` would have been.
     """
     row = await requests_repo.create(
         session,
@@ -86,6 +94,7 @@ async def record_success(
         substituted=substituted,
         attempts=[record.to_json() for record in attempts],
         wasted_tokens_out=wasted_tokens_out,
+        quota_scope=quota_scope,
     )
 
     logger.info(
@@ -106,6 +115,7 @@ async def record_success(
         # one fail over?" wants. The trail itself is in the row.
         attempts=len(attempts),
         wasted_tokens_out=wasted_tokens_out,
+        quota_scope=quota_scope,
     )
     return row
 
@@ -121,6 +131,7 @@ async def record_failure(
     conversation_id: UUID | None = None,
     attempts: Sequence[AttemptRecord] = (),
     substituted: bool = False,
+    quota_scope: str = "system",
 ) -> Request:
     """Record a turn that ended in a normalized provider failure.
 
@@ -134,6 +145,11 @@ async def record_failure(
     are logged at *error* level. A dead provider key is an ops problem that does
     not fix itself, and it should not sit at the same severity as the rate limits
     this gateway hits by design every day.
+
+    ``quota_scope`` (Phase 6 Step 7): the *last attempted* candidate's pool, the
+    same way ``spec``/``served_slot`` already fall back to the last one tried
+    rather than the one requested. ``"system"`` when every candidate was
+    skipped on an open breaker and nothing ever resolved a credential.
     """
     row = await requests_repo.create(
         session,
@@ -152,6 +168,7 @@ async def record_failure(
         # that answers "why did this take eight seconds before failing?", and the
         # error alone names one candidate out of however many were tried.
         attempts=[record.to_json() for record in attempts],
+        quota_scope=quota_scope,
     )
 
     # `log_fields()` carries the routing flags — retryable, failover-eligible,
@@ -165,6 +182,7 @@ async def record_failure(
         "served_slot": spec.slot if spec is not None else None,
         "latency_ms": latency_ms,
         "attempts": len(attempts),
+        "quota_scope": quota_scope,
         # The provider's own prose, kept out of the response body and put here
         # instead: it is written for whoever holds the upstream account.
         "detail": str(error),
@@ -188,6 +206,7 @@ async def record_cache_hit(
     latency_ms: int,
     conversation_id: UUID | None = None,
     substituted: bool = False,
+    quota_scope: str = "system",
 ) -> Request:
     """Record a turn served entirely from D19's exact-match cache.
 
@@ -199,6 +218,12 @@ async def record_cache_hit(
     ``provider``/``model``/``slot`` name the candidate that originally produced
     the cached text, which is what ``served_by`` on the response continues to
     disclose.
+
+    ``quota_scope`` always ``"system"`` (Phase 6 Step 7): a hit spends no
+    credential and no quota, the same reasoning that gives it
+    ``messages_dropped=0``/``extraction_tier=None`` elsewhere (phase5 trap 3)
+    — passed explicitly rather than left to the default so a reader does not
+    have to wonder whether this call site simply forgot the parameter.
     """
     row = await requests_repo.create(
         session,
@@ -216,6 +241,7 @@ async def record_cache_hit(
         cache_hit=True,
         substituted=substituted,
         attempts=[],
+        quota_scope=quota_scope,
     )
 
     logger.info(
@@ -244,6 +270,7 @@ async def record_stream_failure(
     attempts: Sequence[AttemptRecord] = (),
     substituted: bool = False,
     wasted_tokens_out: int = 0,
+    quota_scope: str = "system",
 ) -> Request:
     """Record a streamed turn that failed *in-band*, after the 200 committed.
 
@@ -276,6 +303,7 @@ async def record_stream_failure(
         substituted=substituted,
         attempts=[record.to_json() for record in attempts],
         wasted_tokens_out=wasted_tokens_out,
+        quota_scope=quota_scope,
     )
 
     logger.warning(
@@ -290,5 +318,6 @@ async def record_stream_failure(
         latency_ms=latency_ms,
         attempts=len(attempts),
         wasted_tokens_out=wasted_tokens_out,
+        quota_scope=quota_scope,
     )
     return row

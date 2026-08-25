@@ -177,6 +177,26 @@ def quota_perception_lane(scope: Scope, provider: str, model: str) -> str:
     return f"{_model_scoped(scope, provider, model)}:lane:perception"
 
 
+def user_allocation(user_id: str | UUID, provider: str, model: str) -> str:
+    """``q:{user_id}:{provider}:{model}:alloc:rpd`` — D39's personal daily cap.
+
+    **An addition to Contract C, made with sign-off rather than silently** —
+    the second one, after Phase 3 Step 10's ``rl:`` window segment (ADR-022);
+    ADR-036 records why. Nothing had ever written this key before Phase 6
+    Step 7, so there was nothing to migrate.
+
+    Always keyed on the real ``user_id``, never on :data:`SYSTEM_SCOPE` — this
+    counter exists specifically for the shared-pool path, where the spending
+    scope is ``"system"`` but the cap being checked belongs to one user. Reuses
+    the ``:rpd`` window *label* the model's own daily counter uses (so the
+    existing reserve/commit/release machinery needs no new window kind to
+    enforce it), pointed at a sub-key of its own the way
+    :func:`quota_perception_lane` points D8's split at a sub-key rather than
+    inventing a fifth :data:`QuotaWindow`.
+    """
+    return f"{_model_scoped(str(user_id), provider, model)}:alloc:rpd"
+
+
 # --------------------------------------------------------------------------- #
 # Circuit breaker — Phase 2, Step 3
 # --------------------------------------------------------------------------- #

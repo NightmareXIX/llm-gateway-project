@@ -43,6 +43,7 @@ from app.auth.principal import Principal
 from app.cache.exact import CachedResponse, ExactCache
 from app.core.clock import SYSTEM_CLOCK
 from app.db.repo import messages as messages_repo
+from app.keys_resolution.resolver import quota_scope_for
 from app.memory.canonical import MessageMeta, text_block
 from app.streaming.orchestrator import StreamResult
 from app.usage import logger as usage_logger
@@ -126,6 +127,7 @@ class Collector:
                 degraded=result.degraded,
                 extraction_tier=result.extraction_tier,
                 messages_dropped=result.messages_dropped,
+                key_pool=result.key_pool,
             ),
         )
         await usage_logger.record_success(
@@ -139,6 +141,7 @@ class Collector:
             attempts=result.trail,
             substituted=result.substituted,
             wasted_tokens_out=result.wasted_tokens_out,
+            quota_scope=quota_scope_for(result.key_pool, self._principal.user_id),
         )
 
         # D5/D19's streaming write, exactly where this docstring promised it
@@ -221,6 +224,7 @@ class Collector:
                 latency_ms=latency_ms,
                 conversation_id=conversation_id,
                 substituted=substituted,
+                quota_scope="system",
             )
             await session.commit()
 
@@ -246,6 +250,7 @@ class Collector:
             attempts=result.trail,
             substituted=result.substituted,
             wasted_tokens_out=result.wasted_tokens_out,
+            quota_scope=quota_scope_for(result.key_pool, self._principal.user_id),
         )
 
 

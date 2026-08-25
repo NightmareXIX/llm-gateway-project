@@ -188,6 +188,12 @@ class MessageMeta:
     history — a fact that survives a page reload, the same way ``degraded``
     does for a document that could not be read natively."""
 
+    key_pool: Literal["shared", "private"] | None = None
+    """D42: which credential pool answered — the eighth disclosure field,
+    following ``extraction_tier``'s pattern exactly. ``None`` on a D19 cache
+    hit (no key was spent this turn, so there is nothing to disclose) and on
+    every pre-Phase-6 row, neither of which had a pool to name."""
+
     def to_jsonb(self) -> dict[str, Any]:
         """Serialize for the ``messages.meta`` column.
 
@@ -208,6 +214,7 @@ class MessageMeta:
             "degraded": self.degraded,
             "extraction_tier": self.extraction_tier,
             "messages_dropped": self.messages_dropped,
+            "key_pool": self.key_pool,
         }
 
     @classmethod
@@ -252,6 +259,10 @@ class MessageMeta:
         if tier is not None and tier not in get_args(ExtractionTier):
             raise InvariantViolation(f"meta.extraction_tier is not a known tier: {tier!r}")
 
+        pool = raw.get("key_pool")
+        if pool is not None and pool not in ("shared", "private"):
+            raise InvariantViolation(f"meta.key_pool is not a known pool: {pool!r}")
+
         return cls(
             provider_used=_opt_str("provider_used"),
             model_used=_opt_str("model_used"),
@@ -265,6 +276,7 @@ class MessageMeta:
             degraded=_bool("degraded", False),
             extraction_tier=tier,
             messages_dropped=_int("messages_dropped", 0),
+            key_pool=pool,
         )
 
 

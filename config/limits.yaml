@@ -119,6 +119,13 @@ gateway:
   free:
     rpm: 20
     rpd: 500
+    # D39 (Phase 6 Step 7): a free-tier user's own slice of the *shared*
+    # pool, per (provider, model) — separate from `rpd` above, which caps
+    # calls to the gateway itself across every provider. A
+    # `user_quota_allocations` row overrides this for one user; this is only
+    # the default everyone else gets on the shared path.
+    shared_pool_daily_cap: 50
   plus:
     rpm: 60
     rpd: 5000
+    shared_pool_daily_cap: 200

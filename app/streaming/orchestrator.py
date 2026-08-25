@@ -246,6 +246,9 @@ async def stream_cached_completion(
             # A replay never re-resolves the pin either — no candidate chain
             # was walked, so there is nothing this turn overrode.
             warning=None,
+            # No credential was resolved and nothing was spent (D42) — the
+            # original turn's own row already names the pool that paid for it.
+            key_pool=None,
             status="ok",
         )
     )
@@ -624,6 +627,7 @@ class _Turn:
             extraction_tier=self.extraction_tier,
             messages_dropped=self.messages_dropped,
             warning=selection.pin_warning(self.pinned, self.requested, spec.slot),
+            key_pool=self.key_pool,
             status=self.status,
             partial_content=self.partial_content(),
         )

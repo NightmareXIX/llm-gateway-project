@@ -234,6 +234,12 @@ class ChatCompletionResponse(BaseModel):
     field (trap 6): it must never be routed through ``to_app_error``, never
     set a non-2xx status, and the frontend must not render it as a failure."""
 
+    key_pool: Literal["shared", "private"] | None = None
+    """D42: which credential pool served this turn (Phase 6) — ``"private"``
+    when the caller's own stored key answered, ``"shared"`` for the free-tier
+    pool everyone rides by default. ``None`` on a D19 cache hit, the same way
+    ``extraction_tier`` is ``None`` when the lane never ran this turn."""
+
     # ---- gateway state ----------------------------------------------------- #
     conversation_id: UUID
     message_id: UUID

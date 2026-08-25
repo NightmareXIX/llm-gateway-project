@@ -63,8 +63,11 @@ A daily counter's TTL is "seconds until the provider's next reset", which
 converges on a real instant and is therefore idempotent to re-set. ``rolling_60s``
 is the opposite: refreshing it on every increment means it never expires under
 sustained traffic, and the counter climbs forever behind a permanent false 429
-(D16, trap 1). Named as a set rather than written as ``!= "rolling_60s"`` so a
-fourth :data:`~app.config.ResetKind` has to be classified deliberately.
+(D16, trap 1). Named as a set rather than written as ``!= "rolling_60s"`` so
+every :data:`~app.config.ResetKind` has to be classified deliberately —
+``rolling_daily`` (Phase 6 Step 7, D39) reads the same way ``rolling_60s``
+does: a personal cap with no provider midnight to converge on, refreshed under
+sustained daily use would never expire.
 """
 
 
@@ -175,6 +178,7 @@ class QuotaTracker:
         scope: keys.Scope,
         estimated_tokens: int,
         request_id: str,
+        extra_grants: tuple[WindowGrant, ...] = (),
     ) -> QuotaDecision:
         """Take out budget for one attempt, atomically, across every window.
 
@@ -187,17 +191,28 @@ class QuotaTracker:
         against the standard :func:`keys.quota` key. :meth:`reserve_windows` is
         where the actual work happens now — Step 5 pulled it out so the
         perception lane could reuse it with a grant set of its own.
+
+        ``extra_grants`` is Phase 6 Step 7's seam (D39): the router appends
+        ``quota/allocations.py::shared_pool_grants`` here on a shared-pool
+        candidate, so the personal daily cap is reserved atomically alongside
+        the model's own windows rather than as a second, racy round trip.
+        Empty for every private-pool attempt and for every pre-Phase-6 caller —
+        the same ``()`` default that keeps the router's own default behaviour
+        unchanged when nothing is passed.
         """
         window_specs = self._budget(spec)
-        grants = tuple(
-            WindowGrant(
-                window=window.window,
-                limit=window.limit,
-                reset=window.reset,
-                cost_is_tokens=window.cost_is_tokens,
-                key=keys.quota(scope, spec.provider, spec.model, window.window),
+        grants = (
+            tuple(
+                WindowGrant(
+                    window=window.window,
+                    limit=window.limit,
+                    reset=window.reset,
+                    cost_is_tokens=window.cost_is_tokens,
+                    key=keys.quota(scope, spec.provider, spec.model, window.window),
+                )
+                for window in window_specs
             )
-            for window in window_specs
+            + extra_grants
         )
         return await self.reserve_windows(
             grants,

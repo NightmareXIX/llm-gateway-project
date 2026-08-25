@@ -402,7 +402,7 @@ async def _walk_candidates(
         # candidate walk, independent of whichever provider is about to answer
         # the turn, so a user's own Gemini key pays for reading their document
         # even when Groq's shared key ends up serving the answer.
-        resolved = await credentials.for_provider(spec.provider)
+        resolved = await credentials.for_provider(spec.provider, spec.model)
 
         reservation: Reservation | None = None
         if quota is not None:

@@ -48,7 +48,7 @@ from uuid import uuid4
 from app.cache import keys
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger
-from app.keys_resolution.resolver import ProviderCredentials, SystemCredentials
+from app.keys_resolution.resolver import ProviderCredentials, ResolvedKey, SystemCredentials
 from app.memory.canonical import CanonicalMessage
 from app.memory.render import AttachmentResolver, RenderReport, render
 from app.providers.base import (
@@ -66,7 +66,8 @@ from app.providers.errors import (
 )
 from app.providers.registry import ProviderRegistry
 from app.providers.types import Completion, GenParams, ModelSpec, Usage
-from app.quota.tracker import QuotaTracker, Reservation
+from app.quota import allocations
+from app.quota.tracker import QuotaTracker, Reservation, WindowGrant
 from app.routing import selection
 from app.routing.circuit_breaker import BreakerState, CircuitBreaker
 from app.usage.metrics import COMPLETE, STREAM, LatencyTable
@@ -431,7 +432,7 @@ async def route(
         while True:
             attempt_started = clock.now()
             adapter = registry.adapter_for_spec(spec)
-            resolved = await credentials.for_provider(spec.provider)
+            resolved = await credentials.for_provider(spec.provider, spec.model)
             reservation: Reservation | None = None
 
             try:
@@ -448,6 +449,9 @@ async def route(
                         scope=resolved.scope,
                         estimated_tokens=report.estimated_tokens,
                         request_id=str(uuid4()),
+                        # D39: the shared path's own extra ceiling, reserved
+                        # atomically alongside the model's windows.
+                        extra_grants=_extra_grants(spec, resolved),
                     )
                     if not quota_decision.allowed:
                         trail.append(
@@ -753,7 +757,7 @@ async def route_stream(
         while True:
             attempt_started = clock.now()
             adapter = registry.adapter_for_spec(spec)
-            resolved = await credentials.for_provider(spec.provider)
+            resolved = await credentials.for_provider(spec.provider, spec.model)
             reservation: Reservation | None = None
 
             delivered_chars = 0
@@ -773,6 +777,7 @@ async def route_stream(
                         scope=resolved.scope,
                         estimated_tokens=report.estimated_tokens,
                         request_id=str(uuid4()),
+                        extra_grants=_extra_grants(spec, resolved),
                     )
                     if not quota_decision.allowed:
                         trail.append(
@@ -1040,6 +1045,21 @@ async def route_stream(
         latency_ms=_elapsed_ms(clock, started),
         wasted_tokens_out=wasted_total,
         key_pool=last_key_pool,
+    )
+
+
+def _extra_grants(spec: ModelSpec, resolved: ResolvedKey) -> tuple[WindowGrant, ...]:
+    """D39's personal-cap grant, or none — the router's one-line branch.
+
+    Only the shared path can have a cap: the private path has no cap by
+    construction (§9.4), and :attr:`ResolvedKey.shared_daily_cap` is always
+    ``None`` there anyway, so ``allocations.shared_pool_grants`` would return
+    ``()`` regardless — this check just skips the (harmless) call.
+    """
+    if resolved.pool != "shared" or resolved.shared_daily_cap is None or resolved.user_id is None:
+        return ()
+    return allocations.shared_pool_grants(
+        spec, user_id=resolved.user_id, cap=resolved.shared_daily_cap
     )
 
 

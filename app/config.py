@@ -392,7 +392,13 @@ class ProvidersConfig(BaseModel):
 # --------------------------------------------------------------------------- #
 # config/limits.yaml
 # --------------------------------------------------------------------------- #
-ResetKind = Literal["rolling_60s", "fixed_daily_utc", "fixed_daily_pt"]
+ResetKind = Literal["rolling_60s", "fixed_daily_utc", "fixed_daily_pt", "rolling_daily"]
+"""``rolling_daily`` is Phase 6 Step 7's addition (D39): the personal-cap
+counter's own reset, a day wide like ``fixed_daily_utc``/``fixed_daily_pt``
+but — like ``rolling_60s`` — anchored to whenever the counter was first
+written rather than a wall-clock boundary either provider defines. The cap is
+a policy of this gateway, not a provider's, so it has no midnight to align to;
+see ``quota/allocations.py``."""
 
 
 class ResetPolicy(BaseModel):
@@ -427,6 +433,14 @@ class GatewayLimits(BaseModel):
 
     rpm: int = Field(gt=0)
     rpd: int = Field(gt=0)
+    shared_pool_daily_cap: int | None = Field(default=None, gt=0)
+    """D39: this tier's default personal ceiling on the *shared* pool, per
+    (user, provider, model) — ``None`` means no default cap for this tier.
+    Unrelated to ``rpd`` above: that limits requests to the gateway itself,
+    across every provider; this limits one user's slice of one provider's
+    shared free tier. A ``user_quota_allocations`` row overrides this per
+    (user, provider, model); with neither, there is no personal cap at all,
+    which is today's behaviour."""
 
 
 class LimitsConfig(BaseModel):

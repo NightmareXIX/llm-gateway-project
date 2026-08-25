@@ -1154,7 +1154,8 @@ class ScriptedCredentials:
         self._by_provider = by_provider
         self.calls: list[str] = []
 
-    async def for_provider(self, provider: str) -> ResolvedKey:
+    async def for_provider(self, provider: str, model: str) -> ResolvedKey:
+        del model
         self.calls.append(provider)
         return self._by_provider[provider]
 
@@ -1299,6 +1300,133 @@ async def test_a_streamed_chain_crossing_two_providers_resolves_credentials_per_
 
     assert handler.requests[0].headers["authorization"] == "Bearer shared-groq-key"
     assert handler.requests[1].headers["x-goog-api-key"] == "private-gemini-key"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 Step 7 — D39's personal cap on the shared pool
+# --------------------------------------------------------------------------- #
+SOLO_CONFIG = ProvidersConfig(
+    version=1,
+    providers={
+        PROVIDER: ProviderEntry(
+            enabled=True,
+            base_url="https://api.groq.com/openai/v1",
+            api_key_env="GROQ_API_KEY",
+        )
+    },
+    slots={
+        # Exactly one candidate: a personal-cap block on it must show up as
+        # `RoutingFailed`, not a failover to a sibling candidate whose own
+        # `alloc:rpd` key (keyed by model, not just provider) was never touched.
+        "solo": Slot(description="test slot", candidates=(_candidate("model-a"),))
+    },
+)
+
+
+async def test_a_users_personal_cap_blocks_the_shared_path_independently_of_the_pool(
+    breaker: CircuitBreaker,
+    history: list[CanonicalMessage],
+    redis_client: FakeRedis,
+    frozen_clock: FixedClock,
+) -> None:
+    """D39, and the test the step's own plan calls out by name: a user pinned
+    to a personal cap of 1 is skipped on ``skipped_quota`` on their second
+    request, while a *different* user — same shared model, same provider, no
+    cap of their own — is served off the very same shared ``rpm`` counter
+    without ever seeing it."""
+    scripts = LuaScriptRegistry(redis_client)
+    scripts.load_dir()
+    quota = QuotaTracker(
+        redis_client, scripts, _quota_limits(rpm=100), clock=frozen_clock, headroom=0.0
+    )
+    handler = provider_fixtures.ScriptedHandler(
+        provider_fixtures.load(PROVIDER, "success"),
+        provider_fixtures.load(PROVIDER, "success"),
+    )
+    registry = build_registry(client=handler.client(), config=SOLO_CONFIG)
+
+    capped_user = uuid4()
+    capped_credentials = ScriptedCredentials(
+        {
+            PROVIDER: ResolvedKey(
+                provider=PROVIDER,
+                key="shared-groq-key",
+                pool="shared",
+                scope=keys.SYSTEM_SCOPE,
+                key_id=None,
+                shared_daily_cap=1,
+                user_id=capped_user,
+            )
+        }
+    )
+
+    first = await router.route(
+        registry=registry,
+        breaker=breaker,
+        history=history,
+        params=PARAMS,
+        requested="solo",
+        quota=quota,
+        credentials=capped_credentials,
+        rng=random.Random(0),
+        sleep=_no_sleep,
+    )
+    assert first.spec.provider == PROVIDER
+
+    with pytest.raises(router.RoutingFailed) as failure:
+        await router.route(
+            registry=registry,
+            breaker=breaker,
+            history=history,
+            params=PARAMS,
+            requested="solo",
+            quota=quota,
+            credentials=capped_credentials,
+            rng=random.Random(0),
+            sleep=_no_sleep,
+        )
+    assert isinstance(failure.value.error, RateLimited)
+    assert failure.value.trail[-1].outcome == "skipped_quota"
+    assert failure.value.trail[-1].blocked_window == "rpd"
+    # No second HTTP request for the blocked attempt — the script only ever
+    # served two responses, both spent by the two calls that actually reserved.
+    assert handler.calls == 1
+
+    other_user = uuid4()
+    other_credentials = ScriptedCredentials(
+        {
+            PROVIDER: ResolvedKey(
+                provider=PROVIDER,
+                key="shared-groq-key",
+                pool="shared",
+                scope=keys.SYSTEM_SCOPE,
+                key_id=None,
+                shared_daily_cap=None,
+                user_id=other_user,
+            )
+        }
+    )
+    second_user_outcome = await router.route(
+        registry=registry,
+        breaker=breaker,
+        history=history,
+        params=PARAMS,
+        requested="solo",
+        quota=quota,
+        credentials=other_credentials,
+        rng=random.Random(0),
+        sleep=_no_sleep,
+    )
+    assert second_user_outcome.spec.provider == PROVIDER
+    assert handler.calls == 2
+
+    # The shared model-level `rpm` counter moved for both requests; only the
+    # capped user's own `alloc:rpd` counter ever hit its ceiling.
+    remaining = {
+        state.window: state
+        for state in await quota.remaining(registry.candidates("solo")[0], scope=keys.SYSTEM_SCOPE)
+    }
+    assert remaining["rpm"].used == 2
 
 
 # --------------------------------------------------------------------------- #

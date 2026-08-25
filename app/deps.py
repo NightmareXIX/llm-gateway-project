@@ -266,9 +266,21 @@ def get_credentials(
     ``session_factory`` — not a request-scoped session — is what lets it
     survive into the streaming path the same way ``get_resolver`` already
     does.
+
+    ``limits``/``tier`` (Phase 6 Step 7, D39) are what let the resolver answer
+    a shared-pool candidate's personal daily cap without a database access of
+    its own: ``get_limits_config()`` is the same cached YAML accessor
+    ``get_rate_limiter`` already reads, and ``principal.tier`` is already
+    resolved by the time a caller reaches this factory.
     """
     registry = get_registry(request)
-    return UserCredentials(principal.user_id, registry, session_factory)
+    return UserCredentials(
+        principal.user_id,
+        registry,
+        session_factory,
+        limits=get_limits_config(),
+        tier=principal.tier,
+    )
 
 
 def get_latency(request: Request) -> LatencyTable:

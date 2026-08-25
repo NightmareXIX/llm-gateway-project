@@ -358,6 +358,7 @@ def test_meta_round_trips_through_jsonb() -> None:
         degraded=True,
         extraction_tier="llm",
         messages_dropped=42,
+        key_pool="private",
     )
     assert parse_meta(meta.to_jsonb()) == meta
 
@@ -382,6 +383,7 @@ def test_default_meta_round_trips_with_every_key_present() -> None:
         "degraded",
         "extraction_tier",
         "messages_dropped",
+        "key_pool",
     }
     assert parse_meta(stored) == MessageMeta()
 
@@ -410,6 +412,18 @@ def test_meta_rejects_a_wrongly_typed_value() -> None:
 def test_meta_rejects_an_unknown_extraction_tier() -> None:
     with pytest.raises(InvariantViolation, match="extraction_tier"):
         parse_meta({"extraction_tier": "psychic"})
+
+
+def test_meta_without_key_pool_reads_back_as_none() -> None:
+    """D42: a row written before Phase 6 Step 7 never named a pool — the
+    honest reading is 'nothing to disclose', not a guessed default."""
+    meta = parse_meta({"provider_used": "groq"})
+    assert meta.key_pool is None
+
+
+def test_meta_rejects_an_unknown_key_pool() -> None:
+    with pytest.raises(InvariantViolation, match="key_pool"):
+        parse_meta({"key_pool": "quantum"})
 
 
 def test_empty_meta_column_parses_to_defaults() -> None:

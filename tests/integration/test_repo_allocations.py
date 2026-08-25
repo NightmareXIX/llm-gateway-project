@@ -114,6 +114,34 @@ async def test_a_second_row_for_the_same_triple_is_refused(
             await db_session.flush()
 
 
+async def test_list_for_user_returns_every_allocation_row(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    """The resolver's batch load (D38): every row this user holds, regardless
+    of provider or model — not the single-triple lookup :func:`repo.get_cap`
+    is."""
+    user = await user_factory()
+    await _grant(db_session, user=user, provider="gemini", model="gemini-3.6-flash", daily_cap=50)
+    await _grant(db_session, user=user, provider="groq", model="openai/gpt-oss-120b", daily_cap=10)
+
+    rows = await repo.list_for_user(db_session, user.id)
+
+    assert {(row.provider, row.model, row.daily_cap) for row in rows} == {
+        ("gemini", "gemini-3.6-flash", 50),
+        ("groq", "openai/gpt-oss-120b", 10),
+    }
+
+
+async def test_list_for_user_does_not_read_another_users_allocation(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    owner = await user_factory()
+    other = await user_factory()
+    await _grant(db_session, user=owner, provider="gemini", model="gemini-3.6-flash", daily_cap=50)
+
+    assert await repo.list_for_user(db_session, other.id) == []
+
+
 async def test_a_non_positive_cap_is_refused(
     db_session: AsyncSession, user_factory: Callable[..., Any]
 ) -> None:

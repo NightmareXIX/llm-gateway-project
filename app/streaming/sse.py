@@ -199,6 +199,12 @@ class DoneEvent(BaseModel):
     """D32's streaming twin of :attr:`~app.schemas.chat.ChatCompletionResponse.warning`.
     ``None`` on a replayed cache hit — a replay never reruns pin resolution."""
 
+    key_pool: Literal["shared", "private"] | None = None
+    """D42's streaming twin of :attr:`~app.schemas.chat.ChatCompletionResponse.key_pool`
+    (Phase 6 Step 7). ``None`` on a replayed cache hit — nothing was spent
+    this turn — and only otherwise when every candidate was skipped on an
+    open breaker, the one case with no resolved credential to name."""
+
     status: Literal["ok", "failed"]
     partial_content: str | None = None
     """Set only when ``status == "failed"`` and the longest discarded buffer is

@@ -112,7 +112,7 @@ why — most of the phase's seven overview tasks were already mostly built by Ph
 `core/crypto.py`'s typed seams, `requests.quota_scope`, `/v1/models` auth); the real work is D36's
 per-candidate credential-and-scope resolver, which is what Steps 4–7 build.
 
-**Status: Steps 1–6 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
+**Status: Steps 1–7 of 10 committed.** `alembic/versions/0005_provider_keys.py` adds two tables per
 `phase6.md` §4 Step 1: `provider_keys` (§9.9's columns, `owner_type`/`owner_id` exactly as
 `project-overview.md` §6 specifies even though D37 means only `owner_type='user'` rows are ever written
 in v1 — the shared pool stays in `Settings`, not this table; a CHECK ties the two columns together, and
@@ -329,6 +329,84 @@ already paid for is replayed from tier 0 to the same user's next question even a
 no re-extraction under either pool, and the cache hit spends no quota under either scope). `make test` (1305
 passed, 1 skipped), `ruff check`, `ruff format --check`, and `mypy` are all green; both lanes resolve
 credentials per candidate, and `grep -rn "SYSTEM_SCOPE" app/perception app/deps.py` returns nothing.
+
+Step 7 (quota branching, `quota_scope`, and the disclosure) touches the files `phase6.md` names —
+`app/cache/keys.py`, `app/quota/allocations.py` (new), `app/quota/tracker.py`, `app/config.py`,
+`config/limits.yaml`, `app/usage/logger.py`, `app/memory/canonical.py`, `app/schemas/chat.py`,
+`app/streaming/sse.py`, `app/streaming/collector.py`, `app/api/v1/chat.py` — plus, once D39's cap turned
+out to be per (provider, model) rather than per provider, three files the step's own list doesn't name:
+`app/keys_resolution/resolver.py`, `app/routing/router.py`, and `app/quota/windows.py`. `db/repo/requests.py`
+needed nothing — `quota_scope` has taken a real argument since Phase 3 Step 1. `keys.user_allocation(user_id,
+provider, model)` builds `q:{user_id}:{provider}:{model}:alloc:rpd` — Contract C's second sign-off amendment
+after ADR-022, always keyed on the real user even though the shared path's own spending scope is
+`SYSTEM_SCOPE`. `app/quota/allocations.py` is the new module, `lanes.py`'s mirror image: one pure, *sync*
+function, `shared_pool_grants(spec, *, user_id, cap)`, building zero or one `WindowGrant` at that key — sync
+rather than the phase doc's sketched `async def`, since it does no I/O and `lanes.py`'s own pure helpers
+(`answer_share`, `perception_budget`) already set that precedent (an `async def` with no `await` is also a
+straight `ruff` RUF029 finding). It reuses the `"rpd"` window *label* rather than inventing a fifth
+`QuotaWindow`, the same trick `quota_perception_lane` already plays for D8's split; two grants sharing that
+label inside one reservation do share a hash field in `reserve.lua`'s bookkeeping hash, which the module's own
+docstring says is harmless here and why — `QuotaTracker.commit` never inspects a non-token-cost window's
+hash field, and `QuotaTracker.release` is never called on a router-built reservation in this codebase (only
+`quota/lanes.py`'s perception path calls it). `QuotaTracker.reserve` gained `extra_grants: tuple[WindowGrant,
+...] = ()`, appended to the grants it derives before the call to `reserve_windows` — Step 5's whole reason
+that method exists to be shared. `GatewayLimits` gained `shared_pool_daily_cap: int | None = None`, and
+`config/limits.yaml`'s `gateway:` block now carries real demo values (`free: 50`, `plus: 200`) rather than
+leaving the feature null out of the box.
+
+The cap turned out to need a fourth `ResetKind`: `rolling_daily` (`app/config.py`, `app/quota/windows.py`),
+because the personal cap is a policy of this gateway with no provider midnight to converge on — a day-wide
+TTL set once and never refreshed, the same non-refreshed treatment `rolling_60s` gets and for the same reason
+(D16 trap 1, scaled up). It stays out of `tracker.py`'s `_CONVERGING_RESETS` set by simply not being added to
+it. Finding this is what pulled `quota/windows.py` into the step's real file list.
+
+`app/keys_resolution/resolver.py` turned out to be Step 7's real center of gravity, not a signature ripple:
+`ResolvedKey` gained `shared_daily_cap: int | None = None` (resolved by the resolver alongside the key, per
+D39's "keeps the router free of database access" reasoning) and `user_id: UUID | None = None` (needed because
+the shared path's own `scope` reads `SYSTEM_SCOPE` and cannot itself name whose cap is being checked). Getting
+there required widening `ProviderCredentials.for_provider` from `for_provider(self, provider: str)` to
+`for_provider(self, provider: str, model: str)` — D39's cap is per (provider, model), a finer grain than D36's
+original per-provider question, and every implementation (`SystemCredentials`, `UserCredentials`) and call
+site (`router.py` ×2, `perception/extractors.py` ×1) had to move together. `UserCredentials` gained optional
+`limits: LimitsConfig | None = None` and `tier: str = "free"` — `None` (the default) means no cap is ever
+reported, the same "`None` keeps every existing caller honest" shape D36 already established, so nothing that
+predates this step needed editing beyond the `for_provider` call sites. `_load_once` now also batch-loads
+every `user_quota_allocations` row via a new `db/repo/allocations.py::list_for_user` (beyond the step's
+planned single `get_cap` function, added because a lazy per-candidate `get_cap` call would have cost a second
+round trip per shared candidate, contradicting D38's one-query promise) — in the same session as the
+provider-key load, so the cap costs nothing beyond the round trip Step 4 already pays for. A new module-level
+`quota_scope_for(pool, user_id) -> keys.Scope` reconstructs `requests.quota_scope` from a turn's `key_pool`
+(D42) plus the caller's own principal — a private attempt is always billed to *that* caller's own key, so
+`str(user_id)` is exactly what `ResolvedKey.scope` would have been — rather than threading a second raw scope
+field through `RouterOutcome`/`StreamResult` alongside the `key_pool` label Step 5 already added there.
+`router.py` gained one private helper, `_extra_grants(spec, resolved)`, called from both `quota.reserve(...)`
+sites and building the personal-cap grant only when `resolved.pool == "shared"` and a cap is present.
+
+`key_pool` (D42's eighth disclosure field) lands everywhere `extraction_tier` already does:
+`MessageMeta.key_pool`, `ChatCompletionResponse.key_pool`, `DoneEvent.key_pool`, wired on every path —
+non-streaming success and cache hit, non-streaming failure (both before and after a candidate was ever
+reached), streaming success (`Collector._persist_success`), streaming cache-hit replay, and streaming failure
+— `None` wherever nothing was spent, exactly as `extraction_tier` is. New tests:
+`tests/unit/test_quota_allocations.py` (the grant builder, empty and populated); two new `test_cache_keys.py`
+cases; `test_canonical.py` extended for `key_pool`'s round trip and its absent/unknown-value handling;
+`test_router.py`'s `ScriptedCredentials` updated to the new `for_provider` signature plus a new test proving a
+capped user is skipped on `blocked_window="rpd"` while a second, uncapped user is served off the same shared
+counter (needed a single-candidate `SOLO_CONFIG`, since the existing multi-candidate fixtures would have
+failed the request over instead of blocking it outright); `test_key_resolver.py` gained a `D39` section (the
+private path never carries a cap, the tier default applies with no override, an override row wins, no
+`limits` object means no cap, and the allocations load shares the provider-keys query) and a `D42` section for
+`quota_scope_for`; `test_repo_allocations.py` gained cases for `list_for_user`; `test_chat_endpoint.py` gained
+four end-to-end cases — shared and private disclosure on the wire and in `requests.quota_scope`, the
+definition of done's own exit criterion 4 (one conversation, a key added mid-thread, two different
+`quota_scope` values), and the personal-cap demo itself (one user's cap of 1 blocks their second message with
+no second real provider call, a different user on the same model is unaffected) — the last of which needed its
+own single-candidate `ProvidersConfig` because the committed config still spills a named `general` request
+into `fast`'s own Groq candidate (D10) under the shared `_groq_only()` fixture, which would have silently
+absorbed the block. Writing it also surfaced an unrelated test-authoring trap: `make_jwt`'s default `email` is
+the same literal for every call, so two different users authenticated in one test need distinct `email=`
+overrides or the second login 409s. `make test` (1326 passed, 1 skipped), `ruff check`, `ruff format --check`,
+and `mypy` are all green; `grep -n "scope=" app/routing/router.py` still shows only `resolved.scope` and
+`_reconcile_hint`'s pass-through, per Step 5's own invariant.
 
 ## Phase 5 — Memory & Cross-Provider Translation — complete
 

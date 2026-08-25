@@ -69,6 +69,21 @@ def test_the_perception_lane_is_a_sub_counter_not_a_separate_scope() -> None:
     assert built == "q:system:gemini:gemini-3.6-flash:lane:perception"
 
 
+def test_the_personal_allocation_key_names_the_real_user_not_the_scope() -> None:
+    """D39: this counter exists precisely for the shared path, where the
+    spending scope is ``"system"`` but the cap belongs to one user — so it is
+    always keyed on the user, never on :data:`keys.SYSTEM_SCOPE`."""
+    built = keys.user_allocation(USER_ID, "gemini", "gemini-3.6-flash")
+
+    assert built == f"q:{USER_ID}:gemini:gemini-3.6-flash:alloc:rpd"
+
+
+def test_the_personal_allocation_key_accepts_a_string_user_id_too() -> None:
+    built = keys.user_allocation(str(USER_ID), "groq", "openai/gpt-oss-120b")
+
+    assert built == f"q:{USER_ID}:groq:openai/gpt-oss-120b:alloc:rpd"
+
+
 def test_a_uuid_request_id_is_accepted_as_itself() -> None:
     """Request ids arrive as UUIDs in some call paths and strings in others.
     Requiring the caller to stringify is how one of them forgets."""
