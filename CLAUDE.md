@@ -112,7 +112,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Step 1 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–2 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -127,6 +127,58 @@ dependency of serving real traffic. The unit suite (955 passed, 1 skipped) is gr
 check`, `ruff format --check`, and `mypy`; the integration suite needs a local Postgres/Redis this
 sandbox doesn't have, but Step 1 touches no code path either depends on. `grep` confirms nothing outside
 `usage/pricing.py` and `config.py` imports the table, per the step's own "done when."
+
+Step 2 (D45, the aggregate reads) touches exactly the two files `phase7.md` names —
+`app/db/repo/requests.py` and `tests/integration/test_repo_requests.py` — with no new table, no
+migration and no index, since `ix_requests_user_id_created_at` already matches every predicate.
+Four functions and four frozen dataclasses land beside `create`/`list_for_user` in their own
+documented section: `volume_series` (`VolumePoint`), `provider_distribution` (`ProviderSlice`),
+`outcome_summary` (`OutcomeSummary`) and `pool_split` (`PoolSplit`). Every one groups in Postgres —
+nothing loads rows into Python to count them — is ownership-scoped in the SQL itself, takes its
+`now`/`since` from the caller rather than the clock, and returns UTC. Costing stays out: these return
+token counts and Step 3's handler turns them into money, so the repo module never grows a dependency
+on the price table. A fifth public helper, `window_span(window, now)`, is beyond the step's own list
+of four but exported deliberately — the API layer needs the same floored `since` the series starts
+at when it asks for the other three aggregates, and a summary computed over a different span than the
+chart above it is a dashboard that contradicts itself.
+
+Three details are where this step's real difficulty lives. **The buckets are generated, not
+discovered** (D45, trap 8): `generate_series` left-joined against the rows, so a quiet hour renders
+as a zero bar rather than vanishing from the series and letting the chart draw a smooth line through
+an outage. Getting that to compile needed `.table_valued("bucket_start").render_derived(name=
+"buckets")` rather than a plain `.alias()` — a bare alias names the relation without naming its
+column, and Postgres then cannot resolve `buckets.bucket_start` in the join. The interval is
+interpolated from a closed `_INTERVALS` dict rather than bound, because Postgres cannot infer a
+parameter's type inside `generate_series(timestamptz, timestamptz, ?)`; the keys are a closed
+`Literal` and the values are written in the module, so no caller string reaches it. **Trap 18 is
+handled one step early**: `STATUS_REPLAYED = "replayed"` is named here, before Step 6 writes it, and
+`_NON_ERROR_STATUSES = (STATUS_OK, STATUS_REPLAYED)` states the error predicate as a complement — so
+`total` partitions exactly into `ok + errors + replays`, a successful idempotent retry never inflates
+the error rate the day idempotency ships, and any status a later phase adds is a failure by default
+until somebody classifies it. **`multi_attempt` reads `jsonb_array_length(attempts)` and never looks
+inside an attempt object**, which is what makes it safe against trails written before Phase 6 Step 5
+added `key_pool` (trap 16) and against the `'[]'::jsonb` server default every Phase 1 row carries.
+`provider_distribution` excludes `provider IS NULL` (trap 6 — NULL is "never got that far", not a
+provider called "unknown") and `cache_hit = true` (trap 5 — the row names the candidate that
+*originally* answered, so counting it reports a call that never went out), while both rows still
+count in `volume_series` and `outcome_summary`, because a failure and a cache hit are both requests
+somebody made. `pool_split` keys on the `'system'` literal and never on a comparison with the
+caller's own id (D45's last row): a row written before Phase 6 Step 7 says `'system'` because the
+shared pool really did pay for it.
+
+Every aggregate test seeds rows through `repo.create` and then back-dates `created_at` with one
+`UPDATE`, because the column's `server_default=func.now()` inside a transaction is the *transaction's*
+start time — every row a test writes would otherwise share one timestamp and no bucketing assertion
+would mean anything. The back-dating stays test-only; `create` gains no `created_at` parameter, since
+production never wants to claim a request happened at a time it did not. 28 new cases cover the
+window flooring and point counts, the empty bucket, the NULL-provider and cache-hit exclusions, the
+replay counted on its own axis and nowhere else, `coalesce` turning an empty window into zeroes
+rather than `None`s, `substituted` and `multi_attempt` as genuinely different questions, and
+cross-user isolation on all four functions — including a second user's *private* rows, the most
+dangerous thing `pool_split` could leak since `quota_scope` literally carries their id. The full
+suite (1389 passed, 1 skipped — the local-OCR test that needs Tesseract) ran against a real
+Postgres and Redis this time, along with `ruff check`, `ruff format --check`, and `mypy`; `grep`
+confirms no SQL has appeared anywhere in `app/api/`, per the step's own "done when."
 
 ## Phase 6 — BYOK Settings — complete
 
