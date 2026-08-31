@@ -112,7 +112,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–2 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–3 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -179,6 +179,55 @@ dangerous thing `pool_split` could leak since `quota_scope` literally carries th
 suite (1389 passed, 1 skipped — the local-OCR test that needs Tesseract) ran against a real
 Postgres and Redis this time, along with `ruff check`, `ruff format --check`, and `mypy`; `grep`
 confirms no SQL has appeared anywhere in `app/api/`, per the step's own "done when."
+
+Step 3 (`app/api/admin.py` and its schemas) touches exactly the files `phase7.md` names —
+`app/api/admin.py` (new), `app/schemas/admin.py` (new), `app/main.py` — plus
+`tests/integration/test_admin_endpoints.py` (new) and one file the step's own list doesn't name,
+`app/usage/pricing.py` (why, below). `api/admin.py` mounts `/v1/admin`, tags `["admin"]`,
+`AUTHENTICATED_ERROR_RESPONSES`, and opens with D44's own paragraph: "admin" here means this
+account's own operational view, and there is no operator role in this system to widen one into.
+Three routes. `GET /usage` calls all four of Step 2's aggregates against one floored `since`
+(`requests_repo.window_span`) and turns `provider_distribution`'s token counts into money via
+`usage/pricing.py::simulated_cost` — exactly the layer Step 2's own docstring said would do this;
+`unpriced_requests` counts a slice's `requests` whenever its cost comes back `None`, never folding
+the gap into `total_cost` as zero (D46, trap 7). `pool_split` has no per-(provider, model) breakdown
+to cost directly, so its two sides get a *blended* rate instead — this window's `total_cost` divided
+by the priced tokens behind it, applied to each side's own token counts — documented on
+`PoolSplitOut` as a dashboard approximation rather than a ledger: exact only when every priced
+request in the window shares one per-token price, since a model's input and output tokens are priced
+differently in general and the blend does not preserve either side's own ratio between them; a side
+with real priced traffic elsewhere but zero tokens of its own still costs exactly `Decimal("0")`,
+not `None` — spent nothing, not unpriced, the same distinction `simulated_cost` itself draws.
+`GET /quota` takes no `PrincipalDep` of its own, the same way `list_models` doesn't (that function's
+own docstring says why: `CredentialsDep`'s dependency chain already requires the principal) — and
+rather than re-deriving `list_models`'s per-candidate computation, it calls that function directly
+with this request's own `RegistryDep`/`BreakerDep`/`QuotaDep`/`CredentialsDep`, so `/v1/admin/quota`
+and `/v1/models` answer the same question through the same code and cannot quietly disagree, per
+D44's own "no new disclosure" reasoning. `GET /requests` is `requests_repo.list_for_user` plus a
+mapping to a wire model, exactly as that function's own docstring says it exists for.
+
+Costing the usage route surfaced a real gap in Step 1's own boundary: nothing besides
+`usage/pricing.py` and `config.py` may read `get_pricing_config()` directly (that step's own "done
+when"), but `/v1/admin/usage` needs a currency to report alongside its total and `PricingConfig` has
+no top-level currency field to read without opening a `PricingEntry`. Fixed by adding one function to
+`usage/pricing.py` rather than reaching around the rule — `default_currency()`, scanning the table
+for its assumed-uniform currency and returning `None` for an equally fictional empty table — the one
+addition Step 3 makes to a file `phase7.md` doesn't list for it, and it keeps the invariant rather
+than breaking it.
+
+New tests (`tests/integration/test_admin_endpoints.py`): each route 401s unauthenticated; `/usage`
+and `/requests` are scoped to the caller with a second user's rows seeded alongside; `window`
+validates; an unpriced model surfaces in `unpriced_requests` and is excluded from `total_cost`, and a
+window with nothing priced at all reports `total_cost`/`currency` as `None` rather than zero; the
+pool-split blended rate is checked exactly against a hand-picked case where every priced request uses
+only one token direction, isolating the arithmetic from the approximation; `/quota` is checked
+byte-for-byte against `/v1/models` for the same caller (modulo each response's own live `resets_at`,
+which two separate requests a few milliseconds apart are expected to disagree on) and reproduces
+`test_models_endpoint.py`'s two-account shape — a private Gemini key holder's `/quota` reads their
+own counters while the shared pool's exhaustion marks the same candidate `rate_limited` for everyone
+else. `make test` (1401 passed, 1 skipped), `ruff check`, `ruff format --check`, and `mypy` are all
+green; every route in the module scopes its one query (or its `CredentialsDep` chain) to the calling
+principal, per the step's own "done when."
 
 ## Phase 6 — BYOK Settings — complete
 

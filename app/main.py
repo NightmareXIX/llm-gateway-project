@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api import admin as admin_routes
 from app.api import auth as auth_routes
 from app.api import keys as keys_routes
 from app.api.v1 import chat as chat_routes
@@ -184,6 +185,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations_routes.router)
     app.include_router(files_routes.router)
     app.include_router(models_routes.router)
+    app.include_router(admin_routes.router)
 
     @app.get("/healthz", tags=["health"])
     async def healthz() -> dict[str, str]:
