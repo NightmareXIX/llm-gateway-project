@@ -8,12 +8,13 @@ database without inheriting a connection pool from the production configuration.
 from __future__ import annotations
 
 import asyncio
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import text
 
 from app.api import admin as admin_routes
@@ -24,6 +25,7 @@ from app.api.v1 import conversations as conversations_routes
 from app.api.v1 import files as files_routes
 from app.api.v1 import models as models_routes
 from app.auth.jwt import JwksCache
+from app.cache import keys
 from app.cache.client import LuaScriptRegistry, create_redis_client, probe, redacted_target
 from app.config import Settings, get_settings, validate_startup_config
 from app.core.errors import error_response, register_exception_handlers
@@ -33,10 +35,12 @@ from app.core.logging import (
     get_logger,
 )
 from app.db.session import create_db_engine, create_session_factory
+from app.deps import get_breaker, get_metrics, get_quota, get_registry
 from app.perception.storage import build_store
 from app.providers.registry import build_registry
 from app.schemas.errors import DEFAULT_ERROR_RESPONSES, ErrorResponse
-from app.usage.metrics import LatencyTable
+from app.usage import metrics as usage_metrics
+from app.usage.metrics import LatencyTable, MetricsRegistry
 
 logger = get_logger("app.main")
 
@@ -51,6 +55,24 @@ Two reasons it is not folded into the block above. It cannot *fail* the probe
 dependency cause a 503 by starvation alone. And a `PING` is the cheapest command
 Redis has: one second is already generous, and anything slower is a server that
 is not answering rather than one that is busy."""
+
+PROMETHEUS_MEDIA_TYPE = "text/plain; version=0.0.4"
+"""What a Prometheus scrape expects. The version is part of the content type,
+not decoration: a scraper uses it to pick a parser."""
+
+
+def _metrics_token_ok(request: Request, expected: str) -> bool:
+    """``Authorization: Bearer <token>``, compared in constant time.
+
+    ``compare_digest`` rather than ``==`` for the usual reason, and because the
+    alternative here is a comparison whose timing is observable by anyone who
+    can reach the endpoint — which, on Render, is everyone."""
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return False
+    return secrets.compare_digest(token, expected)
+
 
 HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 """Defaults for the shared outbound client.
@@ -118,6 +140,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # rather than arbitrary.
     app.state.latency = LatencyTable()
 
+    # Beside the latency table and for the same reason (ADR-014): counters that
+    # only mean anything because they accumulate across requests, kept per
+    # process rather than in Redis because sharing them is a Contract C
+    # amendment and that needs sign-off, not a polish phase (D49).
+    app.state.metrics = MetricsRegistry()
+
     logger.info(
         "startup.complete",
         require_verified_email=settings.REQUIRE_VERIFIED_EMAIL,
@@ -144,6 +172,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         perception_enabled=settings.PERCEPTION_ENABLED,
         perception_local_only=settings.PERCEPTION_LOCAL_ONLY,
         perception_local_ocr_enabled=settings.PERCEPTION_LOCAL_OCR_ENABLED,
+        # D49: whether this instance is scrapeable at all, and whether the
+        # scrape needs a token. Both are invisible until a scrape 404s or 401s.
+        metrics_enabled=settings.METRICS_ENABLED,
+        metrics_token_required=settings.METRICS_TOKEN is not None,
     )
     try:
         yield
@@ -261,6 +293,112 @@ def create_app() -> FastAPI:
                 "redis": "ok" if redis_ok else "unavailable",
             },
         )
+
+    @app.get(
+        "/metrics",
+        tags=["health"],
+        responses={
+            401: {"model": ErrorResponse, "description": "A metrics token is required."},
+            404: {"description": "Metrics are disabled on this instance."},
+        },
+    )
+    async def metrics(request: Request) -> Response:
+        """D49: five metric families in Prometheus text format 0.0.4.
+
+        Hand-rolled (``usage/metrics.py``), for the reason
+        ``project-overview.md`` §11 gives about the circuit breaker and this
+        endpoint inherits: an exposition format that is a hundred lines of
+        string building does not justify a runtime dependency.
+
+        **Disabled is 404, not 403.** An endpoint that is switched off should
+        not advertise that it exists, and a scraper reading 403 would keep
+        retrying a thing that is never coming back.
+
+        **The counters are this worker's, the gauges are everyone's.** Render
+        runs two workers, so ``gateway_requests_total`` is a *sample* rather
+        than a total (``docs/limitations.md`` says so out loud). The two gauges
+        are read live from Redis at scrape time and are therefore correct on
+        whichever worker answers — and when Redis does *not* answer they are
+        omitted entirely, counters and all still 200: a metrics endpoint that
+        500s during an incident is useless exactly when it is needed.
+        """
+        settings = get_settings()
+        if not settings.METRICS_ENABLED:
+            return error_response(
+                request,
+                status_code=404,
+                code="not_found",
+                message="Not found.",
+            )
+
+        expected = settings.METRICS_TOKEN
+        if expected is not None and not _metrics_token_ok(request, expected.get_secret_value()):
+            return error_response(
+                request,
+                status_code=401,
+                code="unauthorized",
+                message="A valid metrics token is required.",
+            )
+
+        registry = get_registry(request)
+        breaker = get_breaker(request)
+        quota = get_quota(request)
+
+        breaker_gauges: list[usage_metrics.BreakerGauge] = []
+        quota_gauges: list[usage_metrics.QuotaGauge] = []
+        # Every slot the registry knows, internal ones included: `perception`
+        # spends a real budget against a real provider (D8/D26), so leaving it
+        # out would make the quota gauge disagree with the counters that ran it.
+        seen: set[tuple[str, str]] = set()
+        for slot in registry.describe():
+            for spec in registry.candidates(slot):
+                if spec.key in seen:
+                    continue
+                seen.add(spec.key)
+                try:
+                    decision = await breaker.peek(spec.provider, spec.model)
+                    # A fail-open decision is a guess, not a reading — reporting
+                    # it as `closed` would draw a healthy line through an outage
+                    # of the thing doing the measuring.
+                    if not decision.degraded:
+                        breaker_gauges.append(
+                            usage_metrics.BreakerGauge(
+                                provider=spec.provider,
+                                model=spec.model,
+                                state=decision.state,
+                            )
+                        )
+                    if quota is not None:
+                        for window in await quota.remaining(spec, scope=keys.SYSTEM_SCOPE):
+                            quota_gauges.append(
+                                usage_metrics.QuotaGauge(
+                                    provider=spec.provider,
+                                    model=spec.model,
+                                    window=window.window,
+                                    remaining=max(window.limit - window.used, 0),
+                                )
+                            )
+                except Exception as exc:  # pragma: no cover - defensive
+                    # `peek` and `remaining` are already fail-soft, so reaching
+                    # here means something further out broke. Drop the gauges
+                    # and still serve the counters.
+                    logger.warning(
+                        "metrics.gauges_unavailable",
+                        provider=spec.provider,
+                        model=spec.model,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
+                    breaker_gauges.clear()
+                    quota_gauges.clear()
+                    break
+
+        body = usage_metrics.render_exposition(
+            get_metrics(request),
+            breakers=breaker_gauges,
+            quota=quota_gauges,
+        )
+        return PlainTextResponse(body, media_type=PROMETHEUS_MEDIA_TYPE)
 
     return app
 

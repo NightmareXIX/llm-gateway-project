@@ -46,6 +46,7 @@ from app.cache import keys
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.logging import get_logger, get_request_id
 from app.providers.errors import ProviderError, RateLimited
+from app.usage.metrics import MetricsRegistry
 
 logger = get_logger("app.routing.circuit_breaker")
 
@@ -142,9 +143,15 @@ class CircuitBreaker:
         cooldown_initial_s: float = COOLDOWN_INITIAL_S,
         cooldown_max_s: float = COOLDOWN_MAX_S,
         cooldown_factor: float = COOLDOWN_FACTOR,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._redis = redis
         self._clock = clock
+        self._metrics = metrics
+        """Phase 7 Step 4 (D49): where the fail-open counter ADR-010 asked for
+        finally lands. Optional and defaulting to ``None`` — the same
+        ``None``-keeps-every-existing-caller-honest shape D36 established — so a
+        breaker built by hand in a test counts nothing and needs no edit."""
         self._failure_threshold = failure_threshold
         self._cooldown_initial_s = cooldown_initial_s
         self._cooldown_max_s = cooldown_max_s
@@ -480,9 +487,12 @@ class CircuitBreaker:
 
         Warning rather than debug, per ADR-010: everything Redis does here is an
         optimization, so a permanently-down Redis produces no user-visible symptom
-        and this log line is the only place it appears. The in-process counter the
-        ADR also asks for belongs in ``usage/metrics.py``, which Step 4 creates.
+        and the log line was, for five phases, the only place it appeared. Phase 7
+        Step 4 (D49) gave it a second: ``gateway_breaker_fail_open_total``, which
+        is what makes "how long has the breaker been guessing?" answerable from a
+        graph rather than from log aggregation.
         """
+        self._count_fail_open(provider, model)
         logger.warning(
             "breaker.fail_open",
             provider=provider,
@@ -506,6 +516,7 @@ class CircuitBreaker:
         only casualty is the breaker's memory of it, which is precisely the thing
         ADR-010 says we are willing to lose.
         """
+        self._count_fail_open(decision.provider, decision.model)
         logger.warning(
             "breaker.fail_open",
             provider=decision.provider,
@@ -514,6 +525,11 @@ class CircuitBreaker:
             error=str(exc),
             error_type=type(exc).__name__,
         )
+
+    def _count_fail_open(self, provider: str, model: str) -> None:
+        """One place, so the two log sites cannot drift from the one counter."""
+        if self._metrics is not None:
+            self._metrics.record_breaker_fail_open(provider, model)
 
 
 # --------------------------------------------------------------------------- #

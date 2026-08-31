@@ -17,6 +17,14 @@ is how ``status`` ends up spelled two ways and how the field Phase 7's dashboard
 needs turns out to be populated on two of the three. The repo owns the INSERT;
 this owns what goes in it.
 
+**And, since Phase 7 Step 4, the one place a metric is counted** (D49). These
+functions are already the single funnel every terminal outcome passes through,
+which is exactly the property ``gateway_requests_total`` needs: a counter
+incremented at three call sites is a counter that will be wrong within two
+phases. ``metrics`` arrives optional and defaulting to ``None`` — the same
+``None``-keeps-every-existing-caller-honest shape D36 established — so every
+call site that predates the endpoint keeps working and simply counts nothing.
+
 **The log line is not optional decoration.** ``requests`` answers "what happened
 across the fleet today"; the log line answers "what happened to *this* call", with
 ``request_id`` and ``user_id`` already bound as contextvars. The two are read at
@@ -37,6 +45,7 @@ from app.db.repo import requests as requests_repo
 from app.providers.errors import ProviderError
 from app.providers.types import ModelSpec, Usage
 from app.routing.router import AttemptRecord
+from app.usage.metrics import COMPLETE, STREAM, MetricsRegistry, RoutingMode
 
 logger = get_logger("app.usage")
 
@@ -55,6 +64,9 @@ async def record_success(
     substituted: bool = False,
     wasted_tokens_out: int = 0,
     quota_scope: str = "system",
+    metrics: MetricsRegistry | None = None,
+    key_pool: str | None = None,
+    mode: RoutingMode = COMPLETE,
 ) -> Request:
     """Record a turn that produced an answer.
 
@@ -77,6 +89,15 @@ async def record_success(
     label plus the caller's own principal is exactly what
     :class:`~app.keys_resolution.resolver.ResolvedKey.scope` would have been.
     """
+    _count(
+        metrics,
+        provider=spec.provider,
+        model=spec.model,
+        status=requests_repo.STATUS_OK,
+        key_pool=key_pool,
+        mode=mode,
+        latency_ms=latency_ms,
+    )
     row = await requests_repo.create(
         session,
         user_id=principal.user_id,
@@ -132,6 +153,9 @@ async def record_failure(
     attempts: Sequence[AttemptRecord] = (),
     substituted: bool = False,
     quota_scope: str = "system",
+    metrics: MetricsRegistry | None = None,
+    key_pool: str | None = None,
+    mode: RoutingMode = COMPLETE,
 ) -> Request:
     """Record a turn that ended in a normalized provider failure.
 
@@ -151,6 +175,15 @@ async def record_failure(
     rather than the one requested. ``"system"`` when every candidate was
     skipped on an open breaker and nothing ever resolved a credential.
     """
+    _count(
+        metrics,
+        provider=error.provider,
+        model=error.model,
+        status=requests_repo.STATUS_ERROR,
+        key_pool=key_pool,
+        mode=mode,
+        latency_ms=latency_ms,
+    )
     row = await requests_repo.create(
         session,
         user_id=principal.user_id,
@@ -207,6 +240,7 @@ async def record_cache_hit(
     conversation_id: UUID | None = None,
     substituted: bool = False,
     quota_scope: str = "system",
+    metrics: MetricsRegistry | None = None,
 ) -> Request:
     """Record a turn served entirely from D19's exact-match cache.
 
@@ -225,6 +259,18 @@ async def record_cache_hit(
     — passed explicitly rather than left to the default so a reader does not
     have to wonder whether this call site simply forgot the parameter.
     """
+    # Counted, but deliberately *not* timed (D49): a replay's latency is a
+    # property of Redis, and folding it into a provider's histogram would drag
+    # that distribution toward zero in proportion to how well the cache is
+    # working. `key_pool` is absent for the same reason `quota_scope` is
+    # `"system"` here — a hit spends no credential at all.
+    if metrics is not None:
+        metrics.record_request(
+            provider=provider,
+            model=model,
+            status=requests_repo.STATUS_OK,
+            key_pool=None,
+        )
     row = await requests_repo.create(
         session,
         user_id=principal.user_id,
@@ -271,6 +317,8 @@ async def record_stream_failure(
     substituted: bool = False,
     wasted_tokens_out: int = 0,
     quota_scope: str = "system",
+    metrics: MetricsRegistry | None = None,
+    key_pool: str | None = None,
 ) -> Request:
     """Record a streamed turn that failed *in-band*, after the 200 committed.
 
@@ -288,6 +336,18 @@ async def record_stream_failure(
     request-scoped session calls :func:`record_failure` for it exactly as the
     non-streaming path always has.
     """
+    # No `mode` parameter, unlike the three above: this function exists only
+    # because a streamed failure is shaped differently from every other one, so
+    # its mode is never anything but `stream`.
+    _count(
+        metrics,
+        provider=spec.provider if spec is not None else None,
+        model=spec.model if spec is not None else None,
+        status=requests_repo.STATUS_ERROR,
+        key_pool=key_pool,
+        mode=STREAM,
+        latency_ms=latency_ms,
+    )
     row = await requests_repo.create(
         session,
         user_id=principal.user_id,
@@ -321,3 +381,29 @@ async def record_stream_failure(
         quota_scope=quota_scope,
     )
     return row
+
+
+def _count(
+    metrics: MetricsRegistry | None,
+    *,
+    provider: str | None,
+    model: str | None,
+    status: str,
+    key_pool: str | None,
+    mode: RoutingMode,
+    latency_ms: int,
+) -> None:
+    """One outcome, counted and timed (D49). A no-op without a registry.
+
+    Shared by the three functions that record a turn a provider actually
+    attempted, so ``gateway_requests_total`` and ``gateway_request_duration_ms``
+    can never come to disagree about how many requests there were. The cache-hit
+    path deliberately does not come through here — it counts, and does not time.
+    ``status`` is passed through from ``requests_repo``'s own constants rather
+    than spelled again, so the metric's vocabulary and the column's stay one
+    vocabulary.
+    """
+    if metrics is None:
+        return
+    metrics.record_request(provider=provider, model=model, status=status, key_pool=key_pool)
+    metrics.observe_duration(provider=provider, mode=mode, ms=float(latency_ms))

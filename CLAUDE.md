@@ -112,7 +112,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–3 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–4 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -228,6 +228,51 @@ own counters while the shared pool's exhaustion marks the same candidate `rate_l
 else. `make test` (1401 passed, 1 skipped), `ruff check`, `ruff format --check`, and `mypy` are all
 green; every route in the module scopes its one query (or its `CredentialsDep` chain) to the calling
 principal, per the step's own "done when."
+
+Step 4 (D49, `GET /metrics`) touches the files `phase7.md` names — `app/usage/metrics.py`,
+`app/usage/logger.py`, `app/config.py`, `app/main.py`, `.env.example`, `tests/unit/test_metrics.py`,
+`tests/integration/test_metrics_endpoint.py` (new) — plus five the step's list does not name, each for
+a reason the step's own design forces: `app/routing/circuit_breaker.py` (the fail-open counter has to
+be incremented where the fail-open *happens*), `app/deps.py` (`get_metrics`/`MetricsDep`), and
+`app/api/v1/chat.py`, `app/streaming/collector.py` and `tests/conftest.py` (the call sites that hand
+the registry to the facades, and the test app that owns one). `usage/metrics.py` gains
+`MetricsRegistry` and `render_exposition` beside `LatencyTable` — same file, because it is the same
+kind of number and the same ADR-014 argument, not a new one. Five families, not D49's four: the
+breaker's fail-open counter that module's docstring has promised since Phase 2 is the fifth, and
+`CircuitBreaker` now takes an optional `metrics=` whose two log sites funnel through one private
+`_count_fail_open` so they cannot drift from the counter.
+
+Three details carry the step. **The counters live in `usage/logger.py`'s facades and nowhere else** —
+they are already the one funnel every terminal outcome passes through, and a counter incremented at
+three call sites is a counter that will be wrong within two phases; `metrics` arrives there optional
+and defaulting to `None`, the same shape D36 established, so no pre-existing call site needed
+editing. That funnel is also what supplies the labels honestly: `key_pool` (D42) is threaded from the
+same `outcome.key_pool`/`failure.key_pool`/`result.key_pool` the wire already discloses, and
+`quota_scope` deliberately is **not** a label — it carries a real `user_id` on a private turn, which
+is the exact thing trap 10 forbids. **A cache hit counts but is not timed**: a replay's latency is a
+property of Redis, and folding it into a provider's histogram would drag that distribution toward
+zero in proportion to how well the cache is working. **The histogram stores its buckets
+non-cumulatively and accumulates only at render time**, so a non-monotonic bucket series — the one
+hand-rolled-exporter bug that parses fine and charts wrong — is unrepresentable rather than merely
+untested. Gauges are read live per candidate at scrape time over `registry.describe()`, internal
+`perception` included (it spends a real budget, so omitting it would make the gauge disagree with the
+counters), and a `degraded` breaker decision renders no sample at all rather than a flattering
+`closed`.
+
+`METRICS_ENABLED`/`METRICS_TOKEN` land in `config.py` and `.env.example`; disabled is 404 rather than
+403 (an endpoint that is off should not advertise itself), a set token is compared with
+`secrets.compare_digest`, and any Redis failure drops both gauge families — HELP and TYPE included —
+while still returning 200 with the counters. 15 new unit cases cover the exposition itself (every
+family's `# TYPE`, the cumulative histogram whose `+Inf` bucket equals `_count`, quote/backslash
+escaping, the `unknown`/`none` labels, sorted-and-therefore-byte-stable output, the fail-open counter
+with and without a registry) including the privacy rule asserted rather than written down — no label
+value anywhere matches a UUID. 9 integration cases cover the access rules, a real chat turn moving
+the counter under `key_pool="shared"`, a streamed turn landing in the `stream` series and not the
+`complete` one, and a dead Redis still serving counters. `make test` (1425 passed, 1 skipped), `ruff
+check`, `ruff format --check` and `mypy` are green, and the rendered body was read by eye against the
+format `promtool check metrics` wants, per the step's own "done when." `docs/limitations.md`'s
+two-workers-means-a-sample caveat and `docs/deploy.md`'s two new variables are Step 12's, which owns
+this phase's documentation.
 
 ## Phase 6 — BYOK Settings — complete
 

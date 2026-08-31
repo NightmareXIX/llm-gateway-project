@@ -83,7 +83,7 @@ from app.deps import get_session, get_session_factory
 from app.main import create_app
 from app.perception.storage import build_store
 from app.providers.registry import build_registry
-from app.usage.metrics import LatencyTable
+from app.usage.metrics import LatencyTable, MetricsRegistry
 
 TEST_DATABASE_NAME = "gateway_test"
 TEST_KID = "test-signing-key-1"
@@ -443,6 +443,11 @@ async def app(
     # reorder the candidate chain in another — an ordering bug that appears only
     # when the suite runs in a particular order.
     application.state.latency = LatencyTable()
+
+    # And a fresh counter registry, for the same reason: `/metrics` is
+    # process-local and cumulative, so one shared across tests would make every
+    # assertion on a count depend on which tests ran before it.
+    application.state.metrics = MetricsRegistry()
 
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield db_session

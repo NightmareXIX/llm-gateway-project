@@ -53,6 +53,7 @@ from app.deps import (
     BreakerDep,
     ExactCacheDep,
     LatencyDep,
+    MetricsDep,
     QuotaDep,
     RedisDep,
     RegistryDep,
@@ -96,7 +97,7 @@ from app.streaming import sse
 from app.streaming.collector import Collector
 from app.streaming.orchestrator import stream_cached_completion, stream_completion
 from app.usage import logger as usage_logger
-from app.usage.metrics import LatencyTable
+from app.usage.metrics import STREAM, LatencyTable, MetricsRegistry
 
 logger = get_logger("app.api.chat")
 
@@ -169,6 +170,7 @@ async def create_chat_completion(
     registry: RegistryDep,
     breaker: BreakerDep,
     latency: LatencyDep,
+    metrics: MetricsDep,
     redis: RedisDep,
     quota: QuotaDep,
     cache: ExactCacheDep,
@@ -255,6 +257,7 @@ async def create_chat_completion(
             registry=registry,
             breaker=breaker,
             latency=latency,
+            metrics=metrics,
             redis=redis,
             quota=quota,
             cache=cache,
@@ -292,6 +295,7 @@ async def create_chat_completion(
                 pinned_model=conversation.pinned_model,
                 cached=cached,
                 started=started,
+                metrics=metrics,
             )
         x_cache = exact.MISS
 
@@ -334,6 +338,8 @@ async def create_chat_completion(
             conversation_id=conversation_id,
             attempts=failure.trail,
             quota_scope=quota_scope_for(failure.key_pool, principal.user_id),
+            metrics=metrics,
+            key_pool=failure.key_pool,
         )
         await session.commit()
         # Substitutes a message written for our caller; the provider's own prose
@@ -415,6 +421,8 @@ async def create_chat_completion(
         attempts=outcome.trail,
         substituted=substituted,
         quota_scope=quota_scope_for(outcome.key_pool, principal.user_id),
+        metrics=metrics,
+        key_pool=outcome.key_pool,
     )
     await session.commit()
 
@@ -479,6 +487,7 @@ async def _serve_cache_hit(
     pinned_model: str | None,
     cached: exact.CachedResponse,
     started: float,
+    metrics: MetricsRegistry,
 ) -> ChatCompletionResponse:
     """A hit still writes a message row and a ``requests`` row (D19) — the user
     sees an answer, refreshes, and the turn is still there. ``served_by`` names
@@ -523,6 +532,7 @@ async def _serve_cache_hit(
         conversation_id=conversation_id,
         substituted=substituted,
         quota_scope="system",
+        metrics=metrics,
     )
     await session.commit()
 
@@ -567,6 +577,7 @@ async def _stream_chat_completion(
     registry: ProviderRegistry,
     breaker: CircuitBreaker,
     latency: LatencyTable,
+    metrics: MetricsRegistry,
     redis: Redis,
     quota: QuotaTracker | None,
     cache: exact.ExactCache | None,
@@ -624,7 +635,7 @@ async def _stream_chat_completion(
                     conversation_id=conversation.id,
                     message_id=message_id,
                     latency_ms=_elapsed_ms(started),
-                    persistence=Collector(session_factory, principal=principal),
+                    persistence=Collector(session_factory, principal=principal, metrics=metrics),
                 ),
                 media_type=sse.SSE_MEDIA_TYPE,
                 headers=headers,
@@ -654,7 +665,11 @@ async def _stream_chat_completion(
         credentials=credentials,
         redis=redis,
         persistence=Collector(
-            session_factory, principal=principal, cache=cache, cache_key=cache_key
+            session_factory,
+            principal=principal,
+            cache=cache,
+            cache_key=cache_key,
+            metrics=metrics,
         ),
         is_disconnected=partial(sse.client_disconnected, request),
     ).__aiter__()
@@ -675,6 +690,13 @@ async def _stream_chat_completion(
             conversation_id=conversation.id,
             attempts=failure.trail,
             quota_scope=quota_scope_for(failure.key_pool, principal.user_id),
+            metrics=metrics,
+            key_pool=failure.key_pool,
+            # A pre-first-byte exhaustion is recorded through the non-streaming
+            # facade (nothing streaming-shaped has happened yet), so the mode
+            # this turn's latency belongs to has to be said explicitly — the
+            # default would file a stream's failure under `complete`.
+            mode=STREAM,
         )
         await session.commit()
         raise to_app_error(failure.error) from failure

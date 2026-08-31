@@ -47,6 +47,7 @@ from app.keys_resolution.resolver import quota_scope_for
 from app.memory.canonical import MessageMeta, text_block
 from app.streaming.orchestrator import StreamResult
 from app.usage import logger as usage_logger
+from app.usage.metrics import STREAM, MetricsRegistry
 
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 """What ``app.state.db_session_factory`` (an ``async_sessionmaker``) satisfies
@@ -73,9 +74,11 @@ class Collector:
         principal: Principal,
         cache: ExactCache | None = None,
         cache_key: str | None = None,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._principal = principal
+        self._metrics = metrics
         self._cache = cache
         self._cache_key = cache_key
         """D19's write side, threaded in rather than recomputed: ``cache_key`` is
@@ -142,6 +145,12 @@ class Collector:
             substituted=result.substituted,
             wasted_tokens_out=result.wasted_tokens_out,
             quota_scope=quota_scope_for(result.key_pool, self._principal.user_id),
+            metrics=self._metrics,
+            key_pool=result.key_pool,
+            # Every turn this class records is a streamed one, so the mode is
+            # never in question here the way it is at the endpoint, which serves
+            # both.
+            mode=STREAM,
         )
 
         # D5/D19's streaming write, exactly where this docstring promised it
@@ -225,6 +234,7 @@ class Collector:
                 conversation_id=conversation_id,
                 substituted=substituted,
                 quota_scope="system",
+                metrics=self._metrics,
             )
             await session.commit()
 
@@ -251,6 +261,8 @@ class Collector:
             substituted=result.substituted,
             wasted_tokens_out=result.wasted_tokens_out,
             quota_scope=quota_scope_for(result.key_pool, self._principal.user_id),
+            metrics=self._metrics,
+            key_pool=result.key_pool,
         )
 
 

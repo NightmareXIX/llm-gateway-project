@@ -161,6 +161,24 @@ class Settings(BaseSettings):
     enthusiastic caller draining a shared free-tier pool for everyone else — this
     switch exists for load-testing the gateway itself, not for production use."""
 
+    METRICS_ENABLED: bool = True
+    """D49: expose ``GET /metrics`` in Prometheus text format.
+
+    On by default — a gateway whose whole story is quota and failover is a
+    gateway whose numbers should be scrapeable. Off, the route returns **404**
+    rather than 403: an endpoint that is switched off should not advertise that
+    it exists."""
+
+    METRICS_TOKEN: SecretStr | None = None
+    """Bearer token ``GET /metrics`` requires, or ``None`` for an open endpoint.
+
+    ``None`` is fine on a laptop and is *not* fine on Render, where there is no
+    private network to put a scrape target on — ``docs/deploy.md`` says so at the
+    point somebody is deploying. The endpoint carries no ``user_id``, email or
+    conversation id in any label (D49), so the exposure this guards is
+    operational shape rather than user data; that is a reason to keep the token
+    cheap to set, not a reason to skip it."""
+
     FILES_STORAGE_BACKEND: Literal["supabase", "local", "memory"] = "supabase"
     """D23: which :class:`~app.perception.storage.ObjectStore` implementation
     backs ``POST /v1/files``. ``supabase`` in every deployed environment;

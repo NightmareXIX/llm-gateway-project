@@ -34,7 +34,7 @@ from app.providers.registry import ProviderRegistry
 from app.quota.tracker import QuotaTracker
 from app.quota.windows import sliding_count
 from app.routing.circuit_breaker import CircuitBreaker
-from app.usage.metrics import LatencyTable
+from app.usage.metrics import LatencyTable, MetricsRegistry
 
 logger = get_logger("app.deps")
 
@@ -127,8 +127,14 @@ def get_breaker(request: Request) -> CircuitBreaker:
     would suggest there is something to share in-process, which is exactly the
     misunderstanding the Redis-backed design exists to prevent. Constructing one
     is three attribute assignments.
+
+    It is handed the process-wide :class:`~app.usage.metrics.MetricsRegistry`
+    (Phase 7 Step 4) for one reason: a breaker decision made *without* Redis is
+    otherwise invisible — the request still succeeds — so
+    ``gateway_breaker_fail_open_total`` is the only number that says the breaker
+    has been guessing.
     """
-    return CircuitBreaker(get_redis(request))
+    return CircuitBreaker(get_redis(request), metrics=get_metrics(request))
 
 
 def get_quota(request: Request) -> QuotaTracker | None:
@@ -293,6 +299,20 @@ def get_latency(request: Request) -> LatencyTable:
     """
     table: LatencyTable = request.app.state.latency
     return table
+
+
+def get_metrics(request: Request) -> MetricsRegistry:
+    """The process-wide counters ``GET /metrics`` renders (D49).
+
+    Per *process*, created in the lifespan beside the latency table and for the
+    same reason (ADR-014): its whole value is that it accumulates across
+    requests, and sharing it across workers would need new Contract C keys —
+    a change with sign-off, not a side effect of a polish phase. A scrape
+    therefore reads one worker's sample, which ``docs/limitations.md`` says out
+    loud rather than papering over.
+    """
+    registry: MetricsRegistry = request.app.state.metrics
+    return registry
 
 
 # --------------------------------------------------------------------------- #
@@ -591,3 +611,4 @@ QuotaDep = Annotated[QuotaTracker | None, Depends(get_quota)]
 ExactCacheDep = Annotated[ExactCache | None, Depends(get_exact_cache)]
 RateLimiterDep = Annotated[RateLimiter | None, Depends(get_rate_limiter)]
 LatencyDep = Annotated[LatencyTable, Depends(get_latency)]
+MetricsDep = Annotated[MetricsRegistry, Depends(get_metrics)]
