@@ -28,6 +28,7 @@ test here can leave a poisoned table behind for another.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -41,10 +42,13 @@ from app.config import (
     ConfigError,
     GatewayLimits,
     LimitsConfig,
+    PricingConfig,
     ProvidersConfig,
     Settings,
     _load_yaml_model,
+    _warn_unpriced_models,
     get_limits_config,
+    get_pricing_config,
     get_providers_config,
     get_settings,
     validate_startup_config,
@@ -701,6 +705,119 @@ def test_limits_config_without_a_gateway_block_fails_to_load(tmp_path: Path) -> 
 
     with pytest.raises(ConfigError):
         _load_yaml_model(LimitsConfig, _write(tmp_path, document, "limits.yaml"))
+
+
+# --------------------------------------------------------------------------- #
+# config/pricing.yaml
+# --------------------------------------------------------------------------- #
+PRICING_DOCUMENT: dict[str, Any] = {
+    "version": 1,
+    "pricing": {
+        "groq": {
+            "openai/gpt-oss-120b": {
+                "input_per_mtok": "0.15",
+                "output_per_mtok": "0.75",
+                "currency": "usd",
+            }
+        },
+        "gemini": {},
+    },
+}
+
+
+def test_pricing_entries_carry_dollars_per_million_tokens(tmp_path: Path) -> None:
+    config = _load_yaml_model(PricingConfig, _write(tmp_path, PRICING_DOCUMENT, "pricing.yaml"))
+
+    entry = config.for_model("groq", "openai/gpt-oss-120b")
+    assert entry is not None
+    assert entry.input_per_mtok == Decimal("0.15")
+    assert entry.output_per_mtok == Decimal("0.75")
+    assert entry.currency == "usd"
+
+
+@pytest.mark.parametrize(
+    "provider,model",
+    [
+        ("groq", "some-other-model"),  # known provider, unlisted model
+        ("gemini", "gemini-flash"),  # declared provider, empty table
+        ("anthropic", "claude-opus"),  # provider we do not price at all
+    ],
+)
+def test_an_unpriced_model_has_no_entry_rather_than_a_wrong_one(
+    tmp_path: Path, provider: str, model: str
+) -> None:
+    config = _load_yaml_model(PricingConfig, _write(tmp_path, PRICING_DOCUMENT, "pricing.yaml"))
+
+    assert config.for_model(provider, model) is None
+
+
+def test_a_pricing_document_rejects_a_stray_key(tmp_path: Path) -> None:
+    document = {
+        "version": 1,
+        "pricing": {
+            "groq": {
+                "m": {
+                    "input_per_mtok": "0.10",
+                    "output_per_mtok": "0.50",
+                    "currency": "usd",
+                    "surprsie": "typo",
+                }
+            }
+        },
+    }
+
+    with pytest.raises(ConfigError) as excinfo:
+        _load_yaml_model(PricingConfig, _write(tmp_path, document, "pricing.yaml"))
+
+    assert "surprsie" in str(excinfo.value)
+
+
+def test_every_enabled_candidate_has_a_pricing_entry() -> None:
+    """Step 1's own "done when": every candidate the committed
+    ``providers.yaml`` routes to on an enabled provider has a matching
+    ``pricing.yaml`` entry — OpenRouter's ``:free`` suffix included, since that
+    suffix is part of the model name the pricing table keys on too."""
+    providers = get_providers_config()
+    pricing = get_pricing_config()
+
+    for slot in providers.enabled_slots().values():
+        for candidate in slot.candidates:
+            if not providers.providers[candidate.provider].enabled:
+                continue
+            assert pricing.for_model(candidate.provider, candidate.model) is not None, (
+                f"{candidate.provider}/{candidate.model} is routable but has no pricing entry"
+            )
+
+
+def test_a_gap_in_the_pricing_table_warns_but_does_not_fail_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D46: an unpriced model is a warning, not a :class:`ConfigError` — the one
+    exception in this module, and the only check ``validate_startup_config``
+    tolerates a gap in."""
+    document = _providers_document()
+    document["slots"]["general"]["candidates"][0]["model"] = "not-priced-anywhere"
+    providers = _load_yaml_model(ProvidersConfig, _write(tmp_path, document, "providers.yaml"))
+    pricing = _load_yaml_model(
+        PricingConfig, _write(tmp_path, PRICING_DOCUMENT, "pricing_gap.yaml")
+    )
+
+    import app.config as config_module
+
+    monkeypatch.setattr(config_module, "get_providers_config", lambda: providers)
+    monkeypatch.setattr(config_module, "get_pricing_config", lambda: pricing)
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        config_module.logger, "warning", lambda event, **kw: warnings.append((event, kw))
+    )
+
+    _warn_unpriced_models()
+
+    assert len(warnings) == 1
+    event, fields = warnings[0]
+    assert event == "config.unpriced_models"
+    assert "groq/not-priced-anywhere" in fields["models"]
 
 
 # --------------------------------------------------------------------------- #

@@ -11,6 +11,7 @@ Two rules govern this module.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -19,8 +20,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.logging import get_logger
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
+
+logger = get_logger("app.config")
 
 Environment = Literal["dev", "test", "prod"]
 
@@ -470,6 +475,37 @@ class LimitsConfig(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# config/pricing.yaml
+# --------------------------------------------------------------------------- #
+class PricingEntry(BaseModel):
+    """Published list price for one (provider, model), dollars per million tokens.
+
+    D46: this project runs entirely on free tiers, so nothing here is ever
+    actually billed. It exists to answer "what would this traffic have cost at
+    the provider's own published rate" — a simulation, computed at read time by
+    :func:`app.usage.pricing.simulated_cost`, never stored (a stored number
+    freezes today's fiction and then quietly disagrees with the price list it
+    came from).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_per_mtok: Decimal
+    output_per_mtok: Decimal
+    currency: str
+
+
+class PricingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: int
+    pricing: dict[str, dict[str, PricingEntry]]
+
+    def for_model(self, provider: str, model: str) -> PricingEntry | None:
+        return self.pricing.get(provider, {}).get(model)
+
+
+# --------------------------------------------------------------------------- #
 # YAML loading
 # --------------------------------------------------------------------------- #
 def _load_yaml_model[ModelT: BaseModel](model: type[ModelT], path: Path) -> ModelT:
@@ -502,15 +538,55 @@ def get_limits_config() -> LimitsConfig:
     return _load_yaml_model(LimitsConfig, CONFIG_DIR / "limits.yaml")
 
 
+@lru_cache(maxsize=1)
+def get_pricing_config() -> PricingConfig:
+    return _load_yaml_model(PricingConfig, CONFIG_DIR / "pricing.yaml")
+
+
 def validate_startup_config() -> None:
     """Force every config source to load. Called from the lifespan, before serving.
 
     Any problem raises :class:`ConfigError` and the process fails to start.
+
+    ``_warn_unpriced_models`` is the one exception to "any problem is fatal" in
+    this function: a gap in the *simulated* price table is not a correctness
+    dependency of serving real traffic (D46) — killing the process because
+    someone added a model to ``providers.yaml`` before pricing it would be
+    disproportionate to a feature whose entire output is a fictional number on
+    a dashboard. Every other check in this module stays fatal.
     """
     get_settings()
     get_providers_config()
     get_limits_config()
+    get_pricing_config()
     _validate_encryption_key()
+    _warn_unpriced_models()
+
+
+def _warn_unpriced_models() -> None:
+    """Log, but do not fail, when an enabled candidate has no pricing entry.
+
+    Cross-references every candidate on every *enabled* slot (mirroring
+    :meth:`ProvidersConfig.enabled_slots`'s own notion of "actually routable")
+    against :func:`get_pricing_config`. A gap means Step 2's aggregates will
+    report the affected requests as ``unpriced`` rather than silently pricing
+    them at zero (trap 7) — this warning is the boot-time signal that a
+    ``providers.yaml`` edit landed without its ``pricing.yaml`` counterpart.
+    """
+    providers = get_providers_config()
+    pricing = get_pricing_config()
+
+    unpriced = sorted(
+        {
+            f"{candidate.provider}/{candidate.model}"
+            for slot in providers.enabled_slots().values()
+            for candidate in slot.candidates
+            if providers.providers[candidate.provider].enabled
+            and pricing.for_model(candidate.provider, candidate.model) is None
+        }
+    )
+    if unpriced:
+        logger.warning("config.unpriced_models", models=unpriced)
 
 
 def _validate_encryption_key() -> None:

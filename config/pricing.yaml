@@ -1,0 +1,77 @@
+# Simulated cost table (D46, Phase 7 Step 1).
+#
+# THESE ARE PUBLISHED LIST PRICES FOR MODELS THIS PROJECT CONSUMES FOR FREE. Every
+# candidate in this gateway is reached through a free tier or a personal free-tier
+# key (D37) — nobody is ever billed a cent through this codebase. The numbers below
+# answer a different, deliberately fictional question: "what would this traffic
+# have cost if it were paid at the provider's own published rate?" `usage/pricing.py`
+# is the one place that fiction gets computed, at read time, off whatever is
+# checked in here — never stored, because a stored number freezes today's fiction
+# and then quietly disagrees with the price list it came from (D46's own reasoning,
+# not repeated at every call site).
+#
+# One entry per (provider, model) this project actually routes to, `input_per_mtok`/
+# `output_per_mtok` as dollars per one million tokens. Values are quoted strings,
+# not bare YAML numbers — `usage.pricing.simulated_cost` sums these across
+# thousands of requests and renders the total as currency, and a `float` parsed
+# from an unquoted `0.15` is not the same number after enough additions. Every
+# amount here loads as a `Decimal` for exactly that reason (`app/config.py`'s
+# `PricingEntry`).
+#
+# A model missing from this table is not free — it is *unpriced*, and
+# `usage.pricing.simulated_cost` returns `None` for it rather than `Decimal("0")`.
+# `_warn_unpriced_models()` logs one warning at boot naming any enabled candidate
+# with no entry here; it does not fail startup, because a fictional price table is
+# not a correctness dependency of serving real traffic (D46).
+#
+# Snapshot: Aug 2026, each provider's own public pricing page. Free-tier rates
+# rotate (see the note in `providers.yaml`); so do list prices. Re-check this file
+# whenever a model in `providers.yaml` changes.
+
+version: 1
+
+pricing:
+  groq:
+    # Groq's published per-token rates for its own hosted OSS checkpoints.
+    openai/gpt-oss-120b:
+      input_per_mtok: "0.15"
+      output_per_mtok: "0.75"
+      currency: usd
+    openai/gpt-oss-20b:
+      input_per_mtok: "0.10"
+      output_per_mtok: "0.50"
+      currency: usd
+
+  gemini:
+    # Google's published per-token rate for prompts up to 128k tokens; this
+    # gateway's context windows stay under that tier for every candidate below.
+    gemini-3.6-flash:
+      input_per_mtok: "0.075"
+      output_per_mtok: "0.30"
+      currency: usd
+    gemini-3.5-flash-lite:
+      input_per_mtok: "0.0375"
+      output_per_mtok: "0.15"
+      currency: usd
+    # `pro`'s only candidate (D41) — priced at Google's paid Pro tier, since a
+    # shared key can never reach this model at all; only a private key holder's
+    # own traffic is ever priced against this row.
+    gemini-3.6-pro:
+      input_per_mtok: "1.25"
+      output_per_mtok: "5.00"
+      currency: usd
+
+  openrouter:
+    # The `:free` suffix is a rate-limit tier, not a price — OpenRouter still
+    # publishes what the same weights cost on its metered route, and that is the
+    # number quoted here. Matches `providers.yaml`'s model IDs exactly, `:free`
+    # suffix included, so `PricingConfig.for_model` looks up the same key the
+    # router routes to.
+    nvidia/nemotron-3-super-120b-a12b:free:
+      input_per_mtok: "0.10"
+      output_per_mtok: "0.40"
+      currency: usd
+    openai/gpt-oss-20b:free:
+      input_per_mtok: "0.10"
+      output_per_mtok: "0.50"
+      currency: usd

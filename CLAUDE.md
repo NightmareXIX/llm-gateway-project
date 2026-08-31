@@ -91,7 +91,7 @@ app/
   perception/{lane,extractors,local,storage}.py
   cache/{keys,client,exact}.py
   keys_resolution/resolver.py
-  usage/{logger,metrics}.py
+  usage/{logger,metrics,pricing}.py
   db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,allocations,files,extractions}.py}
 frontend/            # Next.js App Router + Tailwind; lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip,ProviderKeysSection}.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
@@ -102,14 +102,31 @@ README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.exampl
 
 ## Current phase: Phase 7 — Polish & Portfolio
 
-Not started. Per `development-plan.md` §3 Phase 7: the usage dashboard against `api/admin.py`
+In progress. Per `development-plan.md` §3 Phase 7: the usage dashboard against `api/admin.py`
 (request volume, provider distribution, error rate, cache hit rate, quota utilization, and §4.8's
 simulated cost off a checked-in `config/pricing.yaml`), the README's architecture/request-flow/
 "Design Decisions" build-out, `/metrics` in Prometheus format, the load-and-chaos demo script,
 idempotency (D6, `keys.idempotency` still unwritten), keyset message pagination as a **second** repo
 function beside an untouched `list_for_conversation`, and `docs/limitations.md` finalized. Phase 6
 hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` on every attempt —
-see `phase6.md` §9.
+see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
+[phase7.md](doc/reference/phase7.md).
+
+**Status: Step 1 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+`config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
+`PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
+`frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
+validated from `validate_startup_config()` beside the other three config sources.
+`usage/pricing.py::simulated_cost` is the one pure function Steps 2–3's aggregates and dashboard will
+call: `Decimal`, never `float`, and `None` for an unpriced model rather than `Decimal("0")` — a silent
+zero would understate the dashboard's eventual total in the flattering direction. `config/pricing.yaml`
+prices every candidate the committed `providers.yaml` routes to, `pro`'s `gemini-3.6-pro` and both
+OpenRouter `:free` models included; a gap warns at boot (`config.unpriced_models`) rather than failing
+it — the one deliberate exception in this module, since a fictional price table is not a correctness
+dependency of serving real traffic. The unit suite (955 passed, 1 skipped) is green, along with `ruff
+check`, `ruff format --check`, and `mypy`; the integration suite needs a local Postgres/Redis this
+sandbox doesn't have, but Step 1 touches no code path either depends on. `grep` confirms nothing outside
+`usage/pricing.py` and `config.py` imports the table, per the step's own "done when."
 
 ## Phase 6 — BYOK Settings — complete
 
