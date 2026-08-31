@@ -22,6 +22,7 @@ from app.auth.principal import Principal
 from app.cache import keys
 from app.cache.client import LuaScriptRegistry
 from app.cache.exact import ExactCache
+from app.cache.idempotency import IdempotencyStore
 from app.config import GatewayLimits, get_limits_config, get_settings
 from app.core.clock import SYSTEM_CLOCK, Clock
 from app.core.errors import TooManyRequests
@@ -181,6 +182,22 @@ def get_exact_cache(request: Request) -> ExactCache | None:
     if not settings.CACHE_EXACT_ENABLED:
         return None
     return ExactCache(get_redis(request))
+
+
+def get_idempotency_store(request: Request) -> IdempotencyStore:
+    """D6/D47's claim-and-replay store over the process-wide Redis client.
+
+    Constructed per request for the same reason the exact cache is: the store
+    holds no state of its own — ``idem:{user_id}:{idem_key}`` is the state,
+    shared by every worker and every instance.
+
+    Unlike ``get_exact_cache`` this never returns ``None``, because there is no
+    switch to be off: idempotency is opt-in per request via the
+    ``Idempotency-Key`` header, so a caller that does not send one already gets
+    exactly today's behaviour without the store having to know. A Redis outage
+    is handled one layer down instead — every method fails open (D47).
+    """
+    return IdempotencyStore(get_redis(request))
 
 
 def get_resolver(
@@ -609,6 +626,7 @@ RedisDep = Annotated[Redis, Depends(get_redis)]
 BreakerDep = Annotated[CircuitBreaker, Depends(get_breaker)]
 QuotaDep = Annotated[QuotaTracker | None, Depends(get_quota)]
 ExactCacheDep = Annotated[ExactCache | None, Depends(get_exact_cache)]
+IdempotencyDep = Annotated[IdempotencyStore, Depends(get_idempotency_store)]
 RateLimiterDep = Annotated[RateLimiter | None, Depends(get_rate_limiter)]
 LatencyDep = Annotated[LatencyTable, Depends(get_latency)]
 MetricsDep = Annotated[MetricsRegistry, Depends(get_metrics)]

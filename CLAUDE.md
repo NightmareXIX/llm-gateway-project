@@ -106,13 +106,14 @@ In progress. Per `development-plan.md` §3 Phase 7: the usage dashboard against 
 (request volume, provider distribution, error rate, cache hit rate, quota utilization, and §4.8's
 simulated cost off a checked-in `config/pricing.yaml`), the README's architecture/request-flow/
 "Design Decisions" build-out, `/metrics` in Prometheus format, the load-and-chaos demo script,
-idempotency (D6, `keys.idempotency` still unwritten), keyset message pagination as a **second** repo
+idempotency (D6 — `keys.idempotency` and `IDEMPOTENCY_TTL_S` have existed since Phase 3; what Steps
+5–6 add is the behaviour), keyset message pagination as a **second** repo
 function beside an untouched `list_for_conversation`, and `docs/limitations.md` finalized. Phase 6
 hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` on every attempt —
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–4 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–5 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -273,6 +274,49 @@ check`, `ruff format --check` and `mypy` are green, and the rendered body was re
 format `promtool check metrics` wants, per the step's own "done when." `docs/limitations.md`'s
 two-workers-means-a-sample caveat and `docs/deploy.md`'s two new variables are Step 12's, which owns
 this phase's documentation.
+
+Step 5 (D47, the idempotency store) touches exactly the files `phase7.md` names —
+`app/cache/idempotency.py` (new), `app/deps.py`, `tests/unit/test_idempotency.py` (new). The module sits
+beside `cache/exact.py` for the reason that file is not in `cache/client.py`: it is a policy over Redis,
+not a Redis client. `IdempotencyEnvelope` (`state`/`fingerprint`/`request_id`/`stream`/`response`, with
+`to_json`/`from_json` written in full and lenient about unknown keys but never about wrong types — exactly
+`MessageMeta`'s asymmetry), `fingerprint`, `IdempotencyStore.claim`/`complete`/`release`, and the four
+`ClaimResult` members that are one per row of D47's table: `Claimed`, `Replay`, `InFlight`,
+`FingerprintMismatch`. **Storing an envelope rather than a bare `request_id` is not a Contract C
+amendment** — §2.3 froze the key *format*, and `idem:{user_id}:{idem_key}` is unchanged; the module
+docstring says so out loud, because the last two phases both *did* amend Contract C with sign-off and a
+reader has to be able to tell the two cases apart.
+
+Three details carry the step. **The claim is one `SET NX EX` and never a `GET`-then-`SET`** — the whole
+value of D6 is that two concurrent identical retries produce one provider call, which only atomicity
+delivers; the `asyncio.gather` test asserting exactly one `Claimed` among eight simultaneous claims is
+the one that tests the design rather than the code. **`fingerprint` folds in `stream`** along with the
+slot, every message (content *and* `file_refs`), `conversation_id`, every generation knob and the
+`user_id`, reusing `cache/exact.py::request_hash`'s serialization discipline (`sort_keys`, tight
+separators): a streaming retry replaying a non-streaming body would hand SSE a JSON object, and a
+fingerprint that ignored `conversation_id` would answer "add this turn to thread A" with thread B's
+answer. **Every method fails open** — caching's rule and D20's, not quota's D15 rule — so a Redis error
+or an envelope this version cannot parse returns `Claimed` and the request is served exactly as it would
+have been before the module existed; `complete` and `release` shrug, since a failure path is the worst
+place to add a new way to raise.
+
+`fingerprint` takes a structural `IdempotentRequest`/`IdempotentMessage` protocol pair rather than
+importing `ChatCompletionRequest`, which is what keeps `cache/` free of a dependency on `schemas/`; the
+members are read-only properties, because a mutable protocol attribute is invariant and a real
+`list[InputMessage]` would then not satisfy `Sequence[IdempotentMessage]`. `deps.get_idempotency_store`
+mirrors `get_exact_cache` but never returns `None`: there is no switch to be off, since idempotency is
+opt-in per request via the header, and a Redis outage is handled one layer down by the fail-open rule.
+`user_id` is a keyword on each store method rather than a constructor argument, for the same
+import-cycle reason `get_credentials` documents. `IDEMPOTENCY_HEADER`/`REPLAY_HEADER`/`MAX_KEY_LENGTH`
+land here beside the store, the way `exact.py` owns `CACHE_HEADER`, so Step 6's header handling and this
+module's key builder cannot disagree about what is acceptable. 43 unit cases (fakeredis) cover the
+envelope round trip and its six rejected shapes, the fingerprint's sensitivity to all ten fields plus the
+user, a real `ChatCompletionRequest` satisfying the protocol (asserted in the suite *and* checked by
+mypy), all four claim outcomes — mismatch in both the in-flight and done states — per-user key isolation,
+the TTL after both `claim` and `complete`, the concurrent single-winner, and fail-open on each of `set`,
+`get` and `delete` plus a corrupt envelope and a key that vanished between the `SET` and the `GET`.
+`make test` (1468 passed, 1 skipped), `ruff check`, `ruff format --check` and `mypy` are green; `grep`
+confirms nothing in `app/api/` imports the module yet, per the step's own "done when."
 
 ## Phase 6 — BYOK Settings — complete
 
