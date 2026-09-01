@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv*/
 venv/
 *.egg-info/
 dist/
@@ -13,12 +14,31 @@ build/
 .ruff_cache/
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 
 node_modules/
 .next/
 
+# OS junk
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / tooling
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Merge and backup leftovers
+*.orig
+*.rej
+*.bak
+
+# Machine-local Claude Code overrides; committed .claude/skills/ stays tracked
+.claude/settings.local.json
 
 # Next.js/TS build artifact
 tsconfig.tsbuildinfo
