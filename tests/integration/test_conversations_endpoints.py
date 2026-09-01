@@ -113,6 +113,11 @@ async def test_reading_returns_the_canonical_history(
     assert assistant["meta"]["substituted"] is False
     assert assistant["meta"]["tokens_out"] == 27
 
+    # D48: a thread under one page renders exactly as it did before pagination —
+    # the two new fields are additive, not a behaviour change.
+    assert body["has_more"] is False
+    assert body["next_before_seq"] is None
+
 
 async def test_an_omission_marker_survives_the_trip(
     client: httpx.AsyncClient,
@@ -314,6 +319,129 @@ async def test_someone_elses_conversation_is_a_404(
     assert response.json()["error"]["code"] == "conversation_not_found"
 
 
-@pytest.mark.parametrize("path", [CONVERSATIONS, f"{CONVERSATIONS}/{uuid4()}"])
+@pytest.mark.parametrize(
+    "path",
+    [CONVERSATIONS, f"{CONVERSATIONS}/{uuid4()}", f"{CONVERSATIONS}/{uuid4()}/messages"],
+)
 async def test_credentials_are_required(client: httpx.AsyncClient, path: str) -> None:
     assert (await client.get(path)).status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Keyset message pagination (D48)
+# --------------------------------------------------------------------------- #
+def _assistant_meta() -> MessageMeta:
+    return MessageMeta(provider_used="groq", model_used="llama-3.3-70b-versatile")
+
+
+async def _seed_history(
+    db_session: AsyncSession, *, conversation_id: Any, user_id: Any, count: int
+) -> None:
+    for index in range(count):
+        await messages_repo.append(
+            db_session,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role="assistant" if index % 2 else "user",
+            content=[text_block(f"turn {index}")],
+            meta=_assistant_meta() if index % 2 else None,
+        )
+    await db_session.commit()
+
+
+async def test_the_detail_route_returns_the_newest_page_and_a_cursor(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    db_session: AsyncSession,
+    user_factory: Callable[..., Any],
+    conversation_factory: Callable[..., Any],
+) -> None:
+    user = await user_factory()
+    conversation = await conversation_factory(user=user)
+    await _seed_history(db_session, conversation_id=conversation.id, user_id=user.id, count=60)
+
+    detail = await client.get(
+        f"{CONVERSATIONS}/{conversation.id}",
+        headers=_headers(make_jwt, sub=user.id, email=user.email),
+    )
+
+    assert detail.status_code == 200
+    body = detail.json()
+    assert [m["seq"] for m in body["messages"]] == list(range(10, 60))
+    assert body["has_more"] is True
+    assert body["next_before_seq"] == 10
+
+
+async def test_the_message_page_route_walks_a_120_message_thread(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    db_session: AsyncSession,
+    user_factory: Callable[..., Any],
+    conversation_factory: Callable[..., Any],
+) -> None:
+    """The page route plus the detail route's own head reproduce the full
+    history exactly, with no duplicates and no gaps — walked over real HTTP."""
+    user = await user_factory()
+    conversation = await conversation_factory(user=user)
+    await _seed_history(db_session, conversation_id=conversation.id, user_id=user.id, count=120)
+    headers = _headers(make_jwt, sub=user.id, email=user.email)
+
+    detail = await client.get(f"{CONVERSATIONS}/{conversation.id}", headers=headers)
+    detail_body = detail.json()
+    assert detail_body["has_more"] is True
+
+    pages = [detail_body["messages"]]
+    before_seq = detail_body["next_before_seq"]
+    while before_seq is not None:
+        response = await client.get(
+            f"{CONVERSATIONS}/{conversation.id}/messages",
+            params={"before_seq": before_seq},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        page_body = response.json()
+        pages.append(page_body["messages"])
+        before_seq = page_body["next_before_seq"] if page_body["has_more"] else None
+
+    assert len(pages) == 3
+    assert [len(page) for page in pages] == [50, 50, 20]
+    concatenated = [message for page in reversed(pages) for message in page]
+    assert [m["seq"] for m in concatenated] == list(range(120))
+    assert len({m["id"] for m in concatenated}) == 120
+
+
+async def test_the_message_page_route_returns_empty_past_the_start(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    user_factory: Callable[..., Any],
+    conversation_factory: Callable[..., Any],
+) -> None:
+    user = await user_factory()
+    conversation = await conversation_factory(user=user)
+    headers = _headers(make_jwt, sub=user.id, email=user.email)
+
+    response = await client.get(
+        f"{CONVERSATIONS}/{conversation.id}/messages",
+        params={"before_seq": 0},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"messages": [], "has_more": False, "next_before_seq": None}
+
+
+async def test_the_message_page_route_404s_for_a_non_owner(
+    client: httpx.AsyncClient,
+    make_jwt: TokenFactory,
+    user_factory: Callable[..., Any],
+    conversation_factory: Callable[..., Any],
+) -> None:
+    """A non-owner cannot page another user's thread by guessing the id."""
+    owner = await user_factory(email="owner@example.com")
+    conversation = await conversation_factory(user=owner)
+    intruder = _headers(make_jwt, sub=uuid4(), email="intruder@example.com")
+
+    response = await client.get(f"{CONVERSATIONS}/{conversation.id}/messages", headers=intruder)
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "conversation_not_found"

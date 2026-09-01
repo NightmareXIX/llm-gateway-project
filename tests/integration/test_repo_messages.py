@@ -468,6 +468,174 @@ async def test_deleting_a_conversation_cascades_to_its_messages(
     assert remaining.scalars().all() == []
 
 
+# --------------------------------------------------------------------------- #
+# Keyset pagination (D48)
+# --------------------------------------------------------------------------- #
+async def test_a_120_message_thread_pages_exactly_three_times_with_no_gaps(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    user = await user_factory()
+    conversation = await conversations_repo.create(db_session, user_id=user.id)
+    for index in range(120):
+        await repo.append(
+            db_session,
+            conversation_id=conversation.id,
+            user_id=user.id,
+            role="assistant" if index % 2 else "user",
+            content=[text_block(f"turn {index}")],
+            meta=ASSISTANT_META if index % 2 else None,
+        )
+    db_session.expunge_all()
+
+    whole = await repo.list_for_conversation(
+        db_session, conversation_id=conversation.id, user_id=user.id
+    )
+
+    pages: list[Any] = []
+    before_seq: int | None = None
+    for _ in range(10):  # generous cap so a bug can't hang the test
+        page = await repo.list_page_for_conversation(
+            db_session,
+            conversation_id=conversation.id,
+            user_id=user.id,
+            before_seq=before_seq,
+            limit=50,
+        )
+        pages.append(page)
+        if not page.has_more:
+            break
+        before_seq = page.next_before_seq
+
+    assert len(pages) == 3
+    assert [len(p.messages) for p in pages] == [50, 50, 20]
+    assert pages[-1].has_more is False
+    assert pages[-1].next_before_seq is None
+
+    # Oldest page first, newest last — concatenating in that order reproduces
+    # the unpaginated read exactly, with no duplicates and no gaps.
+    concatenated = [m for page in reversed(pages) for m in page.messages]
+    assert [m.seq for m in concatenated] == [m.seq for m in whole]
+    assert [m.id for m in concatenated] == [m.id for m in whole]
+
+
+async def test_the_newest_page_has_more_and_a_usable_cursor(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    user = await user_factory()
+    conversation = await conversations_repo.create(db_session, user_id=user.id)
+    for index in range(75):
+        await repo.append(
+            db_session,
+            conversation_id=conversation.id,
+            user_id=user.id,
+            role="assistant" if index % 2 else "user",
+            content=[text_block(f"turn {index}")],
+            meta=ASSISTANT_META if index % 2 else None,
+        )
+    db_session.expunge_all()
+
+    page = await repo.list_page_for_conversation(
+        db_session, conversation_id=conversation.id, user_id=user.id, limit=50
+    )
+
+    assert [m.seq for m in page.messages] == list(range(25, 75))
+    assert page.has_more is True
+    assert page.next_before_seq == 25
+
+
+async def test_before_seq_beyond_the_start_returns_an_empty_final_page(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    user = await user_factory()
+    conversation = await conversations_repo.create(db_session, user_id=user.id)
+    await repo.append(
+        db_session,
+        conversation_id=conversation.id,
+        user_id=user.id,
+        role="user",
+        content=[text_block("only one")],
+    )
+    db_session.expunge_all()
+
+    page = await repo.list_page_for_conversation(
+        db_session, conversation_id=conversation.id, user_id=user.id, before_seq=0, limit=50
+    )
+
+    assert page.messages == []
+    assert page.has_more is False
+    assert page.next_before_seq is None
+
+
+async def test_a_thread_under_a_page_returns_it_whole_with_has_more_false(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    user = await user_factory()
+    conversation = await conversations_repo.create(db_session, user_id=user.id)
+    await repo.append(
+        db_session,
+        conversation_id=conversation.id,
+        user_id=user.id,
+        role="user",
+        content=[text_block("hello")],
+    )
+    db_session.expunge_all()
+
+    page = await repo.list_page_for_conversation(
+        db_session, conversation_id=conversation.id, user_id=user.id, limit=50
+    )
+
+    assert [m.seq for m in page.messages] == [0]
+    assert page.has_more is False
+    assert page.next_before_seq is None
+
+
+async def test_a_non_owner_pages_an_empty_result_not_someone_elses_thread(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    owner = await user_factory()
+    intruder = await user_factory()
+    conversation = await conversations_repo.create(db_session, user_id=owner.id)
+    await repo.append(
+        db_session,
+        conversation_id=conversation.id,
+        user_id=owner.id,
+        role="user",
+        content=[text_block("private")],
+    )
+    db_session.expunge_all()
+
+    page = await repo.list_page_for_conversation(
+        db_session, conversation_id=conversation.id, user_id=intruder.id, limit=50
+    )
+
+    assert page.messages == []
+    assert page.has_more is False
+    assert page.next_before_seq is None
+
+
+async def test_list_for_conversation_still_returns_everything(
+    db_session: AsyncSession, user_factory: Callable[..., Any]
+) -> None:
+    """Regression guard (D48): the unpaginated read is not touched by pagination."""
+    user = await user_factory()
+    conversation = await conversations_repo.create(db_session, user_id=user.id)
+    for index in range(60):
+        await repo.append(
+            db_session,
+            conversation_id=conversation.id,
+            user_id=user.id,
+            role="assistant" if index % 2 else "user",
+            content=[text_block(f"turn {index}")],
+            meta=ASSISTANT_META if index % 2 else None,
+        )
+    db_session.expunge_all()
+
+    history = await repo.list_for_conversation(
+        db_session, conversation_id=conversation.id, user_id=user.id
+    )
+    assert [m.seq for m in history] == list(range(60))
+
+
 async def test_deleting_a_conversation_keeps_the_usage_history(
     db_session: AsyncSession, user_factory: Callable[..., Any]
 ) -> None:

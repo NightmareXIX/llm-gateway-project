@@ -26,6 +26,7 @@ boundary, because only the caller knows what one unit of work is.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from uuid import UUID
 
 from sqlalchemy import select
@@ -45,6 +46,12 @@ from app.memory.canonical import (
     validate_append,
     validate_message,
 )
+
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+"""Ceiling on :func:`list_page_for_conversation`, the same shape
+``conversations_repo``'s page size constants already take — a caller asking for
+ten thousand rows is a bug or an abuse, and either way the answer is the same."""
 
 
 def to_canonical(row: Message) -> CanonicalMessage:
@@ -180,3 +187,69 @@ async def list_for_conversation(
         .order_by(Message.seq)
     )
     return [to_canonical(row) for row in result.scalars().all()]
+
+
+@dataclass(frozen=True)
+class MessagePage:
+    """One keyset page: newest-first cursor, returned oldest-first within the page.
+
+    ``next_before_seq`` is the lowest ``seq`` still in this page — feed it back as
+    the next call's ``before_seq`` to walk further into the past — and is ``None``
+    exactly when ``has_more`` is ``False``, so a client never has to guess whether
+    a present-but-meaningless cursor is safe to use.
+    """
+
+    messages: list[CanonicalMessage]
+    has_more: bool
+    next_before_seq: int | None
+
+
+async def list_page_for_conversation(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    user_id: UUID,
+    before_seq: int | None = None,
+    limit: int = DEFAULT_PAGE_SIZE,
+) -> MessagePage:
+    """One page of history for a conversation the caller owns (D48).
+
+    This is **not** a replacement for :func:`list_for_conversation`, which stays
+    untouched and unpaginated: the render pipeline's fitting step (D4) needs the
+    *complete* history to decide what to drop, and that need does not shrink
+    because the UI has only scrolled a page into view. This function exists for
+    the UI's own read — the conversation detail route's newest page, and the
+    scroll-up route's older ones — and nothing in `app/memory/` calls it.
+
+    ``before_seq=None`` asks for the newest page; passing back the previous
+    page's ``next_before_seq`` walks further into the past. Ownership is scoped
+    by the same join `list_for_conversation` uses, so a non-owner (or an unknown
+    id) sees an empty page rather than someone else's messages — callers that
+    need to tell "empty page" from "not yours" resolve the conversation with
+    ``conversations.get_owned`` first, exactly as the unpaginated read requires.
+
+    Fetches ``limit + 1`` rows to answer ``has_more`` without a second `COUNT`:
+    a full page-plus-one means there is more; anything less means this is the
+    last page. The sentinel row is dropped before the result is built, and the
+    remaining rows — fetched newest-first so `LIMIT` bounds the right end of the
+    range — are reversed back to the oldest-first order every other read in this
+    module returns, so the client can concatenate pages without reshaping either
+    one.
+    """
+    clamped = max(1, min(limit, MAX_PAGE_SIZE))
+    query = (
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+    )
+    if before_seq is not None:
+        query = query.where(Message.seq < before_seq)
+    query = query.order_by(Message.seq.desc()).limit(clamped + 1)
+
+    result = await session.execute(query)
+    rows = result.scalars().all()
+    has_more = len(rows) > clamped
+    page_rows = rows[:clamped]
+    messages = [to_canonical(row) for row in reversed(page_rows)]
+    next_before_seq = messages[0].seq if has_more and messages else None
+    return MessagePage(messages=messages, has_more=has_more, next_before_seq=next_before_seq)

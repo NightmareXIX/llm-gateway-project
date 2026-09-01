@@ -30,6 +30,7 @@ from app.schemas.conversations import (
     ConversationOut,
     ConversationRenameRequest,
     MessageOut,
+    MessagePageOut,
 )
 from app.schemas.errors import AUTHENTICATED_ERROR_RESPONSES, NOT_FOUND_RESPONSE
 
@@ -97,11 +98,17 @@ async def read_conversation(
     principal: PrincipalDep,
     session: SessionDep,
 ) -> ConversationDetail:
-    """One thread with its full history, oldest first.
+    """One thread with its newest page of history, oldest first within the page.
 
     Two queries rather than a join, and both ownership-scoped. The first is what
     distinguishes "empty new thread" from "not yours" — the message read returns
-    ``[]`` for both, so it cannot answer that on its own.
+    an empty page for both, so it cannot answer that on its own.
+
+    D48: only the newest page comes back here. Older history is
+    ``GET /{conversation_id}/messages``'s job — a second route rather than a
+    query parameter on this one, because the two have different cache
+    lifetimes on the client (this one is mutated by an optimistic turn; old
+    pages are immutable).
     """
     conversation = await conversations_repo.get_owned(
         session, conversation_id=conversation_id, user_id=principal.user_id
@@ -109,12 +116,56 @@ async def read_conversation(
     if conversation is None:
         raise NotFound("That conversation does not exist.", code="conversation_not_found")
 
-    history = await messages_repo.list_for_conversation(
+    page = await messages_repo.list_page_for_conversation(
         session, conversation_id=conversation_id, user_id=principal.user_id
     )
     return ConversationDetail(
         **_to_out(conversation).model_dump(),
-        messages=[_to_message_out(message) for message in history],
+        messages=[_to_message_out(message) for message in page.messages],
+        has_more=page.has_more,
+        next_before_seq=page.next_before_seq,
+    )
+
+
+@router.get(
+    "/{conversation_id}/messages",
+    response_model=MessagePageOut,
+    responses=NOT_FOUND_RESPONSE,
+)
+async def read_message_page(
+    conversation_id: UUID,
+    principal: PrincipalDep,
+    session: SessionDep,
+    before_seq: int | None = Query(default=None, ge=0),
+    limit: int = Query(
+        default=messages_repo.DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=messages_repo.MAX_PAGE_SIZE,
+    ),
+) -> MessagePageOut:
+    """Older history than the thread route's own page — the scroll-up fetch.
+
+    Ownership is resolved with ``get_owned`` first, exactly like the thread
+    route, so a non-owner (or an unknown id) gets 404 rather than an empty page
+    — the same distinction the unpaginated read needs a separate check for.
+    """
+    conversation = await conversations_repo.get_owned(
+        session, conversation_id=conversation_id, user_id=principal.user_id
+    )
+    if conversation is None:
+        raise NotFound("That conversation does not exist.", code="conversation_not_found")
+
+    page = await messages_repo.list_page_for_conversation(
+        session,
+        conversation_id=conversation_id,
+        user_id=principal.user_id,
+        before_seq=before_seq,
+        limit=limit,
+    )
+    return MessagePageOut(
+        messages=[_to_message_out(message) for message in page.messages],
+        has_more=page.has_more,
+        next_before_seq=page.next_before_seq,
     )
 
 

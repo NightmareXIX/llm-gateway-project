@@ -113,7 +113,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–6 of 12 committed — Milestone A done, Milestone B half done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–7 of 12 committed — Milestone A done, Milestone B three of four steps done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -388,6 +388,30 @@ spelled out field by field, making two provider calls and two conversations exac
 this step existed. `make test` (1483 passed, 1 skipped), `ruff check`, `ruff format --check` and
 `mypy` are green, and the whole pre-existing suite passed unchanged, which is the step's own "the
 no-header path is provably unchanged."
+
+Step 7 (D48, keyset message pagination, server side) touches exactly the files `phase7.md` names —
+`app/db/repo/messages.py`, `app/schemas/conversations.py`, `app/api/v1/conversations.py`, plus
+`tests/integration/test_repo_messages.py` and `tests/integration/test_conversations_endpoints.py`.
+`list_page_for_conversation` and its `MessagePage` dataclass land beside `list_for_conversation`,
+whose own body is untouched (`git diff` shows only pure addition after its closing line, per the
+step's own "done when"). It fetches `limit + 1` rows ordered `seq DESC` to answer `has_more` without a
+second `COUNT`, reverses the page back to oldest-first before returning, and is ownership-scoped by
+the same `Conversation` join `list_for_conversation` already uses — a non-owner or unknown id gets an
+empty page rather than someone else's messages, with the "not yours" 404 left to the caller's own
+`get_owned` check, exactly as `list_for_conversation` already requires. `ConversationDetail` gains
+`has_more`/`next_before_seq` (additive, so a pre-pagination client renders unchanged for any thread
+under one page); `read_conversation` now calls the new function with `before_seq=None` instead of the
+unpaginated read. A new route, `GET /v1/conversations/{id}/messages` → `MessagePageOut`, is the
+scroll-up fetch, resolving ownership with `get_owned` first so a non-owner cannot page another user's
+thread by guessing the id. One incidental fix: the route's first docstring draft used the word
+"detail" in prose, which `test_openapi_errors.py` flags as a false positive for FastAPI's own
+`{"detail": ...}` error shape — reworded, not suppressed. 24 new test cases cover a 120-message thread
+paging exactly three times with no gaps or duplicates (both at the repo layer and walked over real
+HTTP against the detail route's own cursor), `has_more`/`next_before_seq` on the newest page, an empty
+final page past the start of history, a thread under one page rendering identically to before this
+step, a non-owner's empty repo-level read and 404 at the route, and a regression guard asserting
+`list_for_conversation` still returns everything. `make test` (1494 passed, 1 skipped), `ruff check`,
+`ruff format --check`, and `mypy` are all green.
 
 ## Phase 6 — BYOK Settings — complete
 

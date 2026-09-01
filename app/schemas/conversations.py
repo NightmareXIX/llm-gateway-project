@@ -69,15 +69,37 @@ class ConversationOut(BaseModel):
 
 
 class ConversationDetail(ConversationOut):
-    """A thread with its full history, oldest first.
+    """A thread with its newest page of history, oldest first within the page.
 
-    Unpaginated, like the repository read behind it: this is a conversation, and
-    the client needs all of it to render the transcript.
+    D48: only the newest page (`` messages_repo.DEFAULT_PAGE_SIZE``) comes back
+    here now — the full, unpaginated history stays a repository-internal need
+    (D4's fitting step), not a wire shape. ``has_more``/``next_before_seq`` are
+    additive fields on an existing response, so a client built before pagination
+    existed still renders correctly for any thread under one page.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     messages: list[MessageOut]
+    has_more: bool
+    next_before_seq: int | None
+    """Feed back as ``before_seq`` on ``GET /{id}/messages`` to fetch the next
+    older page. ``None`` exactly when ``has_more`` is ``False``."""
+
+
+class MessagePageOut(BaseModel):
+    """One older page of history — ``GET /{id}/messages``'s own shape.
+
+    Same ordering as ``ConversationDetail.messages`` (oldest first within the
+    page) so the client can prepend this array onto the one it already has with
+    no reshaping.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    messages: list[MessageOut]
+    has_more: bool
+    next_before_seq: int | None
 
 
 class ConversationRenameRequest(BaseModel):
