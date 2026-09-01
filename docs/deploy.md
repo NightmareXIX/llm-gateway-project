@@ -721,8 +721,9 @@ returns 200 with the counters, so an alert written against `gateway_quota_remain
 absent series as a signal rather than as zero. Quickest check that the token is right:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}
-'   -H "Authorization: Bearer $METRICS_TOKEN"   https://llm-gateway-sed.onrender.com/metrics
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $METRICS_TOKEN" \
+  https://llm-gateway-sed.onrender.com/metrics
 # 200 with the token, 401 without it, 404 if METRICS_ENABLED is false
 ```
 
