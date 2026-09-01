@@ -699,8 +699,19 @@ dead rows is optional — the resolver already ignores them).
 **Scraping `/metrics`.** `GET /metrics` returns Prometheus text format 0.0.4
 ([ADR-044](decisions/ADR-044-hand-rolled-metrics-endpoint.md)) and needs
 `Authorization: Bearer $METRICS_TOKEN` once that variable is set — which on Render it must be, because
-there is no private network to restrict the endpoint to. Two things to know before pointing a scrape
-at it. The three counter families are **process-local**: they reset on every deploy and on every cold
+there is no private network to restrict the endpoint to.
+
+> **An unset `METRICS_TOKEN` means the endpoint is open, not disabled.** The check in
+> `app/main.py` is `if expected is not None`, so leaving the variable blank skips authentication
+> rather than refusing the request. This has already happened on this deployment: a `GET /metrics`
+> returned 200 to a public IP with `"metrics_token_required": false` in that instance's
+> `startup.complete` line. Nothing user-identifying leaks — no label anywhere carries a `user_id`,
+> and a test enforces that — but provider and model names, live breaker state, per-status request
+> counts and the shared pool's remaining free-tier quota all do, to anyone who asks. Grep a
+> `startup.complete` line for `metrics_token_required` to check which state a running instance is in.
+
+Two things to know before pointing a scrape at it. The three counter families are
+**process-local**: they reset on every deploy and on every cold
 start, which on a free instance that spins down after 15 idle minutes is frequent, so treat them as
 rates over a live process rather than as lifetime totals — and if `WEB_CONCURRENCY` is ever raised
 above the `1` `render.yaml` pins, each scrape reads whichever worker answered it rather than the
@@ -726,3 +737,24 @@ manage themselves in Settings, and nothing here touches it.
 check and takes traffic, while the old one is still serving — so a migration must be compatible with
 the *old* code for the length of the rollout. Additive changes only, or a two-deploy
 expand/contract.
+
+**Both instances are alive during a deploy, and they share one connection budget.** The old container
+keeps answering until the new one is healthy — about thirteen seconds on the deploys observed here —
+and for that window two processes are each holding up to ten pooler connections (`pool_size=5 +
+max_overflow=5`, `app/db/session.py`) while the new one also runs `alembic upgrade head`. The effect
+is measurable rather than theoretical: `/readyz` costs a steady ~493ms against Supabase from
+Singapore, and the check that lands inside the overlap window has been seen at 1613ms. Worth knowing
+because the failure it produces is illegible: `alembic` runs *before* uvicorn binds a port, so
+anything that blocks there is a container that never opened a socket, which the platform reports as
+`Port scan timeout reached, no open ports detected` with no application log line at all. That is the
+same message a crashed image produces, and it is not one.
+
+`alembic/env.py` therefore sets two asyncpg timeouts, and it is worth knowing which does what.
+`timeout` (10s) bounds *connecting* — asyncpg already defaults it to 60s, so this only tightens it.
+`command_timeout` (300s) is the one that covers a pooler which accepts the connection and then queues
+the statement, because the connect timeout stops applying the moment the connection is established.
+Together they turn a hung migration into a non-zero exit with a traceback, which cancels the deploy
+and leaves the old instance serving — the outcome `start.sh` was always documented as producing. If a
+migration ever legitimately needs more than five minutes (an index build on a large table is the
+realistic case), raise `COMMAND_TIMEOUT_S` deliberately rather than removing it; the statement runs
+inside `context.begin_transaction()`, so a timeout rolls back rather than half-applying a schema.
