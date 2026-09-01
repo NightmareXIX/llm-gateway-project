@@ -87,3 +87,13 @@ NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     404: _error_doc("No such resource, or it belongs to someone else."),
 }
 """Per-route. Ownership misses are 404s, so this covers both cases."""
+
+CONFLICT_RESPONSE: dict[int | str, dict[str, Any]] = {
+    409: _error_doc(
+        "The request conflicts with one already made — a reused `Idempotency-Key`, "
+        "or one whose original request is still in flight."
+    ),
+}
+"""Per-route, like :data:`NOT_FOUND_RESPONSE`. D6's two 409s
+(``idempotency_key_reuse`` and ``idempotency_in_flight``) are the only ones the
+gateway emits, so this is declared on the one route that can raise them."""

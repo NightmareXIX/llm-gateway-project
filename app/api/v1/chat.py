@@ -33,17 +33,19 @@ from functools import partial
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.dependency import PrincipalDep, RateLimitDep
 from app.auth.principal import Principal
 from app.cache import exact
+from app.cache import idempotency as idem
 from app.config import get_settings
 from app.core.clock import SYSTEM_CLOCK
-from app.core.errors import InvalidRequest, NotFound
+from app.core.errors import Conflict, InvalidRequest, NotFound
 from app.core.logging import get_logger, get_request_id
 from app.db.models import Conversation, File
 from app.db.repo import conversations as conversations_repo
@@ -52,6 +54,7 @@ from app.db.repo import messages as messages_repo
 from app.deps import (
     BreakerDep,
     ExactCacheDep,
+    IdempotencyDep,
     LatencyDep,
     MetricsDep,
     QuotaDep,
@@ -92,7 +95,12 @@ from app.schemas.chat import (
     ServedBy,
     UsageOut,
 )
-from app.schemas.errors import AUTHENTICATED_ERROR_RESPONSES, NOT_FOUND_RESPONSE, ErrorResponse
+from app.schemas.errors import (
+    AUTHENTICATED_ERROR_RESPONSES,
+    CONFLICT_RESPONSE,
+    NOT_FOUND_RESPONSE,
+    ErrorResponse,
+)
 from app.streaming import sse
 from app.streaming.collector import Collector
 from app.streaming.orchestrator import stream_cached_completion, stream_completion
@@ -155,6 +163,7 @@ ResolverDep = Annotated[AttachmentResolver | None, Depends(_get_resolver)]
     response_model=ChatCompletionResponse,
     responses={
         **NOT_FOUND_RESPONSE,
+        **CONFLICT_RESPONSE,
         400: {"model": ErrorResponse, "description": "The request cannot be served as asked."},
         429: {"model": ErrorResponse, "description": "You are over your own tier's limit."},
         502: {"model": ErrorResponse, "description": "The model provider failed."},
@@ -176,7 +185,145 @@ async def create_chat_completion(
     cache: ExactCacheDep,
     resolver: ResolverDep,
     credentials: CredentialsDep,
+    idempotency: IdempotencyDep,
+    idempotency_key: Annotated[str | None, Header(alias=idem.IDEMPOTENCY_HEADER)] = None,
     _rate_limit: RateLimitDep = None,
+) -> ChatCompletionResponse | StreamingResponse:
+    """D6's gate, and nothing else — the turn itself is :func:`_serve_completion`.
+
+    Split in two at Phase 7 Step 6 rather than grown by fifty lines, because the
+    duty a claim creates is exactly the shape a wrapper expresses: claim, serve,
+    and then *always* one of complete-or-release (trap 3). Inlined, that would
+    mean a ``release`` beside every ``raise`` in a two-hundred-line function, and
+    the one that gets forgotten locks a client's key for a day.
+
+    A request with no ``Idempotency-Key`` header takes this function's fast path
+    — no claim, no ticket, no completion — and reaches :func:`_serve_completion`
+    exactly as it reached the handler before this step existed. That is the
+    property the step is judged on, so it is stated here rather than left to be
+    inferred.
+    """
+    # Rejected here rather than inside the router, because only this layer knows
+    # the name came off a request body and is therefore a 400. Before the
+    # conversation is touched — and before the claim below, so a typo'd slot
+    # neither opens a thread it will never answer nor spends an idempotency key
+    # on a request that was never servable.
+    await _validate_slot(registry, body.model, credentials)
+
+    ticket: idem.ClaimTicket | None = None
+    if idempotency_key is not None:
+        # D47's order is the whole design: the claim happens before the
+        # conversation is resolved (trap 2), before the cache is read, before
+        # quota and before routing. Claim late and a replay has already appended
+        # a duplicate user message and moved `preferred_slot` before discovering
+        # it had nothing to do.
+        ticket = idem.ClaimTicket(
+            store=idempotency,
+            key=_validated_idempotency_key(idempotency_key),
+            user_id=principal.user_id,
+            fingerprint=idem.fingerprint(body, user_id=principal.user_id),
+            request_id=get_request_id() or str(uuid4()),
+            stream=body.stream,
+        )
+        claim = await idempotency.claim(
+            ticket.key,
+            user_id=ticket.user_id,
+            fingerprint=ticket.fingerprint,
+            request_id=ticket.request_id,
+            stream=ticket.stream,
+        )
+        if isinstance(claim, idem.InFlight):
+            raise Conflict(
+                "A request with this Idempotency-Key is still being processed.",
+                code="idempotency_in_flight",
+                headers={"Retry-After": "1"},
+            )
+        if isinstance(claim, idem.FingerprintMismatch):
+            # Stripe's semantics, and D47's: answering a different question
+            # under a reused key is the failure this check exists to prevent.
+            raise Conflict(
+                "This Idempotency-Key was already used for a different request.",
+                code="idempotency_key_reuse",
+            )
+        if isinstance(claim, idem.Replay):
+            replayed = await _serve_replay(
+                session=session,
+                response=response,
+                principal=principal,
+                body=body,
+                envelope=claim.envelope,
+                metrics=metrics,
+            )
+            if replayed is not None:
+                return replayed
+            # A stored envelope this version cannot turn back into a response.
+            # Fail open like every other idempotency failure (D47) — serve the
+            # request — but own nothing: the key belongs to whoever wrote that
+            # envelope, and completing or releasing it here would trample them.
+            ticket = None
+
+    try:
+        served = await _serve_completion(
+            body=body,
+            request=request,
+            response=response,
+            principal=principal,
+            session=session,
+            session_factory=session_factory,
+            registry=registry,
+            breaker=breaker,
+            latency=latency,
+            metrics=metrics,
+            redis=redis,
+            quota=quota,
+            cache=cache,
+            resolver=resolver,
+            credentials=credentials,
+            ticket=ticket,
+        )
+    except BaseException:
+        # Every failure path at once, which is the only way to have them all
+        # (trap 3): a 404 for someone else's conversation, a 400 for a system
+        # message in the wrong place, D13's pre-first-byte routing exhaustion,
+        # and the 500 nobody predicted. A stream that fails *after* its first
+        # byte never comes back through here — the collector releases that one.
+        if ticket is not None:
+            await ticket.release()
+        raise
+
+    # A streamed turn is finished by the collector, long after this returns, so
+    # only a non-streaming answer can be stored here. `isinstance` rather than
+    # `not body.stream`, because it is the response object and not the request
+    # flag that decides whether there is a body in hand to store.
+    if ticket is not None and isinstance(served, ChatCompletionResponse):
+        await ticket.complete(
+            response=served.model_dump(mode="json"),
+            # Set by whichever branch produced this answer, one line before it
+            # returned — read back rather than recomputed, so a replay repeats
+            # what the original actually said about provenance (trap 11).
+            cache_status=response.headers.get(exact.CACHE_HEADER),
+        )
+    return served
+
+
+async def _serve_completion(
+    *,
+    body: ChatCompletionRequest,
+    request: Request,
+    response: Response,
+    principal: Principal,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    registry: ProviderRegistry,
+    breaker: CircuitBreaker,
+    latency: LatencyTable,
+    metrics: MetricsRegistry,
+    redis: Redis,
+    quota: QuotaTracker | None,
+    cache: exact.ExactCache | None,
+    resolver: AttachmentResolver | None,
+    credentials: ProviderCredentials,
+    ticket: idem.ClaimTicket | None = None,
 ) -> ChatCompletionResponse | StreamingResponse:
     """Answer one turn, persisting both halves of it.
 
@@ -185,13 +332,12 @@ async def create_chat_completion(
     D13's: the request-scoped ``session`` above persists the user's message and
     is then let go, exactly as the non-streaming path already did, before either
     branch calls out to a provider that can legitimately take sixty seconds.
-    """
-    # Rejected here rather than inside the router, because only this layer knows
-    # the name came off a request body and is therefore a 400. Before the
-    # conversation is touched, so a typo'd slot does not open a thread it will
-    # never answer.
-    await _validate_slot(registry, body.model, credentials)
 
+    ``ticket`` is carried rather than used: only the streaming branch passes it
+    on, to the :class:`~app.streaming.collector.Collector` that will still be
+    running when this function has long returned. A non-streaming answer is
+    stored by the caller, off the response this returns.
+    """
     conversation = await _resolve_conversation(session, principal=principal, body=body)
     conversation_id = conversation.id
 
@@ -264,6 +410,7 @@ async def create_chat_completion(
             resolver=resolver,
             credentials=credentials,
             session_factory=session_factory,
+            ticket=ticket,
         )
 
     # --- D5/D19: an exact-match hit skips routing, the breaker and quota ---- #
@@ -563,6 +710,134 @@ async def _serve_cache_hit(
 
 
 # --------------------------------------------------------------------------- #
+# D6/D47 — the idempotent replay
+# --------------------------------------------------------------------------- #
+def _validated_idempotency_key(raw: str) -> str:
+    """A client-chosen header that is about to become a Redis key segment.
+
+    Checked here rather than only in ``keys._segment``, which would raise a
+    ``ValueError`` and surface as a 500 for what is plainly the client's
+    mistake. The rules are that function's own, plus D47's length cap: non-empty,
+    no whitespace, printable, and at most
+    :data:`~app.cache.idempotency.MAX_KEY_LENGTH` characters.
+    """
+    if (
+        not raw
+        or len(raw) > idem.MAX_KEY_LENGTH
+        or not raw.isprintable()
+        or any(character.isspace() for character in raw)
+    ):
+        raise InvalidRequest(
+            f"{idem.IDEMPOTENCY_HEADER} must be 1-{idem.MAX_KEY_LENGTH} printable "
+            "characters with no whitespace.",
+            code="invalid_idempotency_key",
+        )
+    return raw
+
+
+async def _serve_replay(
+    *,
+    session: AsyncSession,
+    response: Response,
+    principal: Principal,
+    body: ChatCompletionRequest,
+    envelope: idem.IdempotencyEnvelope,
+    metrics: MetricsRegistry,
+) -> ChatCompletionResponse | StreamingResponse | None:
+    """Hand back the answer this key already produced. ``None`` if it cannot be.
+
+    Nothing is routed, nothing is rendered, no quota moves, and — because the
+    claim is checked before :func:`_resolve_conversation` (trap 2) — no message
+    row is written and ``preferred_slot`` does not move. The one write is a
+    ``requests`` row with :data:`~app.db.repo.requests.STATUS_REPLAYED`, so the
+    client's second call still counts as the request it really was.
+
+    ``None`` means the stored envelope cannot be turned back into a response —
+    a body written by a version whose schema has since changed, say. That is a
+    fail-open case like every other one in D47: the caller serves the request
+    normally rather than 500ing over a bookkeeping record.
+
+    The streaming branch reuses :func:`~app.streaming.orchestrator.stream_cached_completion`
+    unchanged, which is the point of D5 having built it: a replay is framed
+    ``meta`` → ``delta``* → ``done`` exactly like a live stream, and the *only*
+    difference from a cache hit is that this one passes no ``persistence`` —
+    a replay must not write the assistant row the original already wrote.
+    """
+    if envelope.response is None:
+        return None
+    try:
+        stored = ChatCompletionResponse.model_validate(envelope.response)
+    except ValidationError as exc:
+        logger.warning(
+            "idempotency.unreplayable",
+            original_request_id=envelope.request_id,
+            error=str(exc),
+        )
+        return None
+
+    started = time.perf_counter()
+    await usage_logger.record_replay(
+        session,
+        principal=principal,
+        requested_slot=body.model,
+        latency_ms=_elapsed_ms(started),
+        conversation_id=stored.conversation_id,
+        metrics=metrics,
+    )
+    await session.commit()
+
+    # Whatever the original said about provenance, said again (trap 11). The two
+    # headers are different facts: this call computed nothing at all, and
+    # `X-Cache` describes where the answer being repeated originally came from.
+    cache_status = envelope.cache_status or exact.BYPASS
+
+    if body.stream:
+        return StreamingResponse(
+            stream_cached_completion(
+                _as_replayable(stored),
+                requested_slot=body.model,
+                conversation_id=stored.conversation_id,
+                message_id=stored.message_id,
+                latency_ms=_elapsed_ms(started),
+                persistence=None,
+            ),
+            media_type=sse.SSE_MEDIA_TYPE,
+            headers={
+                **sse.SSE_HEADERS,
+                exact.CACHE_HEADER: cache_status,
+                idem.REPLAY_HEADER: "true",
+            },
+        )
+
+    response.headers[exact.CACHE_HEADER] = cache_status
+    response.headers[idem.REPLAY_HEADER] = "true"
+    return stored
+
+
+def _as_replayable(stored: ChatCompletionResponse) -> exact.CachedResponse:
+    """The stored body, in the shape the SSE replay machinery already takes.
+
+    A :class:`~app.cache.exact.CachedResponse` is "an answer with no attempt
+    behind it", which is precisely what a replay is too — so the conversion is
+    total rather than lossy, and no second replay path had to be written.
+    ``created_at`` is this moment because nothing reads it here: it exists for
+    the cache's own bookkeeping and this value is never stored.
+    """
+    choice = stored.choices[0]
+    return exact.CachedResponse(
+        text=choice.message.content,
+        provider=stored.served_by.provider,
+        model=stored.served_by.model,
+        slot=stored.served_by.slot,
+        finish_reason=choice.finish_reason,
+        tokens_in=stored.usage.prompt_tokens,
+        tokens_out=stored.usage.completion_tokens,
+        usage_estimated=stored.usage.estimated,
+        created_at=SYSTEM_CLOCK.now().isoformat(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # The streaming twin (D13/D14)
 # --------------------------------------------------------------------------- #
 async def _stream_chat_completion(
@@ -584,6 +859,7 @@ async def _stream_chat_completion(
     resolver: AttachmentResolver | None,
     credentials: ProviderCredentials,
     session_factory: async_sessionmaker[AsyncSession],
+    ticket: idem.ClaimTicket | None = None,
 ) -> StreamingResponse:
     """Drive the router loop far enough to know whether anything will be sent,
     *before* committing to a 200 (D13).
@@ -635,7 +911,15 @@ async def _stream_chat_completion(
                     conversation_id=conversation.id,
                     message_id=message_id,
                     latency_ms=_elapsed_ms(started),
-                    persistence=Collector(session_factory, principal=principal, metrics=metrics),
+                    persistence=Collector(
+                        session_factory,
+                        principal=principal,
+                        metrics=metrics,
+                        # D6: a streamed cache hit still finishes a claim, and
+                        # the collector is the only thing still running when it
+                        # does.
+                        idempotency=ticket,
+                    ),
                 ),
                 media_type=sse.SSE_MEDIA_TYPE,
                 headers=headers,
@@ -670,6 +954,10 @@ async def _stream_chat_completion(
             cache=cache,
             cache_key=cache_key,
             metrics=metrics,
+            # D6's far end (trap 3): this endpoint returns a `StreamingResponse`
+            # long before the answer exists, so the claim is completed — or
+            # released, on an in-band failure — by the collector instead.
+            idempotency=ticket,
         ),
         is_disconnected=partial(sse.client_disconnected, request),
     ).__aiter__()

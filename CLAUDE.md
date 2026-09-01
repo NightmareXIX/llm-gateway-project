@@ -113,7 +113,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–5 of 12 committed.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–6 of 12 committed — Milestone A done, Milestone B half done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -317,6 +317,77 @@ the TTL after both `claim` and `complete`, the concurrent single-winner, and fai
 `get` and `delete` plus a corrupt envelope and a key that vanished between the `SET` and the `GET`.
 `make test` (1468 passed, 1 skipped), `ruff check`, `ruff format --check` and `mypy` are green; `grep`
 confirms nothing in `app/api/` imports the module yet, per the step's own "done when."
+
+Step 6 (D6/D47, idempotency wired into both chat paths) touches the files `phase7.md` names —
+`app/api/v1/chat.py`, `app/streaming/collector.py`, `app/usage/logger.py`, `app/schemas/errors.py`,
+`tests/integration/test_idempotency.py` (new) — with one on that list needing nothing
+(`app/db/repo/requests.py`'s "one constant" is `STATUS_REPLAYED`, which Step 2 already named one step
+early per trap 18) and one beyond it, `app/cache/idempotency.py`, for two reasons given below.
+`record_replay` is the fifth facade in `usage/logger.py`, for the reason `record_cache_hit` was the
+fourth: a replay has no `ModelSpec`, no trail and no tokens, so `provider`/`model`/`served_slot` stay
+NULL — which the repo docstring already defines as "never got that far", literally true here — and it
+counts in `gateway_requests_total` under `status="replayed"` but is deliberately **not** timed, the
+same rule a cache hit gets (D49): a replay's latency is a property of Redis.
+
+**The endpoint is now a wrapper and an inner function.** `create_chat_completion` holds D6's gate —
+read the header, claim, handle the four outcomes — and `_serve_completion` is the previous handler
+body, unchanged, taking a `ticket` it only passes on. That split is the trap-3 machinery rather than
+tidiness: a claim creates a duty to call exactly one of `complete`/`release`, and the only way to
+cover *every* failure path (a 404 for someone else's conversation, a 400 for a misplaced system
+message, D13's pre-first-byte exhaustion, the 500 nobody predicted) is one `except BaseException`
+around the whole turn. Inlined, that would be a `release` beside every `raise` in a two-hundred-line
+function, and the one that gets forgotten locks a client's key for a day. The claim itself sits
+between `_validate_slot` and `_resolve_conversation` exactly as trap 2 requires, so a replay opens no
+thread, appends no message and does not move `preferred_slot` — and a typo'd slot burns no key.
+
+**A streamed turn is completed by the collector, not the endpoint**, which returns a
+`StreamingResponse` long before the answer exists. `Collector` gained one optional `idempotency=`
+argument: `_persist_success` and `persist_cache_hit` complete the claim, `_persist_failure` releases
+it. The streamed cache-hit path is the one with the most ways to drop a ticket — it never reaches
+`persist` at all — and has its own test. A replay is served through `stream_cached_completion`
+unchanged, which is what D5 built it for: the same `meta` → `delta`* → `done` framing, the *only*
+difference from a cache hit being that a replay passes no `persistence`, because the original already
+wrote the assistant row.
+
+Two additions to `app/cache/idempotency.py` beyond Step 5's frozen surface, both forced by this
+step's own points rather than convenient. `ClaimTicket` bundles the six values a claim needs, because
+the endpoint and the collector both hold them and six parallel arguments across that seam is how the
+fingerprint written on `complete` comes to disagree with the one `claim` stored. And the envelope
+gained `cache_status`, because point 5 says a replay of a request that was originally a cache hit
+carries *both* `X-Cache: HIT` and `X-Idempotent-Replay: true` (trap 11) — a replay recomputes no
+cache key, so the only honest thing it can say about provenance is what the original said, and
+nothing else in the stored `ChatCompletionResponse` records it. Neither is a Contract C amendment:
+the key format is still `idem:{user_id}:{idem_key}`, and the module docstring has said since Step 5
+why the *value* was never frozen. `from_json` reads the new field leniently, so an envelope written
+before this commit still replays.
+
+A stored body this version cannot revalidate (`ValidationError`) is the one case that neither
+replays nor 409s: it logs `idempotency.unreplayable`, serves the request normally, and **owns
+nothing** — no `complete`, no `release` — because the key belongs to whoever wrote that envelope.
+That is the same fail-open rule every other Redis failure gets (D47), applied to a schema drift
+rather than an outage.
+
+15 new integration cases (`tests/integration/test_idempotency.py`), every one of them sending a
+`temperature` away from zero unless it is deliberately testing the cache interaction — otherwise D19
+would answer the second call itself and "one provider call" would pass for a reason that has nothing
+to do with idempotency. They cover the headline case (identical body, one upstream call, one
+conversation, two message rows, no quota counter moved, `X-Idempotent-Replay: true`, a
+`status='replayed'` row with NULL provider pointing at the original's conversation); the reused key
+as a 409 `idempotency_key_reuse` that writes no row at all; an `in_flight` envelope written by hand
+becoming a 409 `idempotency_in_flight` with `Retry-After: 1` (the store's own `asyncio.gather`
+single-winner test already proves `SET NX` does the work — what is under test here is the endpoint's
+half, and racing for it would only add flakiness); a failed turn releasing its key and the retry
+really re-running, scripted with `bad_request` rather than `rate_limited` precisely because a 429
+opens the breaker and the retry would then be skipped before reaching the upstream the test needs;
+the streaming twin, frame for frame against the live stream; a streamed pre-first-byte failure
+releasing through the endpoint's own `except`; both cache-hit-replay paths carrying both headers; the
+replay counted on its own metrics axis while the duration histogram stays put; a dead Redis serving
+both requests rather than neither; four unusable header values as 400 `invalid_idempotency_key`
+before anything happens; and the regression guard — a request with no header, asserted against a body
+spelled out field by field, making two provider calls and two conversations exactly as it did before
+this step existed. `make test` (1483 passed, 1 skipped), `ruff check`, `ruff format --check` and
+`mypy` are green, and the whole pre-existing suite passed unchanged, which is the step's own "the
+no-header path is provably unchanged."
 
 ## Phase 6 — BYOK Settings — complete
 

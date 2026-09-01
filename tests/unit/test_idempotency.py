@@ -111,7 +111,7 @@ def test_the_envelope_is_written_in_full_including_defaults() -> None:
         ).to_json()
     )
 
-    assert set(raw) == {"state", "fingerprint", "request_id", "stream", "response"}
+    assert set(raw) == {"state", "fingerprint", "request_id", "stream", "response", "cache_status"}
 
 
 def test_an_unknown_key_is_ignored_rather_than_fatal() -> None:

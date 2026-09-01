@@ -197,6 +197,17 @@ class IdempotencyEnvelope:
     stream: bool
     response: dict[str, Any] | None = None
 
+    cache_status: str | None = None
+    """The ``X-Cache`` value the *original* request returned, carried so a replay
+    can repeat it (Step 6, trap 11).
+
+    ``X-Cache`` and :data:`REPLAY_HEADER` are different facts, and a replay
+    computes neither: it recomputes no cache key and attempts no candidate, so
+    the only honest thing it can say about provenance is what the original said.
+    A replay of a turn that was itself a cache hit therefore carries ``HIT`` and
+    ``X-Idempotent-Replay: true`` together. ``None`` on an ``in_flight``
+    envelope, where there is no answer to have a provenance yet."""
+
     def to_json(self) -> str:
         """Written in full, defaults included — the rule
         :meth:`app.memory.canonical.MessageMeta.to_jsonb` already follows, so a
@@ -208,6 +219,7 @@ class IdempotencyEnvelope:
                 "request_id": self.request_id,
                 "stream": self.stream,
                 "response": self.response,
+                "cache_status": self.cache_status,
             },
             separators=(",", ":"),
         )
@@ -246,12 +258,17 @@ class IdempotencyEnvelope:
         if response is not None and not isinstance(response, dict):
             raise ValueError("idempotency envelope's response must be an object or null")
 
+        cache_status = data.get("cache_status")
+        if cache_status is not None and not isinstance(cache_status, str):
+            raise ValueError("idempotency envelope's cache_status must be a string or null")
+
         return cls(
             state=state,
             fingerprint=stored_fingerprint,
             request_id=request_id,
             stream=stream,
             response=response,
+            cache_status=cache_status,
         )
 
 
@@ -378,6 +395,7 @@ class IdempotencyStore:
         request_id: str,
         stream: bool,
         response: dict[str, Any],
+        cache_status: str | None = None,
     ) -> None:
         """Turn this request's claim into a replayable answer.
 
@@ -393,6 +411,7 @@ class IdempotencyStore:
             request_id=request_id,
             stream=stream,
             response=response,
+            cache_status=cache_status,
         )
         try:
             await self._redis.set(
@@ -419,6 +438,48 @@ class IdempotencyStore:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ClaimTicket:
+    """One claim, held by whoever has to finish it.
+
+    Step 6 needs the same six values in two places — the endpoint, which
+    completes a non-streaming turn and releases every failure it can see, and
+    :class:`~app.streaming.collector.Collector`, which owns the far end of a
+    streamed one long after the endpoint has returned. Passing six parallel
+    arguments through that seam is how the fingerprint written on ``complete``
+    ends up disagreeing with the one ``claim`` stored; a ticket is one object
+    that cannot come apart.
+
+    Holding it is a *duty*, not a convenience: whoever has one must call exactly
+    one of :meth:`complete` or :meth:`release` (trap 3). A ticket that is dropped
+    leaves an ``in_flight`` envelope behind for a day, and answers the client's
+    retry — the exact thing D6 exists to serve — with a 409.
+    """
+
+    store: IdempotencyStore
+    key: str
+    user_id: str | UUID
+    fingerprint: str
+    request_id: str
+    stream: bool
+
+    async def complete(self, *, response: dict[str, Any], cache_status: str | None = None) -> None:
+        """This request's answer, stored for the retry that may never come."""
+        await self.store.complete(
+            self.key,
+            user_id=self.user_id,
+            fingerprint=self.fingerprint,
+            request_id=self.request_id,
+            stream=self.stream,
+            response=response,
+            cache_status=cache_status,
+        )
+
+    async def release(self) -> None:
+        """Give the key back, so the client's retry really retries."""
+        await self.store.release(self.key, user_id=self.user_id)
+
+
 __all__ = [
     "DONE",
     "FINGERPRINT_VERSION",
@@ -427,6 +488,7 @@ __all__ = [
     "MAX_KEY_LENGTH",
     "REPLAY_HEADER",
     "ClaimResult",
+    "ClaimTicket",
     "Claimed",
     "EnvelopeState",
     "FingerprintMismatch",

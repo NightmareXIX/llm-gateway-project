@@ -29,22 +29,42 @@ has no notion of a :class:`Principal` — quota and ownership are this
 module's concerns, not the router's. So a :class:`Collector` is built once
 per request, with the caller's principal closed over, and reused for the one
 result it will ever be handed.
+
+**And, since Phase 7 Step 6, the far end of a streamed turn's idempotency
+claim.** The endpoint claims the key before anything is written and then
+returns a ``StreamingResponse`` long before the answer exists, so it cannot be
+the thing that stores it. This class already runs at exactly the moment the
+answer is complete and already assembles the full text for the exact cache
+(D5), which makes it the one place that can honour the ticket's duty (D47,
+trap 3): :meth:`_persist_success` and :meth:`persist_cache_hit` complete it,
+:meth:`_persist_failure` releases it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.principal import Principal
+from app.cache import exact
 from app.cache.exact import CachedResponse, ExactCache
+from app.cache.idempotency import ClaimTicket
 from app.core.clock import SYSTEM_CLOCK
 from app.db.repo import messages as messages_repo
 from app.keys_resolution.resolver import quota_scope_for
 from app.memory.canonical import MessageMeta, text_block
+from app.providers.types import ExtractionTier
+from app.schemas.chat import (
+    AssistantMessage,
+    ChatCompletionResponse,
+    Choice,
+    ServedBy,
+    UsageOut,
+)
 from app.streaming.orchestrator import StreamResult
 from app.usage import logger as usage_logger
 from app.usage.metrics import STREAM, MetricsRegistry
@@ -75,10 +95,16 @@ class Collector:
         cache: ExactCache | None = None,
         cache_key: str | None = None,
         metrics: MetricsRegistry | None = None,
+        idempotency: ClaimTicket | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._principal = principal
         self._metrics = metrics
+        self._idempotency = idempotency
+        """D6's claim, handed over by the endpoint because a streamed turn
+        finishes here. ``None`` whenever the request carried no
+        ``Idempotency-Key`` — which is every request that predates Step 6, and
+        is why nothing else in this class had to change shape."""
         self._cache = cache
         self._cache_key = cache_key
         """D19's write side, threaded in rather than recomputed: ``cache_key`` is
@@ -181,6 +207,34 @@ class Collector:
                 ),
             )
 
+        # D6's far end: the answer exists, so the claim becomes replayable. The
+        # `X-Cache` this turn returned is derived rather than threaded in — the
+        # endpoint set it from exactly this expression before the stream began,
+        # and a second parameter carrying the same fact is a second thing to get
+        # wrong.
+        if self._idempotency is not None:
+            await self._idempotency.complete(
+                response=_replay_body(
+                    request_id=self._idempotency.request_id,
+                    served_by=ServedBy(slot=spec.slot, provider=spec.provider, model=spec.model),
+                    text=result.text,
+                    finish_reason=result.finish_reason,
+                    tokens_in=result.usage.tokens_in,
+                    tokens_out=result.usage.tokens_out,
+                    estimated=result.usage.estimated,
+                    requested_slot=result.requested_slot,
+                    substituted=result.substituted,
+                    attempts=result.attempts,
+                    degraded=result.degraded,
+                    extraction_tier=result.extraction_tier,
+                    messages_dropped=result.messages_dropped,
+                    key_pool=result.key_pool,
+                    conversation_id=result.conversation_id,
+                    message_id=result.message_id,
+                ),
+                cache_status=exact.MISS if self._cache_key is not None else exact.BYPASS,
+            )
+
     async def persist_cache_hit(
         self,
         *,
@@ -238,6 +292,34 @@ class Collector:
             )
             await session.commit()
 
+        # A replay of a cache hit carries both `X-Cache: HIT` and
+        # `X-Idempotent-Replay: true` (trap 11) — two different facts about two
+        # different calls, and this is where the first of them is remembered.
+        if self._idempotency is not None:
+            await self._idempotency.complete(
+                response=_replay_body(
+                    request_id=self._idempotency.request_id,
+                    served_by=ServedBy(slot=slot, provider=provider, model=model),
+                    text=text,
+                    # A cached answer is a complete one by construction: nothing
+                    # partial is ever written to the cache.
+                    finish_reason="stop",
+                    tokens_in=0,
+                    tokens_out=0,
+                    estimated=False,
+                    requested_slot=requested_slot,
+                    substituted=substituted,
+                    attempts=0,
+                    degraded=False,
+                    extraction_tier=None,
+                    messages_dropped=0,
+                    key_pool=None,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                ),
+                cache_status=exact.HIT,
+            )
+
     async def _persist_failure(self, session: AsyncSession, result: StreamResult) -> None:
         """No ``messages`` row. Invariant 4 — an empty or half-written
         generation is an error, not a stored message — and by the time a
@@ -264,6 +346,72 @@ class Collector:
             metrics=self._metrics,
             key_pool=result.key_pool,
         )
+
+        # Trap 3: an in-band stream failure is still a failure, and a client
+        # that retries it must not be answered with a 409 for the next day.
+        if self._idempotency is not None:
+            await self._idempotency.release()
+
+
+def _replay_body(
+    *,
+    request_id: str,
+    served_by: ServedBy,
+    text: str,
+    finish_reason: str,
+    tokens_in: int,
+    tokens_out: int,
+    estimated: bool,
+    requested_slot: str,
+    substituted: bool,
+    attempts: int,
+    degraded: bool,
+    extraction_tier: ExtractionTier | None,
+    messages_dropped: int,
+    key_pool: Literal["shared", "private"] | None,
+    conversation_id: UUID,
+    message_id: UUID,
+) -> dict[str, Any]:
+    """The stored answer, in the one shape a replay is served from.
+
+    A second builder beside ``api/v1/chat.py``'s ``_to_response`` rather than a
+    shared one, because the two read from genuinely different things — that one
+    from a request body and a stored :class:`CanonicalMessage`, this one from a
+    finished :class:`StreamResult` that has neither. What they must agree on is
+    the *shape*, and ``ChatCompletionResponse`` is what enforces that: a field
+    added to the model and forgotten here is a ``ValidationError`` at this call,
+    not a subtly short replay.
+
+    ``warning`` is deliberately absent (it defaults to ``None``). A streamed
+    envelope is only ever replayed as a stream — :func:`fingerprint` folds in
+    ``stream``, so the two can never cross — and
+    :func:`~app.streaming.orchestrator.stream_cached_completion` builds its own
+    ``done`` event without reading this field at all.
+    """
+    return ChatCompletionResponse(
+        id=request_id,
+        created=int(SYSTEM_CLOCK.now().timestamp()),
+        model=served_by.model,
+        choices=[
+            Choice(index=0, message=AssistantMessage(content=text), finish_reason=finish_reason)
+        ],
+        usage=UsageOut(
+            prompt_tokens=tokens_in,
+            completion_tokens=tokens_out,
+            total_tokens=tokens_in + tokens_out,
+            estimated=estimated,
+        ),
+        served_by=served_by,
+        requested_slot=requested_slot,
+        substituted=substituted,
+        attempts=attempts,
+        degraded=degraded,
+        extraction_tier=extraction_tier,
+        messages_dropped=messages_dropped,
+        key_pool=key_pool,
+        conversation_id=conversation_id,
+        message_id=message_id,
+    ).model_dump(mode="json")
 
 
 __all__ = ["Collector"]

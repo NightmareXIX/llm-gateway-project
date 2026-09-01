@@ -304,6 +304,65 @@ async def record_cache_hit(
     return row
 
 
+async def record_replay(
+    session: AsyncSession,
+    *,
+    principal: Principal,
+    requested_slot: str,
+    latency_ms: int,
+    conversation_id: UUID | None = None,
+    metrics: MetricsRegistry | None = None,
+) -> Request:
+    """Record a turn answered from D6's idempotency store rather than computed.
+
+    The fifth facade function, and a separate one for exactly the reason
+    :func:`record_cache_hit` was the fourth: a replay has no
+    :class:`~app.providers.types.ModelSpec`, no attempt trail and no tokens. It
+    is the *same* answer handed back a second time, so it is not a success and
+    it is certainly not a failure — hence its own ``status`` (D47), which
+    ``requests_repo``'s aggregates have already been reading since Step 2
+    (trap 18).
+
+    ``provider``/``model``/``served_slot`` stay NULL, which the repo docstring
+    already defines as "never got that far" — literally true here: nothing was
+    routed, so the replay stays out of provider distribution and out of cost
+    while request volume still counts it, because the client really did make two
+    requests. ``quota_scope`` is ``"system"`` for the same reason a cache hit's
+    is: no credential was resolved and nothing was spent.
+    """
+    # Counted, not timed — the same rule a cache hit gets (D49). A replay's
+    # latency is a property of Redis, and folding it into a provider's histogram
+    # would drag that distribution toward zero. There is no provider or model to
+    # label it with either, which is exactly what the row says too.
+    if metrics is not None:
+        metrics.record_request(
+            provider=None,
+            model=None,
+            status=requests_repo.STATUS_REPLAYED,
+            key_pool=None,
+        )
+    row = await requests_repo.create(
+        session,
+        user_id=principal.user_id,
+        api_key_id=principal.api_key_id,
+        conversation_id=conversation_id,
+        requested_slot=requested_slot,
+        latency_ms=latency_ms,
+        status=requests_repo.STATUS_REPLAYED,
+        cache_hit=False,
+        attempts=[],
+    )
+
+    logger.info(
+        "chat.replayed",
+        request_row_id=str(row.id),
+        conversation_id=str(conversation_id) if conversation_id else None,
+        requested_slot=requested_slot,
+        latency_ms=latency_ms,
+    )
+    return row
+
+
 async def record_stream_failure(
     session: AsyncSession,
     *,
