@@ -155,7 +155,11 @@ someone else asking the identical question; that trade is written down in
 make dev        # docker-compose: app + Postgres + Redis
 make test        # pytest, no live provider calls — everything is recorded fixtures
 make migrate      # alembic upgrade head
+make chaos-demo    # kill providers under load and watch nobody notice
 ```
 
 See [`.env.example`](.env.example) for required configuration and
 [`docs/deploy.md`](docs/deploy.md) for the deployed-instance runbook.
+[`docs/chaos-demo.md`](docs/chaos-demo.md) explains the chaos run — 360 requests, five
+candidates killed and revived on a schedule, zero client-visible failures — and, just as
+importantly, what an in-process mock does not prove.

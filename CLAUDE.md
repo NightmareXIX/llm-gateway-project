@@ -113,7 +113,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–9 of 12 committed — Milestones A and B done, Milestone C started.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–10 of 12 committed — Milestones A and B done, Milestone C under way.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -527,6 +527,69 @@ same split `ProviderKeysSection`/`useProviderKeys` already model. `make frontend
 `make frontend-lint`, `tsc --noEmit` and `next build` (which lists `/usage` at 4.74 kB) are all
 green, and the backend unit suite still passes untouched. The definition of done's live render for a
 real zero-request account is not something this pass ran.
+
+Step 10 (D50, the chaos demo) touches the files `phase7.md` names — `scripts/chaos_demo.py` (new),
+`docs/chaos-demo.md` (new), `Makefile` (a `chaos-demo` target), `README.md` (one link) — plus one
+the step's list does not name and one it forbids-by-implication but is not: `config/providers.yaml`,
+for a real bug the script found on its first run (below). **`git diff --stat` shows nothing under
+`app/`**, which is the step's own constraint and trap 14: a chaos toggle a deployed service can
+reach is a permanent hole punched in the gateway for the sake of one recording, so the script builds
+the real app with `create_app()` over `httpx.ASGITransport`, supplies by hand everything the
+lifespan would (the ASGI transport does not run it), and fakes only the far side of the wire — an
+`httpx.MockTransport` serving `tests/fixtures/provider_responses/` whose per-candidate behaviour it
+flips as the run progresses. It reads those fixtures as *files* rather than importing `tests`, under
+the same rule `record_fixtures.py` already states about not depending on the suite. It drives load
+through the real `gw_live_` API-key path (D7's programmatic half, and `X-API-Key` — a gateway key in
+`Authorization` is a 401 by design), inserting its own `users` row and deleting it afterwards unless
+`--keep-data` says to leave the rows for `/usage`.
+
+Three things carry the step. **The schedule is expressed in rounds and sized from the gateway's own
+constants**, not in wall-clock weights: phase 2 must land `FAILURE_THRESHOLD` failures on
+`general`'s first candidate to open its breaker, and phases 2–4 must finish inside one
+`COOLDOWN_INITIAL_S` or the half-open probe that fires mid-phase-4 spends the attempt the spill
+needs. When a short `--duration` or a single client cannot honour both, the script **drops** the
+substitution phase rather than running it into a failure it would deserve. **Phase 4 is the only
+shape in this fleet that can produce a `substituted: true` at all** — every slot is backed by the
+same three providers, so a per-provider outage is always absorbed by failover *inside* the slot,
+which is why `Phase.kills` is keyed by either a provider or a single `provider/model` and why that
+phase rate-limits exactly `general`'s three candidates while `fast`'s stay healthy. It fits in D1's
+three attempts only because a breaker-skipped candidate is not an attempt, and because a 429 (unlike
+an `Unavailable`) is not retried on the same provider. **The summary is split into `plan` and
+`outcome`** rather than claimed reproducible wholesale: `plan` (seed, workload, phase schedule) is
+byte-identical between two runs of one seed — verified — and the headline outcome reproduces (360
+requests, zero client-visible failures, all 200s), while the attempt histogram and substitution
+count move by a request or two because a breaker's cooldown expires against a wall clock and a
+request arriving either side of that boundary routes differently. Saying so is the same disclosure
+discipline the gateway applies to its own answers. A streamed turn's terminal `done` event with
+`status: "failed"` is counted as a client-visible failure even though it rode on a 200, and the
+script exits non-zero on any, so it works as a check and not only as a demo.
+
+Four settings are overridden before `create_app()`, all pre-existing documented switches:
+`RATE_LIMIT_ENABLED=false` (D20 caps one user at 20 rpm and this demo *is* one user by
+construction), `QUOTA_ENFORCEMENT=false` (`limits.yaml` describes real free-tier windows a load demo
+saturates in seconds; `--quota` turns it back on and the failure count climbs for reasons unrelated
+to providers dying), `ROUTING_LATENCY_RANKING=false` (D11 reordering makes two runs of one seed
+disagree about who served what) and `FILES_STORAGE_BACKEND=memory`. Redis is `fakeredis` by default
+so a run starts from a clean fleet, imported lazily so the script still runs where the dev extra is
+not installed.
+
+**The demo found a real bug on its first run, fixed in this commit rather than reported:**
+`config/providers.yaml` declared OpenRouter's `nvidia/nemotron-3-super-120b-a12b:free` with
+`max_output_tokens` equal to its whole 262144-token context window, which leaves
+`fitting.input_budget` nothing for input; `render` raises `ContextTooLong`, which Contract A makes
+**failover-ineligible**, so the whole turn 400s. Nothing in the suite reached that candidate,
+because nothing routes that far unless both Groq and Gemini are already down — exactly the situation
+the candidate exists for. Now 65536, with the reasoning in the YAML. That is the argument for the
+script existing: the third-choice candidate is the one nobody exercises and the one you need most.
+
+`docs/chaos-demo.md` carries a real captured transcript (seed 1: 360 requests, 81 streamed, five
+targets killed, zero client-visible failures, 18 substitutions, seven breaker transitions including
+a full `open -> half_open -> closed`), the reproducibility recipe, the table of what is switched off
+and why, and a "what this does not demonstrate" section — an in-process mock is not a network, the
+latencies are not latencies, one worker proves nothing about two, and zero failures is a claim about
+*this* schedule rather than a proof that no schedule produces one. `make test` (1494 passed, 1
+skipped), `ruff check`, `ruff format --check` and `mypy` are green, and two `--seed 1` runs produced
+an identical `plan` block and zero failures each, per the step's own "done when."
 
 ## Phase 6 — BYOK Settings — complete
 

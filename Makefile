@@ -15,7 +15,7 @@
 # and every integration test errors on a refused connection.
 
 .PHONY: install dev test coverage lint typecheck migrate revision record-fixtures \
-        docker-build docker-run deploy \
+        chaos-demo docker-build docker-run deploy \
         frontend-install frontend-dev frontend-build frontend-lint frontend-test
 
 PYTHON ?= python
@@ -57,6 +57,17 @@ revision:
 # make record-fixtures ARGS="--provider gemini --only success"
 record-fixtures:
 	$(PYTHON) -m scripts.record_fixtures $(ARGS)
+
+# The load-and-chaos demo: N concurrent clients against the real app while its
+# providers die and recover on a schedule. Needs Postgres up (`docker compose up
+# -d postgres`); Redis is fakeredis unless --redis-url says otherwise, and no
+# provider is called — the upstream is the recorded fixtures the suite already
+# commits. Calls no live API, writes only its own rows, and deletes them again.
+# See docs/chaos-demo.md.
+# make chaos-demo ARGS="--seed 7 --json run.json"
+# make chaos-demo ARGS="--duration 30 --concurrency 2"
+chaos-demo:
+	$(PYTHON) -m scripts.chaos_demo $(ARGS)
 
 # --------------------------------------------------------------------------- #
 # Deployment — see docs/deploy.md.
