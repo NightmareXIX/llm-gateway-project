@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import { cn } from "@/lib/cn";
@@ -21,10 +22,11 @@ import { Skeleton } from "./ui/Skeleton";
  * *around* the conversation list instead of being given their own surface.
  *
  * A modal fixes the crowding and the discoverability at once. It is still not a
- * settings *page* — model preferences and usage belong to Phase 7 — but Phase 6
+ * settings *page* — model preferences belong to a later phase — but Phase 6
  * gave it the third thing an account genuinely owns: the provider keys that
- * decide whose credential answers your messages (§9.2). It now holds who you
- * are, whose key pays, how it looks, and the way out.
+ * decide whose credential answers your messages (§9.2), and Phase 7 added the
+ * one link to what all of that has actually spent. It now holds who you are,
+ * whose key pays, what it cost, how it looks, and the way out.
  */
 export function AccountDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { me, isLoading } = useMe();
@@ -78,6 +80,24 @@ export function AccountDialog({ open, onClose }: { open: boolean; onClose: () =>
               </div>
             </dl>
           )}
+        </section>
+
+        <section>
+          <h3 className="mb-2 text-sm font-medium text-ink">Usage</h3>
+          <p className="mb-2 text-xs leading-relaxed text-ink-tertiary">
+            Request volume, which provider served what, how often the gateway had to fail over,
+            and what it would have cost at list prices.
+          </p>
+          {/* Closes on the way out: the dialog is rendered by the chat shell,
+              and leaving it mounted over a route it no longer belongs to is
+              how a modal ends up hovering above the page you navigated to. */}
+          <Link
+            href="/usage"
+            onClick={onClose}
+            className="text-sm font-medium text-accent underline-offset-4 hover:underline"
+          >
+            View your usage
+          </Link>
         </section>
 
         <ProviderKeysSection />

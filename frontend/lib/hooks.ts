@@ -4,7 +4,16 @@ import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import useSWR, { mutate as globalMutate } from "swr";
 
-import { GatewayError, NetworkError, PROVIDER_KEYS_KEY, api, swrFetcher } from "./api";
+import {
+  ADMIN_QUOTA_KEY,
+  ADMIN_REQUESTS_KEY,
+  GatewayError,
+  NetworkError,
+  PROVIDER_KEYS_KEY,
+  api,
+  swrFetcher,
+  usageKey,
+} from "./api";
 import { MAX_ATTACHMENTS, rejectionFor, uploadFailureReason, type SentAttachment } from "./files";
 import { deriveTitle } from "./format";
 import { buildAttemptTrail, fromDoneEvent, fromMetaEvent, type Provenance } from "./provenance";
@@ -18,6 +27,9 @@ import type {
   MessageMeta,
   ModelsResponse,
   ProviderKeyStatus,
+  RequestsResponse,
+  UsageOverview,
+  UsageWindow,
 } from "./types";
 
 export const CONVERSATIONS_KEY = "/v1/conversations";
@@ -225,6 +237,53 @@ export function useProviderKeys() {
   );
 
   return { rows: data, error, isLoading, add, remove, revalidate };
+}
+
+// --------------------------------------------------------------------------- //
+// The usage dashboard (Phase 7, Step 9)
+// --------------------------------------------------------------------------- //
+/**
+ * One window's aggregates, keyed by that window.
+ *
+ * `usageKey(window)` *is* the SWR key, so the switch at the top of the page is
+ * a key change and not a refetch of one entry: each window keeps its own cache
+ * entry, switching back is instant, and there is never a frame where the
+ * heading says "last 7 days" over numbers computed for the last hour.
+ *
+ * Not revalidated on focus. These are read-only aggregates over a window that
+ * is usually hours wide; re-running four `GROUP BY`s every time a tab regains
+ * focus buys nothing a manual reload does not.
+ */
+export function useUsage(window: UsageWindow) {
+  const { data, error, isLoading, mutate } = useSWR<UsageOverview>(usageKey(window), swrFetcher, {
+    revalidateOnFocus: false,
+  });
+  return { usage: data, error, isLoading, mutate };
+}
+
+/**
+ * Per-candidate quota utilization under the caller's own resolved scope (D44).
+ *
+ * A separate key from `MODELS_KEY` even though `/v1/admin/quota` delegates to
+ * the very same handler: the two are the same *answer* and deliberately not
+ * the same *cache entry*. The picker's copy is revalidated after every turn
+ * and after every key write (`useProviderKeys`); the dashboard's is a
+ * point-in-time read of a page the user opened on purpose, and sharing one
+ * entry would make each surface's refresh policy the other's.
+ */
+export function useQuotaOverview() {
+  const { data, error, isLoading } = useSWR<ModelsResponse>(ADMIN_QUOTA_KEY, swrFetcher, {
+    revalidateOnFocus: false,
+  });
+  return { quota: data, error, isLoading };
+}
+
+/** The caller's most recent calls, for the table under the charts. */
+export function useRecentRequests() {
+  const { data, error, isLoading } = useSWR<RequestsResponse>(ADMIN_REQUESTS_KEY, swrFetcher, {
+    revalidateOnFocus: false,
+  });
+  return { requests: data?.data, error, isLoading };
 }
 
 // --------------------------------------------------------------------------- //

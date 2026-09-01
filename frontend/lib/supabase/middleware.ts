@@ -1,8 +1,13 @@
 import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-/** Routes that require a session. Everything else is public. */
-const PROTECTED_PREFIXES = ["/chat"];
+/** Routes that require a session. Everything else is public.
+ *
+ *  `/usage` is here for the same reason `/chat` is: every byte it renders
+ *  comes from an authenticated gateway route, so a signed-out visitor would
+ *  otherwise get the page frame and a column of 401s instead of the login
+ *  form. */
+const PROTECTED_PREFIXES = ["/chat", "/usage"];
 
 /** Routes a signed-in user has no reason to see. */
 const AUTH_ONLY_PREFIXES = ["/login"];

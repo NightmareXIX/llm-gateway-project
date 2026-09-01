@@ -113,7 +113,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–8 of 12 committed — Milestones A and B done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–9 of 12 committed — Milestones A and B done, Milestone C started.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -462,6 +462,71 @@ still on a prepend and staying put on an append. `ConversationView.test.tsx`'s h
 new return fields. `make frontend-test` (154 passing), `make frontend-lint`, `tsc --noEmit` and
 `next build` are all green; the definition of done's live 300-message scroll is not something this
 pass ran.
+
+Step 9 (D44/D46/D51, the usage page) touches the files `phase7.md` names —
+`frontend/app/usage/page.tsx` (new), `frontend/components/UsageDashboard.tsx` (new),
+`frontend/components/charts/{Sparkline,BarRow,Meter}.tsx` (new), `frontend/lib/{types,api,hooks}.ts`,
+`frontend/components/AccountDialog.tsx` (one link), `frontend/tests/` — plus one the step's list does
+not name, `frontend/lib/supabase/middleware.ts`, whose `PROTECTED_PREFIXES` gains `/usage`: every byte
+that page renders comes from an authenticated gateway route, so a signed-out visitor would otherwise
+get the page frame and a column of 401s instead of the login form. **No application code changed** —
+`git diff --stat` shows nothing under `app/`, which is what a step whose whole surface is a client of
+Step 3's endpoints should show. `types.ts` mirrors `app/schemas/admin.py` field for field (44 fields,
+checked mechanically rather than by eye), with `simulated_cost`/`total_cost`/the two pool costs typed
+as `string | null` and not `number | null`: pydantic serializes a `Decimal` as a **string**, and
+`Number("0.000123")` on arrival is precisely the lossy step D46 went to the trouble of avoiding on the
+server — the one conversion lives in `formatCost`, at the last possible moment before display.
+
+`usageKey(window)` **is** the SWR key, which is the one structural decision in the page: each window
+is an independent read-only document, so switching is a key change rather than a refetch of one
+entry, switching back is instant, and there is never a frame where the heading says "last 7 days"
+over numbers still computed for the last hour. That is the opposite call from `conversationMessagesKey`
+(D48, trap 12), which is deliberately *not* an SWR key — and both files say why in their own
+docstrings, because the two are otherwise the same shape. `useQuotaOverview` reads `ADMIN_QUOTA_KEY`
+rather than sharing `MODELS_KEY` even though `/v1/admin/quota` delegates to the very handler behind
+`/v1/models`: the same answer, deliberately not the same cache entry, since the picker's copy is
+revalidated after every turn and every key write while the dashboard's is a point-in-time read of a
+page the user opened on purpose, and one entry would make each surface's refresh policy the other's.
+
+Three chart primitives, each a pure function of numbers to inline SVG (D51 — no chart library, which
+would also render through a `ResizeObserver` jsdom does not implement and make every test an
+assertion about a mock). `Sparkline` draws one point per bucket **including the zeros**: the server
+generates the buckets and left-joins the counts (trap 8), so compacting them here would reintroduce
+exactly the smooth line through an outage that D45 went to the trouble of preventing; its divisor is
+clamped to 1, so an all-zero window renders as a flat floor rather than as `NaN` or as a full-height
+band suggesting traffic there was none of. `BarRow` and `Meter` guard their denominators in one place
+each — `Meter` exists precisely because three rates share its shape and all three have a zero
+denominator on a brand-new account, and it renders an em dash for *no data* rather than `0%`, which
+is a real rate over real traffic and a different statement. `formatPercent` keeps one significant
+digit below 1% (`0.4%`, `0.04%`) and rounds to whole percent above it: rounding a small error rate to
+zero rounds in the flattering direction, and "6.0%" claims a precision the counts do not have.
+
+The panels are in the order a reader asks the questions, and three of them carry a trap's client
+half. The cost panel prints the unpriced count beside the total and says out loud that an unpriced
+model is unpriced rather than free (trap 7), that the number is computed now from a checked-in price
+table and nothing was billed (D46), and that the shared/private split is one blended rate and
+therefore an approximation rather than a ledger. The recent-calls table labels a cache hit *from
+cache* instead of reporting the candidate that originally answered as a call that went out (trap 5),
+renders a NULL provider as an em dash rather than as a provider called "unknown" (trap 6), and treats
+`status='replayed'` as a success rather than an error, the same three-way split the aggregates use
+(trap 18). The quota panel de-duplicates candidates on `(provider, model)` — `auto` lists the whole
+fleet, and one budget must not draw twice — and prefers each candidate's daily window, the one a
+person can act on. Nothing anywhere on the page is an ops control (trap 17): there is no all-users
+toggle, no breaker control and no allocation editor, and breaker state is not duplicated at all since
+`/v1/models` already discloses it per candidate.
+
+43 new frontend cases: `charts.test.tsx` (14) asserts the geometry itself — hand-computable
+coordinates for a known array, the empty series' baseline-and-nothing-else, the all-zero floor, a
+single bucket centred rather than pinned left, an overlay on the same scale and an overlay of the
+wrong length ignored outright, and the three degenerate denominators; `UsageDashboard.test.tsx` (24)
+covers every panel from a mocked hook, the three rates against the window's own total, and the
+zero-request account asserted directly against the rendered text containing neither `NaN` nor
+`Infinity`; `useUsage.test.tsx` (5) is the hook-level half the DOM cannot show — the per-window key,
+two windows producing two keys, and `ADMIN_QUOTA_KEY` being a different entry from `MODELS_KEY` — the
+same split `ProviderKeysSection`/`useProviderKeys` already model. `make frontend-test` (197 passing),
+`make frontend-lint`, `tsc --noEmit` and `next build` (which lists `/usage` at 4.74 kB) are all
+green, and the backend unit suite still passes untouched. The definition of done's live render for a
+real zero-request account is not something this pass ran.
 
 ## Phase 6 — BYOK Settings — complete
 

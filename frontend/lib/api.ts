@@ -12,6 +12,9 @@ import type {
   MessagePage,
   ModelsResponse,
   ProviderKeyStatus,
+  RequestsResponse,
+  UsageOverview,
+  UsageWindow,
 } from "./types";
 
 /** Same-origin prefix; `next.config.ts` rewrites it to the gateway. */
@@ -19,6 +22,27 @@ export const GATEWAY_BASE = "/api/gw";
 
 /** Also the SWR cache key for the settings list — see `useProviderKeys`. */
 export const PROVIDER_KEYS_KEY = "/v1/provider-keys";
+
+/** The dashboard's quota panel. Also its SWR key — see `useQuotaOverview`. */
+export const ADMIN_QUOTA_KEY = "/v1/admin/quota";
+
+/** The dashboard's recent-calls table. Also its SWR key. */
+export const ADMIN_REQUESTS_KEY = "/v1/admin/requests";
+
+/**
+ * One window of the usage dashboard's aggregates — and its SWR key.
+ *
+ * The window is in the key rather than in a parameter the fetcher closes over,
+ * so switching from 24h to 7d is a *different* cache entry: the previous
+ * window stays cached and switching back is instant, and there is no moment
+ * where the chart's axis says one thing while its numbers still describe the
+ * other. Unlike `conversationMessagesKey`, a cache entry per window is exactly
+ * what is wanted here — these are four independent read-only documents, not
+ * pages of one growing list.
+ */
+export function usageKey(window: UsageWindow): string {
+  return `/v1/admin/usage?window=${window}`;
+}
 
 /**
  * The URL of one older page of a thread's history (D48).
@@ -296,6 +320,22 @@ export const api = {
    *  this is the only thing that refreshes it short of a real request failing. */
   revalidateProviderKey: (provider: string) =>
     request<ProviderKeyStatus>(`${PROVIDER_KEYS_KEY}/${provider}/validate`, { method: "POST" }),
+
+  // ------------------------------------------------------------------------ //
+  // The usage dashboard (Phase 7, D44)
+  // ------------------------------------------------------------------------ //
+  /**
+   * One window's aggregates over **this account's own** traffic (D44).
+   *
+   * "Admin" in the path is the gateway's own slot name for the module, not a
+   * claim about privilege: every route under it is scoped to the calling
+   * principal inside the SQL, and there is no operator identity in this system
+   * that could widen it.
+   */
+  fetchUsage: (window: UsageWindow) => request<UsageOverview>(usageKey(window)),
+
+  /** The caller's most recent calls, newest first. */
+  fetchRecentRequests: () => request<RequestsResponse>(ADMIN_REQUESTS_KEY),
 };
 
 /** SWR's fetcher: the key is the path, so cache keys read as URLs in devtools. */
