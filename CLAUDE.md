@@ -113,7 +113,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–7 of 12 committed — Milestone A done, Milestone B three of four steps done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–8 of 12 committed — Milestones A and B done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -412,6 +412,56 @@ final page past the start of history, a thread under one page rendering identica
 step, a non-owner's empty repo-level read and 404 at the route, and a regression guard asserting
 `list_for_conversation` still returns everything. `make test` (1494 passed, 1 skipped), `ruff check`,
 `ruff format --check`, and `mypy` are all green.
+
+Step 8 (D48's client half) touches exactly the files `phase7.md` names —
+`frontend/lib/{types,api,hooks}.ts`, `frontend/components/{ConversationView,MessageList}.tsx`,
+`frontend/tests/` — and no application code: this step is the frontend only. `types.ts` gains
+`MessagePage` and makes `has_more`/`next_before_seq` **optional** on `ConversationDetail`, the same
+shape every wire field added since Phase 5 has (a client build can be newer than the gateway it talks
+to, and an absent `has_more` reads as "one page, nothing older" rather than as `undefined`). `api.ts`
+gains `conversationMessagesKey(id, beforeSeq)` and `fetchMessagePage`; the key builder's docstring says
+out loud that it is deliberately **not** an SWR key, because a sibling cache entry beside the head is
+exactly the mistake two routes exist to prevent.
+
+`useConversation` is where the step's real difficulty lives, and its shape follows D48 literally: the
+head comes from SWR, **older pages are component state and are never written into the head key**
+(trap 12) — otherwise every `globalMutate(conversationKey(id))` in `hooks.ts`, one of which fires after
+every completed turn, would silently drop the pages a user had scrolled back through, and a thread
+getting *shorter* after you send a message reads as data loss. The paging state is held against the
+conversation id it was loaded for, the same derivation `ConversationView`'s model pick already uses,
+so navigating to another thread resets the cursor and the loaded pages for free with no effect to run
+and nothing to cancel. The cursor is the newest thing that knows it — the last page fetched, or the
+head response before any older page exists. Re-entrancy is guarded by a **ref, not by
+`isLoadingOlder`**: a state update is not visible to the synchronous caller that queued it, so two
+scroll events in one frame would both pass a state-based check and request the same page twice. The
+merged list is `[...older, ...head]` de-duplicated by id in the head's favour, since the head is the
+copy a revalidation just refreshed. A failed page fetch is the one deliberately swallowed failure in
+that file: nothing on screen changed, no cursor moved, the trigger comes back enabled and *is* the
+retry, and rethrowing would only produce an unhandled rejection at the two `void loadOlder()` call
+sites.
+
+Two rendering details carry the rest. **The auto-scroll effect is now keyed on the last message's id
+rather than on `messages.length`** — a prepended page moves the count and adds nothing at the bottom
+to follow, so the old dependency would have scrolled the reader to the bottom every time history
+arrived at the top. And `MessageList` gained scroll anchoring (trap 13): a `useLayoutEffect` captures
+`scrollHeight` per commit and, when the first row changed *while still being present in the list*
+(which is what tells a prepend apart from a navigation), moves `scrollTop` by the delta. The
+scroll-up trigger itself is `ConversationView`'s `onScroll` — fired on every scroll event and
+collapsed by the hook's own guard rather than debounced — beside a real "Load earlier messages"
+button in `MessageList`, which is both the keyboard path and the only affordance a viewport too tall
+to scroll would ever get. `hasMore`/`isLoadingOlder`/`onLoadOlder` are optional props defaulting to
+"no pagination", so a caller that never paginates renders exactly what it rendered before.
+
+15 new cases in `frontend/tests/useConversationPaging.test.tsx` cover the merge and its page-by-page
+cursor walk, `hasMore` going false on the last page, a duplicate row rendering once, a thread under
+one page and a server sending neither field both behaving as they did before this step, a burst of
+three simultaneous `loadOlder` calls issuing one request, a failed fetch leaving the cursor intact,
+another thread's pages being dropped on navigation, the trigger's three states, and — asserted
+directly against a scriptable `scrollHeight`, since jsdom performs no layout — the viewport holding
+still on a prepend and staying put on an append. `ConversationView.test.tsx`'s hook mock gained the
+new return fields. `make frontend-test` (154 passing), `make frontend-lint`, `tsc --noEmit` and
+`next build` are all green; the definition of done's live 300-message scroll is not something this
+pass ran.
 
 ## Phase 6 — BYOK Settings — complete
 

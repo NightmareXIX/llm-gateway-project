@@ -9,6 +9,7 @@ import type {
   ErrorResponse,
   FileUploadResponse,
   Me,
+  MessagePage,
   ModelsResponse,
   ProviderKeyStatus,
 } from "./types";
@@ -18,6 +19,21 @@ export const GATEWAY_BASE = "/api/gw";
 
 /** Also the SWR cache key for the settings list — see `useProviderKeys`. */
 export const PROVIDER_KEYS_KEY = "/v1/provider-keys";
+
+/**
+ * The URL of one older page of a thread's history (D48).
+ *
+ * Deliberately **not** an SWR key. The head of a thread lives at
+ * `conversationKey(id)` and is what an optimistic turn mutates; older pages are
+ * immutable history held in component state by `useConversation`. Giving them a
+ * cache entry under a sibling of the head key is the exact mistake two routes
+ * exist to prevent — a `globalMutate` of the thread would then have two
+ * entries to reconcile, and the one holding page four would win somewhere.
+ */
+export function conversationMessagesKey(id: string, beforeSeq: number | null): string {
+  const query = beforeSeq === null ? "" : `?before_seq=${beforeSeq}`;
+  return `/v1/conversations/${id}/messages${query}`;
+}
 
 /**
  * A gateway failure, carrying the error envelope intact.
@@ -215,6 +231,17 @@ export const api = {
   listConversations: () => request<Conversation[]>("/v1/conversations"),
 
   getConversation: (id: string) => request<ConversationDetail>(`/v1/conversations/${id}`),
+
+  /**
+   * One page of history older than `beforeSeq` — the scroll-up fetch.
+   *
+   * `beforeSeq` comes from the previous response's `next_before_seq` and never
+   * from arithmetic on a `seq` that happens to be on screen: `seq` is gap-free
+   * per conversation today, but the cursor is the server's to define, and
+   * inventing one here would silently skip a message the day that changes.
+   */
+  fetchMessagePage: (id: string, beforeSeq: number | null) =>
+    request<MessagePage>(conversationMessagesKey(id, beforeSeq)),
 
   renameConversation: (id: string, title: string | null) =>
     request<Conversation>(`/v1/conversations/${id}`, {

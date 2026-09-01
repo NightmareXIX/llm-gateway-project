@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import Link from "next/link";
 
 import { GatewayError } from "@/lib/api";
@@ -9,6 +9,11 @@ import { Composer } from "./Composer";
 import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
 import { MessageList, MessageListSkeleton } from "./MessageList";
+
+/** How close to the top counts as "at the top". One turn's height, roughly:
+ *  far enough that the next page is usually already there when the user gets
+ *  there, close enough that it is not fetching history nobody asked for. */
+const OLDER_PAGE_TRIGGER_PX = 240;
 
 /**
  * One thread.
@@ -23,9 +28,24 @@ import { MessageList, MessageListSkeleton } from "./MessageList";
  * `fast` on turn nine, reload, and you come back on `fast` rather than
  * silently on `auto`. See `modelSlot` below for why that is a derivation and
  * not a `useEffect`.
+ *
+ * The transcript is the newest page plus whatever older pages have been
+ * scrolled back to (D48). This component owns the scrolling element, so it is
+ * where the scroll-up trigger lives; `useConversation` owns the cursor and the
+ * re-entrancy guard, and `MessageList` owns the anchoring that keeps the
+ * viewport still while a page lands above it.
  */
 export function ConversationView({ conversationId }: { conversationId: string }) {
-  const { conversation, error, isLoading, mutate } = useConversation(conversationId);
+  const {
+    conversation,
+    messages,
+    error,
+    isLoading,
+    mutate,
+    loadOlder,
+    isLoadingOlder,
+    hasMore,
+  } = useConversation(conversationId);
   const { models } = useModels();
 
   /**
@@ -61,6 +81,22 @@ export function ConversationView({ conversationId }: { conversationId: string })
   );
   const busy = pending?.status === "sending" || pending?.status === "streaming";
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  /**
+   * Ask for the next older page when the user reaches the top.
+   *
+   * `onScroll` fires dozens of times per gesture, so this fires `loadOlder` on
+   * every one of them and relies on that function's own guard to collapse them
+   * into a single request — the alternative, debouncing here, would still be
+   * racing the same state and would only make the window narrower. The
+   * threshold is a band rather than `scrollTop === 0` because momentum
+   * scrolling regularly stops a few pixels short.
+   */
+  const handleScroll = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container || container.scrollTop > OLDER_PAGE_TRIGGER_PX) return;
+    void loadOlder();
+  }, [loadOlder]);
 
   if (isLoading && !conversation) {
     return (
@@ -107,11 +143,13 @@ export function ConversationView({ conversationId }: { conversationId: string })
     );
   }
 
-  const messages = conversation?.messages ?? [];
-
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain"
+      >
         {messages.length === 0 && pending === null ? (
           <div className="flex h-full items-center justify-center">
             <EmptyState
@@ -127,6 +165,9 @@ export function ConversationView({ conversationId }: { conversationId: string })
             onDismiss={dismiss}
             onKeepPartial={keepPartial}
             scrollContainerRef={scrollContainerRef}
+            hasMore={hasMore}
+            isLoadingOlder={isLoadingOlder}
+            onLoadOlder={() => void loadOlder()}
           />
         )}
       </div>

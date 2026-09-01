@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 import type { PendingTurn as PendingTurnState } from "@/lib/hooks";
 import type { Message } from "@/lib/types";
@@ -21,9 +21,11 @@ import { Skeleton } from "./ui/Skeleton";
  * half sentence every hundred milliseconds, so the in-flight answer opts out of
  * the region while it is being written and rejoins it once it is stored.
  *
- * Auto-scroll is anchored to message count rather than to a scroll event: it
- * follows new turns, and does not fight a user who has scrolled up to re-read
- * something.
+ * Auto-scroll is anchored to the *last* message's identity rather than to a
+ * scroll event or to the message count: it follows new turns, does not fight a
+ * user who has scrolled up to re-read something, and — since D48's pagination
+ * landed — does not fire when an older page is prepended, which changes the
+ * count while adding nothing at the bottom to follow.
  *
  * `scrollContainerRef` names the actual `overflow-y-auto` element the caller
  * scrolls this list inside of, and the effect below moves *that element's own*
@@ -57,6 +59,9 @@ export function MessageList({
   onDismiss,
   onKeepPartial,
   scrollContainerRef,
+  hasMore = false,
+  isLoadingOlder = false,
+  onLoadOlder,
 }: {
   messages: Message[];
   pending: PendingTurnState | null;
@@ -64,18 +69,71 @@ export function MessageList({
   onDismiss: () => void;
   onKeepPartial?: () => void;
   scrollContainerRef?: RefObject<HTMLDivElement | null>;
+  /** D48: there is history above this page. Defaults false, so a caller that
+   *  never paginates renders exactly what it rendered before this existed. */
+  hasMore?: boolean;
+  isLoadingOlder?: boolean;
+  onLoadOlder?: () => void;
 }) {
   // Follows the answer as it streams, not only as turns are added — but on
   // `restarts.length` rather than on every delta, so a long answer does not fight
   // a user who has scrolled up to re-read something while it is still writing.
+  //
+  // Keyed on the last message's id, never on `messages.length`: a prepended
+  // older page moves the count and nothing else, and scrolling to the bottom
+  // because history arrived at the top is exactly the jump `anchorRef` below
+  // exists to prevent.
+  const lastMessageId = messages.at(-1)?.id ?? null;
   useEffect(() => {
     const container = scrollContainerRef?.current;
     if (!container) return;
     container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-  }, [scrollContainerRef, messages.length, pending?.status, pending?.restarts.length]);
+  }, [scrollContainerRef, lastMessageId, pending?.status, pending?.restarts.length]);
+
+  // Scroll anchoring for a prepended page. Without it the viewport keeps its
+  // `scrollTop` while the content above it grows, so the user is thrown to the
+  // top of the newly-arrived page every time one lands — which makes scrolling
+  // back through a long thread unusable rather than merely untidy.
+  //
+  // A prepend is told apart from a navigation by asking whether the row that
+  // used to be first is *still in the list*: if it is, everything above it is
+  // new and the delta in `scrollHeight` is exactly how far to move down.
+  const anchorRef = useRef<{ firstId: string | null; scrollHeight: number }>({
+    firstId: null,
+    scrollHeight: 0,
+  });
+  useLayoutEffect(() => {
+    const container = scrollContainerRef?.current;
+    if (!container) return;
+    const anchor = anchorRef.current;
+    const firstId = messages[0]?.id ?? null;
+    const prepended =
+      anchor.firstId !== null &&
+      firstId !== anchor.firstId &&
+      messages.some((message) => message.id === anchor.firstId);
+    if (prepended) container.scrollTop += container.scrollHeight - anchor.scrollHeight;
+    anchorRef.current = { firstId, scrollHeight: container.scrollHeight };
+  });
 
   return (
     <div className="mx-auto flex w-full max-w-[46rem] flex-col gap-6 px-4 py-6">
+      {hasMore && (
+        // A real control, not only a scroll trigger: the container's `onScroll`
+        // is what fires in normal use, but a keyboard user never generates one,
+        // and neither does a viewport tall enough to show the whole page
+        // without scrolling at all.
+        <div className="flex justify-center pb-2">
+          <button
+            type="button"
+            onClick={onLoadOlder}
+            disabled={isLoadingOlder}
+            className="rounded-control border border-strong bg-raised px-3 py-1.5 text-xs font-medium text-muted transition-colors hover:bg-sunken disabled:cursor-default disabled:opacity-60"
+          >
+            {isLoadingOlder ? "Loading earlier messages…" : "Load earlier messages"}
+          </button>
+        </div>
+      )}
+
       <div role="log" aria-live="polite" aria-label="Conversation" className="flex flex-col gap-6">
         {messages.map((message, index) => (
           <MessageTurn

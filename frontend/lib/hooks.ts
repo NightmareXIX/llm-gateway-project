@@ -58,6 +58,24 @@ export function useConversations() {
   return { conversations: data, error, isLoading, mutate };
 }
 
+/**
+ * One thread: the newest page from SWR, older pages from component state.
+ *
+ * **The split is the whole point of D48's two routes.** The head — what
+ * `GET /v1/conversations/{id}` returns — is live: an optimistic turn appends to
+ * it and a revalidation replaces it wholesale. Older pages are immutable
+ * history, and they are held *here*, outside the SWR cache, so that neither of
+ * those two writes can touch them. Written into the head key instead, every
+ * `globalMutate(conversationKey(id))` in this file would silently drop every
+ * page the user had scrolled back through — and the symptom, a thread getting
+ * shorter after you send a message, reads as data loss (trap 12).
+ *
+ * The paging state is stored *against the conversation id it was loaded for*,
+ * the same shape `ConversationView` uses for the model pick: switching threads
+ * then resets the cursor and the loaded pages for free, with no effect to run
+ * and nothing to clean up on a fetch that is still in flight for the thread
+ * the user just left.
+ */
 export function useConversation(id: string | null) {
   const { data, error, isLoading, mutate } = useSWR<ConversationDetail>(
     id ? conversationKey(id) : null,
@@ -66,8 +84,87 @@ export function useConversation(id: string | null) {
     // revalidation would re-fetch every time the user tabs back for no new data.
     { revalidateOnFocus: false },
   );
-  return { conversation: data, error, isLoading, mutate };
+
+  const [paging, setPaging] = useState<ConversationPaging | null>(null);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  // Not derived from `isLoadingOlder`: a state update is not visible to the
+  // synchronous caller that queued it, so two scroll events in the same frame
+  // would both pass the check and fetch the same page twice. The ref is read
+  // and written in the same tick as the guard it protects.
+  const inFlightRef = useRef(false);
+
+  // `null` for any thread but the one this state was loaded for — including the
+  // moment right after a navigation, before the fetch for the new id resolves.
+  const loaded = paging?.conversationId === id ? paging : null;
+
+  // The cursor is the newest thing that knows it: the last page fetched, or —
+  // before any older page exists — the head response itself. Both fields are
+  // optional on the wire (a server older than this build sends neither), and an
+  // absent `has_more` means "one page, nothing older", never "unknown".
+  const hasMore = loaded ? loaded.hasMore : (data?.has_more ?? false);
+  const nextBeforeSeq = loaded ? loaded.nextBeforeSeq : (data?.next_before_seq ?? null);
+
+  const loadOlder = useCallback(async () => {
+    if (id === null || inFlightRef.current || !hasMore || nextBeforeSeq === null) return;
+    inFlightRef.current = true;
+    setIsLoadingOlder(true);
+    try {
+      const page = await api.fetchMessagePage(id, nextBeforeSeq);
+      setPaging((current) => {
+        const pages = current?.conversationId === id ? current.pages : [];
+        return {
+          conversationId: id,
+          // Oldest page first in the array, so `pages.flat()` is already in
+          // transcript order: each fetch reaches further back than the last.
+          pages: [page.messages, ...pages],
+          hasMore: page.has_more,
+          nextBeforeSeq: page.next_before_seq,
+        };
+      });
+    } catch {
+      // Swallowed deliberately, and this is the one place in this file that
+      // does it. Every other failure here has something to say — a turn that
+      // did not send, a key that was rejected — and a surface to say it on. A
+      // page of old history that did not arrive has neither: the transcript on
+      // screen is unchanged and still correct, the cursor is untouched, and
+      // the trigger comes back enabled, which *is* the retry. Rethrowing would
+      // only produce an unhandled rejection at the two `void loadOlder()` call
+      // sites, since neither a scroll event nor a click has anywhere to catch.
+    } finally {
+      inFlightRef.current = false;
+      setIsLoadingOlder(false);
+    }
+  }, [id, hasMore, nextBeforeSeq]);
+
+  const older = loaded ? loaded.pages.flat() : [];
+  const head = data?.messages ?? [];
+  // De-duplicated in the head's favour: it is the copy a revalidation just
+  // refreshed, and the only rows that can appear twice are ones a page boundary
+  // and a concurrent write disagreed about.
+  const headIds = new Set(head.map((message) => message.id));
+  const messages = [...older.filter((message) => !headIds.has(message.id)), ...head];
+
+  return {
+    conversation: data,
+    /** The whole transcript on screen: every older page loaded, then the head. */
+    messages,
+    error,
+    isLoading,
+    mutate,
+    loadOlder,
+    isLoadingOlder,
+    hasMore,
+  };
 }
+
+/** Older pages of one thread, kept against the id they belong to. */
+type ConversationPaging = {
+  conversationId: string;
+  /** Oldest page first. Each entry is one response, oldest-first within itself. */
+  pages: Message[][];
+  hasMore: boolean;
+  nextBeforeSeq: number | null;
+};
 
 // --------------------------------------------------------------------------- //
 // BYOK provider keys (Phase 6, Step 10)

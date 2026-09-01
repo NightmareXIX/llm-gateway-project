@@ -137,7 +137,31 @@ export type Conversation = {
   updated_at: string;
 };
 
-export type ConversationDetail = Conversation & { messages: Message[] };
+/**
+ * A thread, with the **newest page** of its history (D48).
+ *
+ * `has_more`/`next_before_seq` are optional for the same reason every wire
+ * field added since Phase 5 is: a client build can be newer than the server it
+ * is talking to, and a detail response written before pagination existed must
+ * render as "one page, nothing older" rather than as `undefined`. Readers
+ * default them, they never assert them.
+ */
+export type ConversationDetail = Conversation & {
+  messages: Message[];
+  has_more?: boolean;
+  /** Feed back as `before_seq` to fetch the next older page. `null` exactly
+   *  when `has_more` is false. */
+  next_before_seq?: number | null;
+};
+
+/** One older page — `GET /v1/conversations/{id}/messages`'s own shape. Ordered
+ *  oldest-first *within the page*, so it prepends onto what is already on
+ *  screen with no reshaping. */
+export type MessagePage = {
+  messages: Message[];
+  has_more: boolean;
+  next_before_seq: number | null;
+};
 
 // --------------------------------------------------------------------------- //
 // Files — app/schemas/files.py (Phase 4)

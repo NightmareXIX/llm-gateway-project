@@ -69,13 +69,19 @@ function conversation(overrides: Partial<ConversationDetail> = {}): Conversation
   };
 }
 
-/** What `useConversation` returns, in one of its three interesting states. */
+/** What `useConversation` returns, in one of its three interesting states.
+ *  `messages` is the merged transcript the hook now returns (D48) — these
+ *  tests are about the picker, so it is just the head's own rows. */
 function loaded(detail: ConversationDetail | undefined, isLoading = false) {
   useConversation.mockReturnValue({
     conversation: detail,
+    messages: detail?.messages ?? [],
     error: undefined,
     isLoading,
     mutate: vi.fn(),
+    loadOlder: vi.fn(),
+    isLoadingOlder: false,
+    hasMore: false,
   });
 }
 
