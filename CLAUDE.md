@@ -80,7 +80,7 @@ config/{providers.yaml,limits.yaml,pricing.yaml}
 app/
   main.py  config.py  deps.py
   api/{v1/{chat,models,files,conversations}.py, auth.py, keys.py, admin.py, health.py}
-  schemas/{chat,models,files,keys,errors}.py        # pydantic request/response only
+  schemas/{chat,models,files,keys,conversations,admin,auth,errors}.py   # pydantic request/response only
   core/{errors,logging,ids,clock,crypto}.py
   auth/{principal,jwt,api_keys,dependency}.py
   providers/{types,errors,base,groq,gemini,openrouter,registry}.py
@@ -89,20 +89,27 @@ app/
   quota/{tracker,windows,lanes,allocations}.py + quota/scripts/*.lua
   memory/{canonical,render,fitting,summarize}.py
   perception/{lane,extractors,local,storage}.py
-  cache/{keys,client,exact}.py
+  cache/{keys,client,exact,idempotency}.py
   keys_resolution/resolver.py
   usage/{logger,metrics,pricing}.py
   db/{session.py,models.py,repo/{users,conversations,messages,requests,provider_keys,allocations,files,extractions}.py}
-frontend/            # Next.js App Router + Tailwind; lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip,ProviderKeysSection}.tsx
+frontend/            # Next.js App Router + Tailwind; app/usage/, lib/{sse,files}.ts, components/{ModelIndicator,ModelPicker,Composer,AttachmentChip,ProviderKeysSection}.tsx + charts/{Sparkline,BarRow,Meter}.tsx
 tests/{conftest.py,fixtures/{provider_responses,golden_payloads,files},unit,contract,integration}
 scripts/{record_fixtures,chaos_demo,seed_dev}.py
-docs/{architecture.md,limitations.md,decisions/}      # ADRs; doc/reference/ holds the source specs
+docs/{architecture.md,limitations.md,deploy.md,chaos-demo.md,decisions/}   # ADRs; doc/reference/ holds the source specs
 README.md  Makefile  pyproject.toml  docker-compose.yml  Dockerfile  .env.example  .github/workflows/ci.yml
 ```
 
-## Current phase: Phase 7 — Polish & Portfolio
+## Current state: v1, feature-complete
 
-In progress. Per `development-plan.md` §3 Phase 7: the usage dashboard against `api/admin.py`
+All seven phases are done and `development-plan.md` §8's Definition of Done ticks line by line.
+Everything beyond this is §7's ordered backlog — p50 latency routing, summarization, semantic caching
+— each left as a visible seam rather than a rewrite. `phase7.md` §9 names them and
+[docs/limitations.md](docs/limitations.md) records what is deliberately unbuilt and why.
+
+## Phase 7 — Polish & Portfolio — complete
+
+Per `development-plan.md` §3 Phase 7: the usage dashboard against `api/admin.py`
 (request volume, provider distribution, error rate, cache hit rate, quota utilization, and §4.8's
 simulated cost off a checked-in `config/pricing.yaml`), the README's architecture/request-flow/
 "Design Decisions" build-out, `/metrics` in Prometheus format, the load-and-chaos demo script,
@@ -113,7 +120,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–11 of 12 committed — Milestones A and B done, Milestone C under way.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: all 12 steps committed, all three milestones done.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -616,14 +623,43 @@ than recalled, which is how the JWKS row came to say what it says: a stale key s
 only a *cold* cache is a 503, and it is a 503 rather than a 401 because it is our outage
 (`app/auth/jwt.py::JwksCache._refresh`). **The ADR index is honest about its own numbering** — the
 records run 007…039 with gaps, because Phase 1 planned ADR-001…008 and wrote two records in total;
-saying so in one clause is cheaper than a reader wondering what happened to ADR-003. The six Phase 7
-ADRs are Step 12's to write and to add here, which is why the index does not yet link files that do
-not exist. **The mermaid block is checked, not eyeballed**: `mermaid.parse` was run over the extracted
+saying so in one clause is cheaper than a reader wondering what happened to ADR-003. Step 12's six ADRs are indexed there
+now, under a new *Reading the system back* heading, with idempotency filed beside the cache and
+pagination beside the memory records. **The mermaid block is checked, not eyeballed**: `mermaid.parse` was run over the extracted
 figure in a scratch directory (no dependency added to this repo), and every `{}`-braced Redis key was
 rewritten in prose form inside the node labels — a brace inside a rhombus label is the one construct
 that parses locally and then fails on GitHub. Every relative link in the file was resolved against the
 working tree. `make test` (1494 passed, 1 skipped), `ruff check`, `ruff format --check` and `mypy` are
 green — unchanged, as a documentation-only commit should leave them.
+
+Step 12 (the ADRs and the rest of the docs) touches the files `phase7.md` names —
+`docs/decisions/ADR-040…045` (new), `docs/limitations.md`, `docs/architecture.md`, `docs/deploy.md`,
+`CLAUDE.md` — minus `.env.example`, which Step 4 already carried, plus `README.md` (the ADR index,
+which Step 11 deliberately left unlinked until these files existed) and `doc/reference/phase7.md`
+(§7 asks for that file to stay accurate as steps land, and one thing in it was not). No application
+code, no tests, no frontend. D51 gets no ADR of its own — ADR-040's consequences section says why,
+following the precedent ADR-032 set for D33 — so six records cover seven decisions.
+
+Three things are worth recording beyond the six files. **The plan's own "Render runs two workers" is
+wrong, and the docs now say what is true**: `render.yaml` pins `WEB_CONCURRENCY=1` on a 0.1-CPU free
+instance, so a scrape reads one whole process rather than a fraction of the service. The caveat
+survives the correction — process-local counters still reset on every deploy and every cold start,
+and a second worker is one value away — but ADR-044, `docs/limitations.md`, `docs/architecture.md`
+and D49 itself now carry the real number rather than the assumed one. **Every mermaid figure in the
+repo was parsed, not eyeballed**, the way Step 11 checked its own: that found two pre-existing
+diagrams in `docs/architecture.md`'s Phase 5 section whose labels carried backslash-escaped quotes
+(`role:\"system\"`), which `mermaid.parse` rejects outright — rewritten with single quotes, so all
+eight blocks now parse. **The staleness pass found two forward references that had become
+promises**: the perception lane's privacy disclosure ("worth a visible disclosure in the UI once that
+lane exists") shipped in Phase 4, and the personal-cap paragraph pointed at Phase 7's dashboard to
+make "your cap" distinguishable from "the pool's" — which this phase did **not** do, because
+`/v1/admin/quota` delegates to `/v1/models`, whose status comes from `QuotaTracker.remaining`, which
+reads the provider's declared windows and knows nothing about the `alloc:rpd` grant the router
+appends at reservation time. Saying so beats leaving a pointer at a phase that has now shipped.
+`docs/limitations.md` also gained a closing inventory of what stays unbuilt at v1 with its seam named
+in each case, which is what "finalized" means for that document. `make test` (1494 passed, 1
+skipped), `ruff check`, `ruff format --check`, `mypy`, `make frontend-test` (197 passing) and
+`make frontend-lint` are all green — unchanged, as a documentation-only commit should leave them.
 
 ## Phase 6 — BYOK Settings — complete
 

@@ -303,7 +303,11 @@ Counters are **process-local**, like `LatencyTable` and for the same reason (ADR
 need new Contract C keys, and that is a change with sign-off, not a side effect of a polish phase.
 Render runs two workers, so a scrape hits one of them and the counters are a *sample*, not a total. That
 is a real limitation, it goes in `docs/limitations.md` with the standard production answer (a shared
-store or a push gateway), and it is *not* papered over by pretending the numbers are complete. The gauges
+store or a push gateway), and it is *not* papered over by pretending the numbers are complete.
+*(Corrected in Step 12: the deployed `render.yaml` pins `WEB_CONCURRENCY=1`, so a scrape reads one whole
+process today rather than a fraction. The caveat survives — the counters still reset on every deploy and
+cold start, and a second worker is one value away — but the docs say what is true rather than what this
+plan assumed. See ADR-044.)* The gauges
 are live from Redis and therefore correct on any worker.
 
 **Labels never carry a `user_id`, an email, a conversation id, or free text.** Unbounded label
@@ -800,8 +804,9 @@ the repo.
    direction, which is the worst kind.
 8. **Empty time buckets must be generated, not discovered.** `GROUP BY date_trunc` omits quiet periods
    and the chart then shows a smooth line through an outage.
-9. **`/metrics` counters are per-worker.** Render runs two. Document it, do not pretend otherwise, and do
-   not "fix" it by inventing Redis keys — that is a Contract C amendment and needs sign-off.
+9. **`/metrics` counters are per-worker.** Document it, do not pretend otherwise, and do
+   not "fix" it by inventing Redis keys — that is a Contract C amendment and needs sign-off. (The
+   deployed service pins one worker; see the correction under D49.)
 10. **No `user_id` in a metric label.** Ever. Cardinality and privacy, and the assertion in the test suite
     is what keeps it true.
 11. **`X-Cache` and `X-Idempotent-Replay` are different facts.** A replay of a cache hit sets both. Do not

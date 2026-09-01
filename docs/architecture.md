@@ -239,9 +239,9 @@ flowchart TD
     Render --> Groq["Groq adapter"]
     Render --> OpenRouter["OpenRouter adapter"]
 
-    Gemini --> GP["contents / parts\ntop-level system_instruction\nno role:\"system\" entry anywhere"]
-    Groq --> GrP["messages[]\nmessages[0].role == \"system\"\nno top-level system field"]
-    OpenRouter --> OP["messages[]\nmessages[0].role == \"system\"\nno top-level system field"]
+    Gemini --> GP["contents / parts\ntop-level system_instruction\nno role 'system' entry anywhere"]
+    Groq --> GrP["messages[]\nmessages[0].role == 'system'\nno top-level system field"]
+    OpenRouter --> OP["messages[]\nmessages[0].role == 'system'\nno top-level system field"]
 
     classDef shape fill:#2f6f4f,color:#fff,stroke:none;
     class GP,GrP,OP shape;
@@ -352,3 +352,86 @@ turn, so a user's own Gemini key can pay to *read* their document while Groq's s
 question about it. The extraction cache stays global and keyed on `file_hash` alone (D24): scoping it
 per user to "keep private-key work private" would re-spend a provider's budget to recompute an
 identical string, and that trade is documented in `docs/limitations.md` rather than made silently.
+
+---
+
+## Phase 7: reading the system back
+
+Every diagram above is about serving a request. This one is about *reading what happened* — and it
+exists because the dashboard raises a question the code answers in three different places. Three
+numbers on one page ("how many requests", "how many requests", "how much budget is left") come from
+three different stores with three different truth properties, and which one is authoritative depends
+on which question is being asked.
+
+```mermaid
+flowchart LR
+    subgraph write ["WRITE PATH — one served request"]
+        Turn["a chat turn"] --> Logger["usage/logger.py\nrecord_success / record_failure\nrecord_cache_hit / record_replay"]
+        Logger --> PG[("Postgres\nrequests + messages")]
+        Logger --> Ctr["MetricsRegistry\nprocess-local counters\nusage/metrics.py"]
+        Turn --> RedisW[("Redis\nquota counters, breaker hashes")]
+    end
+
+    subgraph read ["READ PATH — three surfaces"]
+        PG --> Agg["db/repo/requests.py\nvolume_series · provider_distribution\noutcome_summary · pool_split\nGROUP BY, in SQL, scoped to one user"]
+        Agg --> Usage["GET /v1/admin/usage\n+ usage/pricing.py::simulated_cost"]
+        Usage --> Page["/usage page\nhand-rolled SVG"]
+
+        RedisW --> Live["QuotaTracker.remaining\nCircuitBreaker.peek"]
+        Live --> Models["GET /v1/models\nGET /v1/admin/quota"]
+        Models --> Page
+
+        Ctr --> Expo["render_exposition"]
+        RedisW --> Expo
+        Expo --> Metrics["GET /metrics\ntext/plain 0.0.4"]
+        Metrics --> Scrape(["a scrape\nnot the page"])
+    end
+
+    classDef durable fill:#2f6f4f,color:#fff,stroke:none;
+    classDef volatile fill:#7a5a2f,color:#fff,stroke:none;
+    classDef local fill:#4a3f7a,color:#fff,stroke:none;
+    class PG,Agg,Usage durable;
+    class RedisW,Live,Models volatile;
+    class Ctr,Expo,Metrics local;
+```
+
+**Green is durable and complete. Amber is live and correct but has no history. Purple is a sample.**
+That is the whole distinction, and it is why the same count can legitimately appear twice with two
+different values.
+
+- **Postgres is the only complete record.** Every terminal outcome writes a `requests` row through
+  one of `usage/logger.py`'s five facades, so the aggregates are exact over any window they can see —
+  across restarts, across workers, across deploys. They are also the slowest, which is fine for a
+  page somebody opened on purpose.
+- **Redis is the only live one.** A quota remainder or a breaker state is a fact about *now* with no
+  past tense; asking Postgres would answer a different question. Both `/v1/models` and
+  `/v1/admin/quota` read it at request time and neither stores anything
+  ([ADR-040](decisions/ADR-040-self-scoped-usage-dashboard.md) — the second delegates to the first's
+  handler rather than re-deriving it, so the two cannot disagree).
+- **The `/metrics` counters are process-local**, and they reset on every deploy and cold start
+  ([ADR-044](decisions/ADR-044-hand-rolled-metrics-endpoint.md), ADR-014's precedent). The deployed
+  service pins one worker, so a scrape sees the whole of one process today; raise `WEB_CONCURRENCY`
+  and each scrape becomes a sample of whichever worker answered. The gauges in the same response are
+  read live from Redis and are correct on any worker, which means one `/metrics` body legitimately
+  mixes a process-local number with a shared one — said out loud in `docs/limitations.md` rather than
+  papered over.
+
+**The three surfaces answer three different questions, which is why none of them is redundant.**
+`/usage` answers *what did my traffic do* — self-scoped, historical, costed at read time
+([ADR-041](decisions/ADR-041-simulated-cost-at-read-time.md)). `/v1/models` answers *what can I use
+right now*. `/metrics` answers *is this process healthy*, and is the only one of the three that is
+system-wide rather than per-user — which is exactly why it is behind a bearer token instead of a
+session, and why no label on it carries a user id.
+
+**Two numbers on the page disagree on purpose.** Request volume counts every row, cache hits and
+`status='replayed'` idempotent replays included, because the client really did make those requests.
+Provider distribution excludes both — a cache hit names the candidate that *originally* answered, and
+a replay never reached one — because counting them would report provider calls that never went out
+(D45's table; traps 5, 6 and 18). Volume minus provider calls is a real, meaningful gap, and the
+dashboard's own copy says so rather than hiding it by making the two agree.
+
+**The buckets are generated, not discovered.** `volume_series` builds its time buckets with
+`generate_series` and left-joins the rows onto them, so an hour in which nothing happened renders as
+a zero bar. A `GROUP BY date_trunc` over the rows alone is shorter and silently omits quiet periods,
+which draws a smooth line straight through an outage — the one chart bug that makes the system look
+*better* the worse it behaved.

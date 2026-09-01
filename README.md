@@ -123,10 +123,10 @@ schedule, zero client-visible failures, and a section on what an in-process mock
 
 ## Design Decisions
 
-Every ADR, grouped by area and stated as the question it answers rather than by number — nobody reads
-an index by number. The numbering starts at 007 because Phase 1 planned ADR-001…008 and ended up
-writing only two records at all (007 and 009); the gaps were left open rather than renumbered
-afterwards.
+All thirty-eight records, grouped by area and stated as the question each one answers rather than by
+number — nobody reads an index by number. The numbering runs 007…045 with gaps: Phase 1 planned
+ADR-001…008 and ended up writing only two records at all (007 and 009), and the holes were left open
+rather than renumbered afterwards.
 
 **Identity and limits**
 
@@ -156,6 +156,7 @@ afterwards.
 - [ADR-021](docs/decisions/ADR-021-quotahint-transport.md) — A provider's own rate-limit headers are better data than our counter; how do they reach the tracker without widening a frozen contract?
 - [ADR-023](docs/decisions/ADR-023-exact-cache-identity-and-scope.md) — What makes two requests "the same", and may one user's answer be replayed to another?
 - [ADR-024](docs/decisions/ADR-024-models-endpoint-shape.md) — `GET /v1/models` has to be OpenAI-compatible *and* report live quota; which shape wins?
+- [ADR-042](docs/decisions/ADR-042-idempotency-claim-before-routing.md) — A client retries after a timeout: how do you charge them once, and where in the request must you decide that?
 
 **The perception lane**
 
@@ -171,6 +172,7 @@ afterwards.
 - [ADR-031](docs/decisions/ADR-031-cross-provider-golden-matrix.md) — Where do you assert "one history, three payload shapes" — at each adapter, or at the render boundary?
 - [ADR-032](docs/decisions/ADR-032-pinning-without-tool-calls.md) — D3 pins a conversation on its first tool call, but v1 cannot store one; build the mechanism, or leave a seam?
 - [ADR-033](docs/decisions/ADR-033-truncation-disclosed-and-uncached.md) — Two thirds of a thread got dropped to fit the window; who is told, and may that answer be cached?
+- [ADR-043](docs/decisions/ADR-043-keyset-pagination-beside-the-full-read.md) — The UI wants a page of a long thread and the renderer wants all of it; one function or two?
 
 **Bring your own key**
 
@@ -179,6 +181,13 @@ afterwards.
 - [ADR-036](docs/decisions/ADR-036-personal-caps-under-frozen-contract-c.md) — How do you cap one user's share of the shared pool when the key schema is frozen?
 - [ADR-037](docs/decisions/ADR-037-private-key-failure-is-not-laundered.md) — A user's key is rejected: retry it on the shared pool, or tell them?
 - [ADR-038](docs/decisions/ADR-038-private-key-only-slots.md) — Your key unlocks a model nobody else can reach; should `auto` be allowed to pick it?
+
+**Reading the system back**
+
+- [ADR-040](docs/decisions/ADR-040-self-scoped-usage-dashboard.md) — There is no admin role in this system; what is an "admin dashboard" then?
+- [ADR-041](docs/decisions/ADR-041-simulated-cost-at-read-time.md) — Nothing here is billed: where does a cost number come from, and what does an unpriced model cost?
+- [ADR-044](docs/decisions/ADR-044-hand-rolled-metrics-endpoint.md) — Why is there no `prometheus_client`, and which of these numbers is a total and which is a sample?
+- [ADR-045](docs/decisions/ADR-045-chaos-demo-drives-the-real-app.md) — How do you kill a provider on purpose without shipping a way to kill a provider on purpose?
 
 **Deployment**
 

@@ -249,7 +249,14 @@ migration exactly as loudly as it would fail the app, before the service ever be
 > set it **before** that deploy, or the start command's config validation fails and the deploy is
 > cancelled rather than the service coming up degraded.
 
-Ten variables, and **only seven of them are the values from your local `.env`**. Copying that file
+> **Phase 7 Step 4 added one that matters here.** `METRICS_TOKEN` has a default (empty), so nothing
+> fails without it — the deploy comes up fine and `GET /metrics` is simply **open to the internet**.
+> Render has no private network to put a scrape target on, so unlike a compose or Kubernetes setup
+> there is nowhere to hide the endpoint; on Render the token is not optional. `METRICS_ENABLED`
+> defaults to `true` and only needs setting to switch the endpoint off, which returns 404 rather than
+> 403 so a disabled endpoint does not advertise itself.
+
+Eleven variables, and **only seven of them are the values from your local `.env`**. Copying that file
 wholesale points production at your laptop:
 
 | Variable | Value |
@@ -258,6 +265,7 @@ wholesale points production at your laptop:
 | `DATABASE_URL` | the Supabase pooler string from step 1 — `.env` holds `127.0.0.1:5432`, the compose container |
 | `REDIS_URL` | Upstash, from step 2 — `.env` holds `localhost:6379` |
 | `ENCRYPTION_KEY` | **generate a fresh one, and keep it.** `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Since Phase 6 this encrypts every BYOK provider key users add in Settings; sharing dev's means a leaked dev `.env` also decrypts production. See *If `ENCRYPTION_KEY` is lost or rotated* under Operating notes before you change it |
+| `METRICS_TOKEN` | **generate a fresh one and set it.** `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Empty means `GET /metrics` answers anybody; see the callout above. No label on that endpoint carries a user id, an email or a conversation id ([ADR-044](decisions/ADR-044-hand-rolled-metrics-endpoint.md)), so what the token guards is operational shape rather than personal data — which is a reason to set it, not a reason to skip it |
 | `REQUIRE_VERIFIED_EMAIL` | type `true` **literally**. It has a default in `Settings`, so it is frequently absent from `.env` — scripting it out of that file yields an empty string, and an empty string is not a boolean |
 
 > That last row is a real failure, not a hypothetical. Anything scripted that interpolates a missing
@@ -687,6 +695,25 @@ the provider. **There is no rotation path built** — `MultiFernet` is the named
 planned rotation would need first. Practically: back the value up wherever you back up the database,
 and if it is genuinely lost, the recovery is to tell users to re-add their keys (a `DELETE` of the
 dead rows is optional — the resolver already ignores them).
+
+**Scraping `/metrics`.** `GET /metrics` returns Prometheus text format 0.0.4
+([ADR-044](decisions/ADR-044-hand-rolled-metrics-endpoint.md)) and needs
+`Authorization: Bearer $METRICS_TOKEN` once that variable is set — which on Render it must be, because
+there is no private network to restrict the endpoint to. Two things to know before pointing a scrape
+at it. The three counter families are **process-local**: they reset on every deploy and on every cold
+start, which on a free instance that spins down after 15 idle minutes is frequent, so treat them as
+rates over a live process rather than as lifetime totals — and if `WEB_CONCURRENCY` is ever raised
+above the `1` `render.yaml` pins, each scrape reads whichever worker answered it rather than the
+service. The two gauge families (`gateway_breaker_state`, `gateway_quota_remaining`) come from Redis
+and are correct regardless. Second, a Redis outage **omits both gauge families entirely** and still
+returns 200 with the counters, so an alert written against `gateway_quota_remaining` should treat an
+absent series as a signal rather than as zero. Quickest check that the token is right:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}
+'   -H "Authorization: Bearer $METRICS_TOKEN"   https://llm-gateway-sed.onrender.com/metrics
+# 200 with the token, 401 without it, 404 if METRICS_ENABLED is false
+```
 
 **Rotating a provider key.** Edit `GROQ_API_KEY` (or `GEMINI_API_KEY` / `OPENROUTER_API_KEY`) in the
 service's Environment tab; saving triggers a redeploy. A revoked key surfaces as a clean 502 with a

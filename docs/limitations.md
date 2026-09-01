@@ -207,8 +207,8 @@ answers a different, less interesting engineering question.
 
 **Free-tier data-privacy terms differ by provider, and some may use submitted prompts for model
 training.** This matters most for the perception lane (Phase 4), which routes uploaded file content to
-a third-party provider for extraction — a real privacy trade-off, not a hypothetical one, and worth a
-visible disclosure in the UI once that lane exists rather than a line buried here.
+a third-party provider for extraction — a real privacy trade-off, not a hypothetical one, which is why
+the composer discloses it at the point of attachment rather than leaving it as a line buried here.
 
 ---
 
@@ -313,8 +313,13 @@ has room for.
 providers and fails *open* (ADR-036 vs ADR-022). Hitting the cap skips that candidate the way any
 exhausted candidate is skipped — the request fails over rather than erroring — so a capped user on a
 one-candidate slot sees the same "everything is at its limit" answer an exhausted pool produces, with
-no message distinguishing "your cap" from "the pool's". Making that distinction visible is a Phase 7
-usage-dashboard question.
+no message distinguishing "your cap" from "the pool's". **Phase 7's dashboard did not close this**,
+and that is worth saying rather than leaving a forward reference that reads as a promise:
+`/v1/admin/quota` delegates to `/v1/models`, whose per-candidate status comes from
+`QuotaTracker.remaining`, which reads the provider's own declared windows and knows nothing about the
+`alloc:rpd` grant the router appends at reservation time. Surfacing a personal cap would mean teaching
+`remaining` about a window that only exists on the write path — a real change to the tracker, not a
+dashboard panel.
 
 **What the leak test covers, and what it does not.** `tests/integration/test_credential_leakage.py`
 drives a sentinel key through the real app — add, list, a non-streaming turn, a streaming turn, a
@@ -325,6 +330,78 @@ checks the traceback carries neither. That is coverage of *our* log stream and *
 says nothing about what a provider logs on their side, about a heap dump, or about a future log call
 written after the test was, which is why the sentinel is asserted against captured records rather
 than against a list of known-risky call sites.
+
+## Reading the system back (Phase 7)
+
+**The `/metrics` counters are process-local, and they are not a total.** `gateway_requests_total`,
+`gateway_request_duration_ms` and `gateway_breaker_fail_open_total` live in one process's memory
+([ADR-044](decisions/ADR-044-hand-rolled-metrics-endpoint.md)) and reset on every deploy and every
+cold start — which on a free instance that spins down after 15 idle minutes is often. The deployed
+service pins `WEB_CONCURRENCY=1` (`render.yaml`, a 0.1-CPU instance), so today a scrape sees the whole
+of one process rather than a fraction; raise that number and each scrape becomes a **sample** of
+whichever worker answered it. The two gauge families in the same response (`gateway_breaker_state`, `gateway_quota_remaining`)
+are read live from Redis and are correct on any worker, so one `/metrics` body legitimately mixes the
+two kinds of number. The standard production answer is a shared counter store or a push gateway;
+neither is built, because sharing them means new Contract C keys and that is a change made with
+sign-off rather than as a side effect of a polish phase — the same trade ADR-014 already made for the
+latency table, and the same one decision would unblock both.
+
+**Simulated cost is a fiction, computed now, at list prices.** Nothing on this project is billed. The
+dashboard's total is `config/pricing.yaml` applied to token counts at read time
+([ADR-041](decisions/ADR-041-simulated-cost-at-read-time.md)), which means editing that file changes
+every historical number on the page — deliberately, since the only claim the feature can honestly make
+is "what this traffic would cost at *today's* published rates". It is not an invoice and there is no
+stored ledger to reconcile against. A model with no entry contributes `None` and is counted separately
+as `unpriced_requests`, never folded in as `$0`. The shared-vs-private cost split is one *blended*
+rate — this window's total divided by the priced tokens behind it — which is exact only if every
+priced request in the window shares one per-token price; input and output are priced differently, so
+in general it is an approximation, and the page says so.
+
+**Request volume and provider distribution disagree, on purpose.** Volume counts every `requests` row.
+Provider distribution excludes `cache_hit = true` rows (the row names the candidate that *originally*
+answered, so counting it reports a call that never went out) and `provider IS NULL` rows (which mean
+"never got that far", not a provider called *unknown*) — and a `status='replayed'` idempotent replay is
+both. So "1,203 requests" over "980 provider calls" is not a bug in one of the two numbers; it is the
+cache and idempotency working, and the difference is the closest thing this dashboard has to a
+savings figure. `total = ok + errors + replays` partitions exactly, so a successful retry never
+inflates the error rate.
+
+**The dashboard is your own view, not an ops console.** Every route under `/v1/admin/` is scoped to the
+calling principal's `user_id` in the SQL itself
+([ADR-040](decisions/ADR-040-self-scoped-usage-dashboard.md)). There is no admin identity in this
+system — `Principal` is frozen at four fields and `users` has no role column — so there is no
+all-users view, no provider-health control, and no editor for `user_quota_allocations` (whose rows are
+still written by hand). The quota panel reports the pool *the caller resolves to*, which for a
+private-key holder is their own counters and for everyone else is the shared pool's. The system-wide
+view is `/metrics`, which is scraped rather than browsed.
+
+**Message pagination applies to the read, not to the render pipeline.** `GET /v1/conversations/{id}`
+returns the newest page and a cursor walks backwards from it
+([ADR-043](decisions/ADR-043-keyset-pagination-beside-the-full-read.md)), which fixes the payload the
+browser downloads. It does not shrink what a *turn* costs: `list_for_conversation` stays unpaginated
+and D4's fitting step still reads the complete history on every request, because choosing what to drop
+is a decision a page of history cannot make well. A very long thread therefore still costs a full
+history read per turn, and the fix for that is summarization (`memory/summarize.py`, still the unbuilt
+seam) rather than a paged render.
+
+**Idempotency is best-effort, and deliberately so.** A Redis outage disables it silently and the
+request is served as it would have been before the feature existed
+([ADR-042](decisions/ADR-042-idempotency-claim-before-routing.md)) — which means a retry during that
+outage really can produce a second completion. That is the correct trade (nothing is being *spent* by
+proceeding, and refusing to answer because a cache is down is the worse failure), but it is a trade,
+not a guarantee. The window is also finite: envelopes expire after 24 hours, so a retry a day later is
+a new request. And a stored envelope that a newer build cannot revalidate is served fresh rather than
+replayed, because the shape of a response is allowed to change between deploys.
+
+**The chaos demo is an in-process mock, not a network.** `scripts/chaos_demo.py` drives the real ASGI
+app over `httpx.ASGITransport` with a scripted `MockTransport` upstream
+([ADR-045](decisions/ADR-045-chaos-demo-drives-the-real-app.md)), so there is no TLS, no DNS, no
+connection-pool exhaustion and no real timeout — the latencies in the transcript are not latencies.
+One worker proves nothing about two, and "zero client-visible failures" is a claim about *that*
+schedule rather than a proof that no schedule produces one. `docs/chaos-demo.md` carries the full
+list of what the run does and does not demonstrate.
+
+---
 
 ## Explicitly out of scope for v1
 
@@ -340,6 +417,18 @@ PNG, JPEG and WebP — a format with no tier-3 fallback is a format that fails a
 degrading, so nothing is accepted without one. And extraction runs synchronously inside the request
 that needs it (D22) rather than on a queue, because a background worker is a second runtime a free
 tier does not have room for.
+
+**Still deliberately unbuilt at v1, with the seam visible in each case.** Summarization
+(`memory/summarize.py`; the `summary` block type stays reserved and rejected at the JSONB boundary,
+and `fitting.FitStrategy` still has one member); semantic caching, which would sit behind
+`cache/exact.py::is_cacheable` and would have to respect the same two gates (`degraded`, `truncated`);
+p50-over-a-window latency routing, which needs the same cross-instance counter store the `/metrics`
+counters do — one decision unlocks both; an operator identity and `allocations_repo.set_cap`
+([ADR-040](decisions/ADR-040-self-scoped-usage-dashboard.md)); `MultiFernet` key rotation
+([ADR-035](decisions/ADR-035-shared-pool-stays-in-the-environment.md)); `owner_type='system'` rows in
+`provider_keys`; `pin_target`'s tool-call branch ([ADR-032](decisions/ADR-032-pinning-without-tool-calls.md));
+rollup tables for the dashboard; and `scripts/seed_dev.py`. Each is a named slot rather than a
+rewrite, which is the whole point of listing them.
 
 **Not a production system.** Built entirely on free tiers for a portfolio/learning purpose, which means
 lower throughput, higher latency variance, and lower consistency than a paid setup would have — stated
