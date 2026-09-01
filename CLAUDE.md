@@ -113,7 +113,7 @@ hands it a `requests.quota_scope` that is no longer a constant and a `key_pool` 
 see `phase6.md` §9. Twelve steps, three milestones, decisions D44–D51: full plan in
 [phase7.md](doc/reference/phase7.md).
 
-**Status: Steps 1–10 of 12 committed — Milestones A and B done, Milestone C under way.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
+**Status: Steps 1–11 of 12 committed — Milestones A and B done, Milestone C under way.** Step 1 (D46, simulated cost) touches the files `phase7.md` names —
 `config/pricing.yaml` (new), `app/config.py`, `app/usage/pricing.py` (new) — plus tests.
 `PricingEntry`/`PricingConfig` mirror `ModelLimits`/`LimitsConfig` exactly (`extra="forbid"`,
 `frozen=True`, a `for_model` lookup), loaded by a fourth `lru_cache`d `get_pricing_config()` and
@@ -590,6 +590,40 @@ latencies are not latencies, one worker proves nothing about two, and zero failu
 *this* schedule rather than a proof that no schedule produces one. `make test` (1494 passed, 1
 skipped), `ruff check`, `ruff format --check` and `mypy` are green, and two `--seed 1` runs produced
 an identical `plan` block and zero failures each, per the step's own "done when."
+
+Step 11 (the README) touches exactly one file — `README.md`. `docs/architecture.md` is on the step's
+own list only conditionally ("one new diagram *if* the README links to it rather than inlining"), and
+the diagram is inlined, so that file is untouched and its Phase 7 section stays Step 12's. No
+application code, no tests, no frontend: `git diff --stat` shows `README.md` alone. The four existing
+"why" essays are kept verbatim under a new **In depth** heading and joined by a fifth, on idempotency
+— §13 names it as an interview question and it was the only one of them with no essay. Above them,
+the four things the step asks for: a four-sentence "what this is" that says portfolio project and free
+tiers out loud; **one** mermaid figure carrying both §5.1's request flow and §5.2's two lanes, with
+the perception lane as a subgraph joined to the answer lane by the only edge that is real (render
+step 1, per attempt, dotted in both directions); a seventeen-row **request-flow walkthrough** naming
+the file and function at every hop from `get_principal` to `_to_response`, so it doubles as a code
+tour; an eleven-row **failure-mode table**; and the **Design Decisions** index — every ADR, grouped by
+area and stated as *the question it answers* rather than by number.
+
+Three details are worth recording. **The failure table is the step's real deliverable**, since its
+"done when" is that a stranger can answer "what happens when Groq goes down mid-stream" from the
+README alone — so that row is written at length (discard the partial, emit `restart`, resume on a
+*different* candidate on the same open 200, and `done{status:"failed"}` with `partial_content` past
+40 characters when the budget runs out) and the table deliberately splits Redis into two rows,
+because "fails closed" and "fails open" are the same dependency under two settings and collapsing
+them is how a reader learns the wrong rule. Every row's answer was read back out of the code rather
+than recalled, which is how the JWKS row came to say what it says: a stale key set keeps serving and
+only a *cold* cache is a 503, and it is a 503 rather than a 401 because it is our outage
+(`app/auth/jwt.py::JwksCache._refresh`). **The ADR index is honest about its own numbering** — the
+records run 007…039 with gaps, because Phase 1 planned ADR-001…008 and wrote two records in total;
+saying so in one clause is cheaper than a reader wondering what happened to ADR-003. The six Phase 7
+ADRs are Step 12's to write and to add here, which is why the index does not yet link files that do
+not exist. **The mermaid block is checked, not eyeballed**: `mermaid.parse` was run over the extracted
+figure in a scratch directory (no dependency added to this repo), and every `{}`-braced Redis key was
+rewritten in prose form inside the node labels — a brace inside a rhombus label is the one construct
+that parses locally and then fails on GitHub. Every relative link in the file was resolved against the
+working tree. `make test` (1494 passed, 1 skipped), `ruff check`, `ruff format --check` and `mypy` are
+green — unchanged, as a documentation-only commit should leave them.
 
 ## Phase 6 — BYOK Settings — complete
 
